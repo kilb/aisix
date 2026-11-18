@@ -343,7 +343,7 @@ select.select-sm {
 
 /* ── Tables: shadcn's Table inside a Card ────────────────────── */
 .dt-wrap {
-  --dt-edge: 12px;
+  --dt-edge: 16px;
   position: relative;
   overflow-x: auto;
   margin: 16px 0 0;
@@ -427,7 +427,7 @@ select.select-sm {
 .dt tr.dt-detail > td {
   padding-top: 0;
   padding-bottom: 16px;
-  background: var(--card);
+  background: var(--well);
 }
 .dt tr.dt-detail:hover,
 .dt tr:has(+ tr.dt-detail):hover {
@@ -692,9 +692,9 @@ main { counter-reset: bento-card; }
 .bento-page-header .font-mono, .bento-card-header .font-mono, .bento-stat .font-mono { font-family: var(--font-sans); letter-spacing: 0; }
 .btn:active:not(:disabled, [aria-disabled="true"]) { filter: brightness(.94); }
 .dt tr:focus-within { background: var(--row-hover); }
-.dt tr.dt-detail > td { padding: 0 var(--dt-edge) 20px; background: var(--card); }
+.dt tr.dt-detail > td { padding: 0 var(--dt-edge) 20px; background: var(--well); }
 .dt tr:has(+ tr.dt-detail) > td { border-bottom: 0; }
-.dt tr.dt-detail:hover { background: var(--card); }
+.dt tr.dt-detail:hover { background: var(--well); }
 .empty p { max-width: 54ch; line-height: 22px; }
 .side-panel { scroll-margin-top: 88px; }
 .side-head { padding-bottom: 16px; border-bottom: 1px solid var(--border); }

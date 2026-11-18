@@ -31,6 +31,7 @@ import { formatCount } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
 import { beijingInputValue, fmtBeijing, parseBeijingInput } from "./lib/time";
 import { keySettingsPatch } from "./lib/keySettings";
+import { modelNameMatcher } from "./lib/modelNameMatcher";
 import { keyLimitText } from "./lib/keyRateLimits";
 import { fetchKeyCosts, keyCostNotes, keyMonthRange, type KeyCosts } from "./lib/keyUsage";
 import { fmtMicroCny } from "./lib/money";
@@ -211,13 +212,15 @@ export function Keys({
           <p className="keys-summary-period">费用期间：{when(costs?.from ?? costRange.from)} 至 {when(costs?.to ?? costRange.to)}（UTC+8，不含结束时间）。待计价与处理中记录见列表；数量不受下方筛选影响。</p>
         </Card>
         <Card padding="table" className={cn(span.d12, "keys-list")}>
-          <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" actions={<Button onClick={() => void load()}>刷新列表</Button>} />
-          <p className="hint px-5">组织密钥归组织所有；创建者被停用或移除后仍保留，不会自动吊销。</p>
+          <CardHeader number={3} title="密钥列表" className="key-list-header" actions={<>
+            <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属、创建者或分组" }}>
+              <Field label="密钥状态"><Select value={stateFilter} onValueChange={setStateFilter} size="compact"><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</Select></Field>
+              <Field label="密钥分组"><Select value={groupFilter} onValueChange={setGroupFilter} size="compact"><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</Select></Field>
+            </RecordTableToolbar>
+            <Button onClick={() => void load()}>刷新列表</Button>
+          </>} />
+          <p className="hint px-5">复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。组织密钥归组织所有；创建者被停用或移除后仍保留，不会自动吊销。</p>
           {costErr && <div className="note crit" role="alert">费用读取失败：{costErr}<Button onClick={() => void load()}>重新读取费用</Button></div>}
-          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属、创建者或分组" }}>
-            <Field label="密钥状态"><Select value={stateFilter} onValueChange={setStateFilter} size="compact"><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</Select></Field>
-            <Field label="密钥分组"><Select value={groupFilter} onValueChange={setGroupFilter} size="compact"><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</Select></Field>
-          </RecordTableToolbar>
           {!active && <div className="note crit">组织已被停用，所有密钥暂时无法调用；这里只能吊销密钥。</div>}
           {listErr && (
             <div className="note crit" role="alert">
@@ -542,7 +545,6 @@ export function KeyForm({
   // with the key and never changed afterwards.
   const [group, setGroup] = useState(initial?.group?.id ?? "");
   const [modelScope, setModelScope] = useState<"inherited" | "selected">(initial && initial.model_ids !== null ? "selected" : "inherited");
-  const [modelsOpen, setModelsOpen] = useState(false);
   const [modelSearch, setModelSearch] = useState("");
   const [picked, setPicked] = useState<string[]>(initial?.model_ids ?? []);
   const [concurrency, setConcurrency] = useState(initial?.rate_limit.concurrency?.toString() ?? "");
@@ -576,7 +578,6 @@ export function KeyForm({
     if (groups !== null && groups.length > 0 && group === "") found.group = "请选择分组";
     if (noModels) {
       found.models = modelsEmptyMessage;
-      setModelsOpen(true);
       setModelSearch("");
     }
     const c = limit(concurrency);
@@ -624,7 +625,6 @@ export function KeyForm({
       setLabel("");
       setGroup(groups !== null && groups.length === 1 ? (groups[0]?.id ?? "") : "");
       setModelScope("inherited");
-      setModelsOpen(false);
       setModelSearch("");
       setPicked([]);
       setConcurrency("");
@@ -646,7 +646,6 @@ export function KeyForm({
         }
         setErrs(byField);
         if (byField.models) {
-          setModelsOpen(true);
           setModelSearch("");
         }
         if (rest.length > 0) setErr(rest.join("；"));
@@ -670,12 +669,13 @@ export function KeyForm({
   // The models are a fieldset rather than one Field: their hint and refusal are wired here.
   const modelsHint = `${id}-models-hint`;
   const modelsErr = `${id}-models-err`;
-  const modelsList = `${id}-models-list`;
   const modelsEmpty = `${id}-models-empty`;
   const modelsDescribedBy = [modelsHint, errs.models ? modelsErr : noModels ? modelsEmpty : null].filter(Boolean).join(" ");
-  const search = modelSearch.trim().toLocaleLowerCase();
-  const visibleModels = (catalog ?? []).filter((m) => m.name.toLocaleLowerCase().includes(search));
-  const unavailableModels = catalog === null ? [] : picked.filter(modelId => !catalog.some(model => model.id === modelId));
+  const matchesModel = modelNameMatcher(modelSearch);
+  const visibleModels = (catalog ?? []).filter(model => matchesModel(model.name));
+  const pickedIds = new Set(picked);
+  const availableIds = new Set(catalog?.map(model => model.id));
+  const unavailableModels = catalog === null ? [] : picked.filter(modelId => !availableIds.has(modelId));
   function clearModelsError() {
     setErrs((was) => {
       const { models: _, ...rest } = was;
@@ -791,7 +791,6 @@ export function KeyForm({
                   aria-describedby={modelsHint}
                   onChange={() => {
                     setModelScope("inherited");
-                    setModelsOpen(false);
                     clearModelsError();
                   }}
                 />
@@ -818,52 +817,46 @@ export function KeyForm({
                   已选 {formatCount(picked.length)} 个模型{initial && picked.length === 0 ? "，该密钥无法调用任何模型" : ""}
                 </p>
                 {noModels && !errs.models && <p className="hint" id={modelsEmpty}>{modelsEmptyMessage}</p>}
-                <div>
-                  <Button
-                    size="sm"
-                    aria-expanded={modelsOpen}
-                    aria-controls={modelsList}
-                    onClick={() => setModelsOpen((open) => !open)}
-                  >
-                    {modelsOpen ? "收起模型列表" : "展开模型列表"}
-                  </Button>
-                </div>
-                <div id={modelsList} hidden={!modelsOpen}>
-                  <div className="grid gap-3">
-                    <Field label="搜索模型">
-                      <input type="search" value={modelSearch} onChange={(e) => setModelSearch(e.target.value)} />
-                    </Field>
-                    {unavailableModels.length > 0 && <div className="picks [overflow-wrap:anywhere]">
-                      {unavailableModels.map(modelId => <label key={modelId} className="pick min-w-0">
-                        <input type="checkbox" checked onChange={() => setPicked(was => was.filter(value => value !== modelId))} />
-                        已不在组织授权内（{modelId}）
-                      </label>)}
-                    </div>}
-                    {catalog === null ? (
-                      <span className="hint">载入中…</span>
-                    ) : catalog.length === 0 ? (
-                      <span className="hint">组织还没有获授权的模型</span>
-                    ) : visibleModels.length === 0 ? (
-                      <span className="hint">没有匹配的模型</span>
-                    ) : (
-                      <div className="picks max-h-64 overflow-y-auto [overflow-wrap:anywhere]">
-                        {visibleModels.map((m) => (
-                          <label key={m.id} className="pick min-w-0">
-                            <input
-                              type="checkbox"
-                              checked={picked.includes(m.id)}
-                              onChange={(e) => {
-                                const checked = e.target.checked;
-                                setPicked((was) => checked ? [...was, m.id] : was.filter((p) => p !== m.id));
-                                clearModelsError();
-                              }}
-                            />
-                            {m.name}
-                          </label>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+                <div className="grid gap-2">
+                  <Field label="搜索模型" hint="* 可匹配任意字符。保存当前选中的模型，以后新增的匹配模型需另行选择。">
+                    <input type="search" value={modelSearch} onChange={(e) => setModelSearch(e.target.value)} />
+                  </Field>
+                  {modelSearch.includes("*") && visibleModels.length > 0 && <div><Button size="sm"
+                    disabled={busy || visibleModels.every(model => pickedIds.has(model.id))}
+                    onClick={() => {
+                      setPicked(previous => [...new Set([...previous, ...visibleModels.map(model => model.id)])]);
+                      clearModelsError();
+                    }}>选择全部匹配模型</Button></div>}
+                  {unavailableModels.length > 0 && <div className="picks key-model-cards [overflow-wrap:anywhere]">
+                    {unavailableModels.map(modelId => <label key={modelId} className="pick min-w-0">
+                      <input type="checkbox" checked onChange={() => setPicked(was => was.filter(value => value !== modelId))} />
+                      已不在组织授权内（{modelId}）
+                    </label>)}
+                  </div>}
+                  {catalog === null ? (
+                    <span className="hint">载入中…</span>
+                  ) : catalog.length === 0 ? (
+                    <span className="hint">组织还没有获授权的模型</span>
+                  ) : visibleModels.length === 0 ? (
+                    <span className="hint">没有匹配的模型</span>
+                  ) : (
+                    <div className="picks key-model-cards max-h-64 overflow-y-auto [overflow-wrap:anywhere]">
+                      {visibleModels.map((m) => (
+                        <label key={m.id} className="pick min-w-0">
+                          <input
+                            type="checkbox"
+                            checked={pickedIds.has(m.id)}
+                            onChange={(e) => {
+                              const checked = e.target.checked;
+                              setPicked((was) => checked ? [...was, m.id] : was.filter((p) => p !== m.id));
+                              clearModelsError();
+                            }}
+                          />
+                          {m.name}
+                        </label>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

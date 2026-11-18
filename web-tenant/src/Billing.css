@@ -13,6 +13,8 @@
 .billing-calculation > p { min-width: 0; margin: 0; line-height: 1.7; overflow-wrap: anywhere; }
 .tenant-billing .dt :is(th, td) { padding: 10px 12px; font-size: var(--text-small); line-height: 20px; }
 .tenant-billing .dt td { white-space: normal; overflow-wrap: anywhere; }
+.tenant-billing .dt :is(th, td):first-child { padding-inline-start: 20px; }
+.tenant-billing .dt :is(th, td):last-child { padding-inline-end: 20px; }
 .tenant-billing :is(.billing-topups-table, .billing-ledger-table) { width: 100%; min-width: 1080px; table-layout: fixed; }
 .tenant-billing .billing-ledger-table td[data-label="本笔余额计算"] { min-width: 0; white-space: normal; }
 .billing-ledger-formula { display: flex; flex-wrap: wrap; gap: 2px 6px; font-size: var(--text-caption); line-height: 20px; }

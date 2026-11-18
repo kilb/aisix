@@ -14,7 +14,7 @@
 .charge-col-tokens { width: 11rem; }
 .charge-col-action { width: 6.5rem; }
 .charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { vertical-align: top; white-space: normal; overflow-wrap: anywhere; }
-.charge-records .charge-records-table > thead > tr > th { white-space: nowrap; }
+.charge-records .charge-records-table > thead > tr > th { vertical-align: middle; white-space: nowrap; }
 .charge-model-name { display: block; color: var(--foreground); font-weight: 600; }
 .charge-records .cell-note { margin-top: 4px; }
 .charge-records .finance-amount-label { display: block; margin-bottom: 2px; color: var(--color-fg-3); font-size: var(--text-caption); }
@@ -39,6 +39,8 @@
 .charge-call-time time > span:first-child { color: var(--ink); font-weight: 500; }
 .charge-call-time time > span + span { margin-top: 3px; color: var(--muted-foreground); font-size: var(--text-caption); }
 .charge-records .charge-records-table > :is(thead, tbody) > tr > :is(th, td) { padding-inline: 10px; }
+.charge-records .charge-records-table > :is(thead, tbody) > tr > :first-child { padding-inline-start: max(16px, var(--dt-edge)); }
+.charge-records .charge-records-table > :is(thead, tbody) > tr > :last-child { padding-inline-end: max(16px, var(--dt-edge)); }
 .charge-records .charge-records-table > tbody > tr[data-finance-record] > td { padding-block: 12px; }
 .charge-records .usage-performance { grid-template-columns: minmax(0, 1fr); gap: 3px; text-align: left; }
 .charge-records .usage-performance > div { display: inline-flex; width: max-content; align-items: baseline; justify-content: flex-start; gap: 6px; white-space: nowrap; }
@@ -57,9 +59,8 @@
 .call-log-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 
 /* 复核是同一条记录的连续分区，数量表不与其它信息挤在半列里。 */
-.charge-check { display: grid; min-width: 0; gap: 16px; padding-block: 16px; border-top: 1px solid var(--color-hairline); overflow-wrap: anywhere; }
+.charge-check { display: grid; min-width: 0; gap: 16px; padding-block: 16px; overflow-wrap: anywhere; }
 .charge-check > section { min-width: 0; }
-.charge-check > section + section { padding-top: 16px; border-top: 1px solid var(--color-hairline); }
 .charge-quantities-scroll { min-width: 0; max-width: 100%; overflow-x: auto; }
 .charge-quantities-scroll:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
 .charge-check .charge-quantities-table { width: 100%; min-width: 36rem; border-collapse: collapse; }

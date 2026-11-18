@@ -27,6 +27,7 @@ import {
   type Tenant,
 } from "../lib/api";
 import { errorText, fmtInt, fmtTime } from "../lib/fmt";
+import { modelNameMatcher } from "../lib/modelNameMatcher";
 import { keyModels } from "../lib/keyModels";
 import { keyLimitText } from "../lib/keyRateLimits";
 import { adminKeySettingsPatch } from "../lib/keySettingsAdmin";
@@ -686,7 +687,8 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
   const grants = useMemo(() => tenant.effective_model_ids.map(id => ({ id, name: names?.get(id) ?? id })).sort((a, b) => a.name.localeCompare(b.name)), [tenant.effective_model_ids, names]);
   const grantedIds = useMemo(() => new Set(grants.map(model => model.id)), [grants]);
   const selectedIds = useMemo(() => new Set(models), [models]);
-  const visible = grants.filter(model => model.name.toLocaleLowerCase().includes(modelSearch.trim().toLocaleLowerCase()));
+  const matchesModel = modelNameMatcher(modelSearch);
+  const visible = grants.filter(model => matchesModel(model.name));
   const unavailable = names === null ? [] : models.filter(id => !grantedIds.has(id));
   const at = (path: string) => refused?.at.get(path);
   const patternsError = [...(refused?.at ?? [])].filter(([path]) => atList("/allowed_models")(path)).map(([, message]) => message).join("；");
@@ -736,7 +738,8 @@ function CreateForm({ tenant, names, catalogError, choices, onMinted, onCancel, 
       <p className="hint">不限制模型时使用租户当前及之后授权的模型；指定模型时只使用勾选项。</p>
       {catalogError && <p className="note crit" role="alert">模型目录读取失败：{catalogError}</p>}
       {modelScope === "selected" && <>
-        <TextField label="搜索模型" value={modelSearch} onChange={setModelSearch} disabled={busy} placeholder="按模型名称搜索" />
+        <TextField label="搜索模型" value={modelSearch} onChange={setModelSearch} disabled={busy} placeholder="按模型名称搜索" hint="* 可匹配任意字符。保存当前选中的模型，以后新增的匹配模型需另行选择。" />
+        {modelSearch.includes("*") && visible.length > 0 && <Button size="sm" disabled={busy || visible.every(model => selectedIds.has(model.id))} onClick={() => setModels(previous => [...new Set([...previous, ...visible.map(model => model.id)])])}>选择全部匹配模型</Button>}
         {grants.length === 0 ? <p className="hint">该租户还没有授权模型，请先在租户页授权。</p> : visible.length === 0 ? <p className="hint">没有匹配的模型</p> : <ul className="tn-checks tn-box key-model-options">{visible.map(model => <Check key={model.id} label={model.name} checked={selectedIds.has(model.id)} disabled={busy} onChange={checked => setModels(previous => checked ? [...previous, model.id] : previous.filter(id => id !== model.id))} error={at(`/model_ids/${sent?.model_ids?.indexOf(model.id) ?? -1}`)} />)}</ul>}
         {unavailable.length > 0 && <><p className="hint">以下已选模型已不在当前授权中，可取消勾选后保存：</p><ul className="tn-checks key-model-options">{unavailable.map(id => <Check key={id} label={`${names?.get(id) ?? id}（已不可用）`} checked disabled={busy} onChange={() => setModels(previous => previous.filter(value => value !== id))} />)}</ul></>}
         {models.length === 0 && initial && <p className="hint">未选择任何模型，此密钥将不能调用模型。</p>}

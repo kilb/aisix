@@ -74,7 +74,6 @@ for (const width of [1440, 390]) {
       const form = page.locator("form").filter({ has: page.getByRole("group", { name: "可用模型", exact: true }) });
       const models = form.getByRole("group", { name: "可用模型", exact: true });
       await models.getByRole("radio", { name: "指定模型", exact: true }).check();
-      await models.getByRole("button", { name: "展开模型列表", exact: true }).click();
       const options = models.getByRole("checkbox");
       await expect(options.first()).toBeVisible();
       expect(await options.count(), "real model choices are present").toBeGreaterThan(1);

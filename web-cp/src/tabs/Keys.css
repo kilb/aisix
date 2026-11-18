@@ -90,7 +90,7 @@
 }
 .cp-keys .key-row-actions {
   gap: 2px;
-  align-items: flex-start;
+  align-items: center;
 }
 .cp-keys .key-row-actions > .btn svg,
 .cp-keys .key-row-actions > .two-step > .btn svg {
@@ -106,31 +106,31 @@
     table-layout: fixed;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-identity-column {
-    width: 22%;
+    width: 20%;
     min-width: 16rem;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-owner-column {
-    width: 17%;
+    width: 16%;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-model-column {
-    width: 15%;
+    width: 14%;
     min-width: 10rem;
   }
   .cp-keys .keys-list .ops-record-table > .dt :is(th, td):nth-child(4) {
-    width: 10%;
+    width: 9%;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-limit-column {
     width: 8%;
   }
   .cp-keys .keys-list .ops-record-table > .dt :is(th, td):nth-child(6) {
-    width: 10%;
+    width: 9%;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-created-column {
     width: 12%;
     min-width: 0;
   }
   .cp-keys .keys-list .ops-record-table > .dt .key-actions-column {
-    width: 6%;
+    width: 12%;
     min-width: 0;
   }
 }

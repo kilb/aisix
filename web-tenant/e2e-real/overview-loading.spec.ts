@@ -11,6 +11,49 @@ if (state.ready !== true || state.realBackend !== true || state.mockUpstream !==
 if (!["http:", "https:"].includes(base.protocol) || !["localhost", "127.0.0.1", "[::1]"].includes(base.hostname) || base.username || base.password) throw new Error("Only an isolated loopback overview URL is allowed");
 if (typeof auth.metricsOwner?.email !== "string" || typeof auth.metricsOwner?.password !== "string") throw new Error("Existing isolated owner credentials are required");
 
+test("用量汇总解释未授权或未知模型，保留这组的调用次数", async ({ context, page }) => {
+  const login = await context.request.post(new URL("/api/login", base).href, { data: auth.metricsOwner });
+  expect(login.status()).toBe(200);
+  try {
+    await page.goto(baseUrl);
+    const recent = await page.evaluate(async () => {
+      const response = await fetch("/api/usage/calls?limit=1");
+      if (!response.ok) throw new Error("无法读取隔离环境中的历史调用");
+      return (await response.json()).items[0]?.occurred_at;
+    });
+    expect(typeof recent).toBe("string");
+    const last = Date.parse(recent);
+    const query = new URLSearchParams({ group: "day", from: new Date(last - 7 * 86_400_000).toISOString(), to: new Date(last + 86_400_000).toISOString() });
+    const summary = page.waitForResponse(r => {
+      const url = new URL(r.url());
+      return url.pathname === "/api/usage/summary" && url.searchParams.get("from") === query.get("from");
+    });
+    await page.goto(new URL("#usage?" + query, base).href);
+    const response = await summary;
+    expect(response.status()).toBe(200);
+    const rows: { period_start: string; model: { id: string | null; name: string }; requests: number }[] = (await response.json()).items;
+    const unknown = rows.filter(row => row.model.id === null && row.model.name === "");
+    expect(unknown.length).toBeGreaterThan(0);
+    const table = page.getByRole("table", { name: "用量汇总", exact: true });
+    const displayed = table.getByRole("row").filter({ has: page.getByRole("cell", { name: "未授权或未知模型", exact: true }) });
+    await expect(displayed).toHaveCount(unknown.length);
+    const calendar = new Intl.DateTimeFormat("sv-SE", { timeZone: "Asia/Shanghai" });
+    for (const group of unknown) {
+      const day = calendar.format(new Date(group.period_start));
+      const row = displayed.filter({ has: page.getByRole("cell", { name: day, exact: true }) });
+      await expect(row.locator('td[data-label="调用次数"]')).toHaveText(String(group.requests));
+    }
+    await expect(page.getByText(/调用记录没有可识别的模型，或模型已不在组织当前授权范围内/)).toBeVisible();
+    const ordinary = rows.find(row => row.model.id && row.model.name);
+    expect(ordinary).toBeDefined();
+    await page.getByRole("searchbox", { name: "搜索汇总模型" }).fill(ordinary!.model.name);
+    await expect(displayed).toHaveCount(0);
+    await expect(page.getByText(/调用记录没有可识别的模型，或模型已不在组织当前授权范围内/)).toHaveCount(0);
+  } finally {
+    expect((await context.request.post(new URL("/api/logout", base).href, { data: {} })).status()).toBe(204);
+  }
+});
+
 test("已认证概览不等组织资料返回才开始读取统计", async ({ context, page }, info) => {
   const errors: string[] = [];
   const writes: string[] = [];

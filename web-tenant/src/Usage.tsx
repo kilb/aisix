@@ -367,10 +367,10 @@ function defaultRange(group: "day" | "month"): { from: string; to: string } {
 const MAX_DAYS = { day: 92, month: 731 } as const;
 
 /** A card that is a region named by its heading. */
-function Section({ title, number, children, className = "", ref, style }: { title: string; number: number; children: ReactNode; className?: string; ref?: Ref<HTMLElement>; style?: CSSProperties }) {
+function Section({ title, number, children, actions, className = "", ref, style }: { title: string; number: number; children: ReactNode; actions?: ReactNode; className?: string; ref?: Ref<HTMLElement>; style?: CSSProperties }) {
   return (
     <Card ref={ref} style={style} padding="table" role="region" aria-label={title} className={`${span.d12} usage-record-section ${className}`}>
-      <CardHeader number={number} title={title} />
+      <CardHeader number={number} title={title} actions={actions} />
       {children}
     </Card>
   );
@@ -598,6 +598,7 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
             </tbody>
           </DataTable>
         )}
+        {table.rows.some(row => row.model.id === null && row.model.name === "") && <p className="hint">“未授权或未知模型”表示调用记录没有可识别的模型，或模型已不在组织当前授权范围内。这些调用和已计费用仍计入汇总。</p>}
         {rows !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="用量汇总" />}
       </Section>
     </BentoGrid>
@@ -757,15 +758,16 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
           <input type="search" value={searchQuery} onChange={event => update({ q: event.target.value })} placeholder="模型、密钥、成员或请求 ID" />
         </label>
       </UsageRecordFilters>
-      <Section ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} title="调用记录" number={8} className="usage-calls-section call-table-card">
+      <Section ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} title="调用记录" number={8} className="usage-calls-section call-table-card" actions={<>
+        <details className="usage-summary-notes usage-call-notes">
+          <summary>筛选、性能与计费口径</summary>
+          <p>文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
+          <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
+          <p>同一请求合并一行，优先展示最终成功结果；费用汇总全部实际计费尝试。详情保留故障转移、同目标重试与每次已保存日志。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。</p>
+        </details>
+        {rows !== null && <p className="hint">已加载 {rows.length.toLocaleString("en-US")} 条{next !== null ? "，还有更多记录" : ""}</p>}
+      </>}>
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}
-      <details className="usage-summary-notes usage-call-notes">
-        <summary>筛选、性能与计费口径</summary>
-        <p>文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
-        <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
-        <p>同一请求合并一行，优先展示最终成功结果；费用汇总全部实际计费尝试。详情保留故障转移、同目标重试与每次已保存日志。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。</p>
-      </details>
-      {rows !== null && <p className="hint">已加载 {rows.length.toLocaleString("en-US")} 条{next !== null ? "，还有更多记录" : ""}</p>}
       {err && (
         <div className="note crit" role="alert">
           {err}

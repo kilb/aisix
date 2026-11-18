@@ -13,7 +13,7 @@ test.afterEach(async ({ page }, info) => {
   if (info.status !== info.expectedStatus) await page.screenshot({ path: info.outputPath("organization-failure.png"), fullPage: true });
 });
 
-test("不限模型显式单选，指定区域折叠，既有密钥继承后续授权", async ({ page }) => {
+test("不限模型时隐藏选项并继承后续授权，选择指定模型后直接展示选项", async ({ page }) => {
   const world = await seedRealWorld(stack);
   const closed = await world.api.post("/api/keys", { label: "既有空选范围", model_ids: [] });
   await login(page, stack, world.owner);
@@ -36,7 +36,6 @@ test("不限模型显式单选，指定区域折叠，既有密钥继承后续�
   }, { timeout: 60_000 }).toBe(true);
   await page.getByRole("radio", { name: "指定模型", exact: true }).check();
   await expect(page.getByRole("button", { name: "新建密钥", exact: true })).toBeDisabled();
-  await page.getByRole("button", { name: "展开模型列表", exact: true }).click();
   await page.getByRole("searchbox", { name: /模型/ }).fill(world.model.name);
   await page.getByRole("checkbox", { name: world.model.name, exact: true }).check();
   await expect(page.getByText(/已选\s*1/)).toBeVisible();

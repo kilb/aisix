@@ -26,8 +26,8 @@ test("admin-call-records-token-column-stays-readable", async ({ page }) => {
   })));
   await test.info().attach("call-record-column-widths", { body: JSON.stringify(geometry), contentType: "application/json" });
   for (const row of geometry) {
-    expect(row.cells).toHaveLength(7);
-    expect(row.cells.find(cell => cell.label === "用量")!.width, "Token counts and estimates need a readable column").toBeGreaterThanOrEqual(160);
+    expect(row.cells.map(cell => cell.label)).toEqual(["时间", "请求类型", "调用 / 租户", "计价结果", "费用（元）", "服务 / 档位", "响应性能", "Token 消耗", "日志 / 复核"]);
+    expect(row.cells.find(cell => cell.label === "Token 消耗")!.width, "Token counts and estimates need a readable column").toBeGreaterThanOrEqual(160);
     expect(row.height, "summary rows must not become vertical paragraphs").toBeLessThanOrEqual(180);
   }
   await expect(table.getByText(/按字节估算 Token/).first()).toBeVisible();
@@ -36,7 +36,7 @@ test("admin-call-records-token-column-stays-readable", async ({ page }) => {
   await capture(page, "admin-call-records-readable-1440");
 });
 
-test("admin-call-records-use-fields-when-main-area-is-narrow", async ({ page }) => {
+test("admin-call-records-scroll-to-readable-fields-and-actions-when-narrow", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 1000 });
   await login(page, "admin");
   await page.goto(`${state.adminUrl}/#calls`);
@@ -45,10 +45,23 @@ test("admin-call-records-use-fields-when-main-area-is-narrow", async ({ page }) 
   const first = table.locator("tbody > tr[data-finance-record]").first();
   for (const width of [1280, 900, 390]) {
     await page.setViewportSize({ width, height: 1000 });
-    await expect(first, "a narrow main area must use labelled fields instead of seven squeezed columns").toHaveCSS("display", "grid");
-    expect((await first.locator('[data-label="用量"]').boundingBox())!.width).toBeGreaterThanOrEqual(240);
+    const scroller = page.getByRole("region", { name: "计费明细表格滚动区域", exact: true });
+    expect((await first.locator('[data-label="Token 消耗"]').boundingBox())!.width).toBeGreaterThanOrEqual(160);
     await checkCells(table);
     const expand = first.getByRole("button", { name: /^展开用量明细 / });
+    await scroller.hover({ position: { x: 40, y: 60 } });
+    await page.mouse.wheel(-2400, 0);
+    await expect.poll(() => scroller.evaluate(element => element.scrollLeft)).toBe(0);
+    const window = (await scroller.boundingBox())!;
+    const before = (await expand.boundingBox())!;
+    expect(before.x + before.width).toBeGreaterThan(window.x + window.width);
+    await page.mouse.wheel(2400, 0);
+    await expect.poll(() => scroller.evaluate(element => element.scrollLeft)).toBeGreaterThan(0);
+    await expect.poll(async () => {
+      const bounds = (await expand.boundingBox())!;
+      return bounds.x >= window.x && bounds.x + bounds.width <= window.x + window.width;
+    }).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollLeft)).toBe(0);
     await expand.click();
     await expect(first.getByRole("button", { name: /^收起用量明细 / })).toHaveAttribute("aria-expanded", "true");
     await expect(table.locator("tbody > tr.dt-detail").first()).toBeVisible();
@@ -138,3 +151,100 @@ for (const width of [1440, 900, 390]) {
     expect(runtime, "uncaught application errors").toEqual([]);
   });
 }
+
+async function expectAlignedActions(table: Locator) {
+  const actions = table.locator('tbody tr').first().locator('td[data-label="操作"] button:visible');
+  await expect(actions).toHaveCount(3);
+  const centers = await actions.evaluateAll(buttons => buttons.map(button => {
+    const { y, height } = button.getBoundingClientRect();
+    return y + height / 2;
+  }));
+  expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(1);
+}
+
+test("双端密钥操作对齐，租户可在标题右侧筛选", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await login(page, "admin");
+  await page.goto(`${state.adminUrl}/#keys?tenant=${state.tokenUiFixture.tenantId}`);
+  await expectAlignedActions(page.getByRole("table", { name: "密钥列表" }));
+  await login(page, "tenant");
+  await page.goto(state.tenantUrl + "/#keys");
+  const table = page.getByRole("table", { name: "密钥列表" });
+  await expectAlignedActions(table);
+  const title = (await page.getByRole("heading", { name: "密钥列表", exact: true }).boundingBox())!;
+  const controls = [
+    page.getByRole("searchbox", { name: "搜索密钥" }),
+    page.getByRole("combobox", { name: "密钥状态", exact: true }),
+    page.getByRole("combobox", { name: "密钥分组", exact: true }),
+    page.getByRole("button", { name: "刷新列表" }),
+  ];
+  const centers: number[] = [];
+  for (const control of controls) {
+    const bounds = (await control.boundingBox())!;
+    expect(bounds.x).toBeGreaterThan(title.x + title.width);
+    centers.push(bounds.y + bounds.height / 2);
+  }
+  expect(Math.max(...centers) - Math.min(...centers)).toBeLessThanOrEqual(6);
+  expect(Math.abs(centers[0]! - title.y - title.height / 2)).toBeLessThan(24);
+  const status = (await table.getByRole("columnheader", { name: "状态" }).boundingBox())!;
+  const name = (await table.getByRole("columnheader", { name: "名称" }).boundingBox())!;
+  expect(name.width).toBeGreaterThan(status.width);
+  await capture(page, "key-list-actions-and-filters");
+});
+
+test("租户调用表头同排可展开，余额流水时间完整同行", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await login(page, "tenant");
+  await page.goto(state.tenantUrl + "/#calls");
+  const section = page.getByRole("table", { name: "调用记录", exact: true }).locator("xpath=ancestor::section[1]");
+  const title = (await section.getByRole("heading", { name: "调用记录", level: 2, exact: true }).boundingBox())!;
+  const note = section.locator("summary").filter({ hasText: "筛选、性能与计费口径" });
+  const count = section.getByText(/^已加载 \d+ 条/);
+  await expect(count).toBeVisible();
+  for (const el of [note, count]) {
+    const r = (await el.boundingBox())!;
+    expect(r.x).toBeGreaterThan(title.x + title.width);
+    expect(Math.abs(r.y + r.height / 2 - title.y - title.height / 2)).toBeLessThan(6);
+  }
+  await note.click();
+  await expect(section.getByText(/文字搜索仅筛选已加载记录/)).toBeVisible();
+  await note.click();
+  await page.goto(state.tenantUrl + "/#billing");
+  const ledger = page.getByRole("table", { name: "余额流水", exact: true });
+  const dates = ledger.locator('tbody td[data-label="时间"]');
+  await expect(dates.first()).toBeVisible();
+  const lines = await dates.evaluateAll(cells => cells.map(cell => {
+    const range = document.createRange();
+    range.selectNodeContents(cell);
+    return new Set([...range.getClientRects()].map(box => Math.round(box.y))).size;
+  }));
+  expect(lines.every(count => count === 1)).toBe(true);
+  await capture(page, "ledger-single-line-times");
+});
+
+test("管理调用表头居中，展开区使用独立底色和边距", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await login(page, "admin");
+  await page.goto(state.adminUrl + "/#calls");
+  const table = page.getByRole("table", { name: "计费明细", exact: true });
+  const first = table.locator("tbody tr").first();
+  await expect(first).toBeVisible();
+  const header = table.getByRole("columnheader", { name: "时间", exact: true });
+  const metrics = await header.evaluate(cell => {
+    const range = document.createRange(); range.selectNodeContents(cell);
+    const text = range.getBoundingClientRect(), bounds = cell.getBoundingClientRect();
+    return { center: Math.abs(text.y + text.height / 2 - bounds.y - bounds.height / 2), padding: text.x - bounds.x };
+  });
+  expect(metrics.center).toBeLessThanOrEqual(2);
+  expect(metrics.padding).toBeGreaterThanOrEqual(16);
+  await first.getByRole("button", { name: /^展开用量明细 / }).click();
+  const expanded = table.locator("tr.dt-detail > td").first();
+  await expect(expanded).toBeVisible();
+  const colors = await expanded.evaluate(cell => [
+    getComputedStyle(cell).backgroundColor,
+    getComputedStyle(cell.closest(".bento-card") ?? cell.closest("section")!).backgroundColor,
+  ]);
+  expect(colors[0]).not.toBe("rgba(0, 0, 0, 0)");
+  expect(colors[0]).not.toBe(colors[1]);
+  await capture(page, "admin-call-expanded-record");
+});

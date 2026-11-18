@@ -39,6 +39,11 @@ test("门户与运维台的密钥生效限额显示逻辑逐字节一致", () =>
   assert.ok(mine.equals(cp));
 });
 
+test("门户与运维台的模型名称通配逻辑逐字节一致", () => {
+  const [mine, cp] = both("lib/modelNameMatcher.ts");
+  assert.ok(mine.equals(cp));
+});
+
 test("门户与运维台的记录筛选分页逻辑逐字节一致", () => {
   const [mine, cp] = both("lib/recordTable.ts");
   assert.ok(mine.equals(cp));

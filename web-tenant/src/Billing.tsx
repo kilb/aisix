@@ -775,7 +775,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
         {records.loaded && rows.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的流水" : "所选范围内没有流水"} mark="route" />}
         {rows.length > 0 && (
           <DataTable label="余额流水" tableClassName="billing-ledger-table">
-            <colgroup><col className="w-36" /><col className="w-20" /><col className="w-32" /><col className="w-32" /><col className="w-64" /><col /></colgroup>
+            <colgroup><col className="w-48" /><col className="w-28" /><col className="w-36" /><col className="w-36" /><col className="w-64" /><col /></colgroup>
             <thead>
               <tr>
                 <th>时间</th>

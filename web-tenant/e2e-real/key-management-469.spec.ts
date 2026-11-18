@@ -80,7 +80,6 @@ for (const scenario of [{ width: 1440, cycle: "累计", kind: "cumulative", peri
     const label = `tenant-key-469-${scenario.width}-${Date.now()}`;
     const dialog = await newKey(page, label);
     await dialog.getByRole("radio", { name: "指定模型", exact: true }).check();
-    await dialog.getByRole("button", { name: "展开模型列表", exact: true }).click();
     await dialog.getByLabel("搜索模型", { exact: true }).fill(model.name);
     await dialog.getByRole("checkbox", { name: model.name, exact: true }).check();
     await dialog.getByLabel("费用额度（元）", { exact: true }).fill("12.34");
@@ -125,4 +124,80 @@ test("a zero quota is refused before minting and a blank quota stays unlimited",
   expect(Object.hasOwn(created.body, "budget")).toBe(false);
   const rows = (await jsonGet<{ items: Budget[] }>(page, "/api/budgets")).items.filter(row => row.scope === "api_key" && row.target.id === created.key.id);
   expect(rows).toEqual([]);
+});
+
+test("现有密钥可设置、调整和移除费用额度，并恢复无独立并发和 RPM 限制", async ({ page }) => {
+  writable();
+  await login(page);
+  const dialog = await newKey(page, `费用和速率 ${crypto.randomUUID()}`);
+  const { key } = await submit(page, dialog);
+  const path = `/api/keys/${key.id}`;
+  const openEdit = async () => {
+    await page.goto(`${origin}/#keys?key=${key.id}&edit=1`);
+    await expect(page.getByRole("heading", { name: "修改密钥", exact: true })).toBeVisible();
+  };
+  await openEdit();
+  const editor = page.getByRole("region", { name: "密钥费用额度", exact: true });
+  await expect(editor.getByText("未设置密钥费用额度", { exact: true })).toBeVisible();
+  const readCaps = async () => (await jsonGet<{ quotas: Budget[] }>(page, path + "/quota")).quotas.filter(row => row.scope === "api_key");
+  expect(await readCaps()).toEqual([]);
+  await editor.getByRole("button", { name: "设置密钥额度", exact: true }).click();
+  const form = page.getByRole("dialog");
+  await form.getByLabel("额度（元）", { exact: true }).fill("12.34");
+  await form.getByRole("button", { name: "保存额度", exact: true }).click();
+  await expect(editor.getByText(/¥12\.34/)).toBeVisible();
+  const [first] = await readCaps();
+  expect(first).toMatchObject({ limit_micro_cny: 12_340_000 });
+  await editor.getByRole("button", { name: "调整额度", exact: true }).click();
+  await form.getByLabel("额度（元）", { exact: true }).fill("23.45");
+  await form.getByRole("button", { name: "保存额度", exact: true }).click();
+  await expect(editor.getByText(/¥23\.45/)).toBeVisible();
+  expect((await readCaps()).map(row => [row.id, row.limit_micro_cny])).toEqual([[first!.id, 23_450_000]]);
+  await page.reload();
+  await editor.getByRole("button", { name: "移除额度", exact: true }).click();
+  await editor.getByRole("button", { name: "取消", exact: true }).click();
+  expect(await readCaps()).toHaveLength(1);
+  await editor.getByRole("button", { name: "移除额度", exact: true }).click();
+  await editor.getByRole("button", { name: "确认移除额度", exact: true }).click();
+  await expect(editor.getByText("未设置密钥费用额度", { exact: true })).toBeVisible();
+  expect(await readCaps()).toEqual([]);
+  for (const limits of [{ concurrency: 2, rpm: 15 }, {}] as const) {
+    await openEdit();
+    await page.getByLabel("并发", { exact: true }).fill("concurrency" in limits ? String(limits.concurrency) : "");
+    await page.getByLabel("每分钟请求", { exact: true }).fill("rpm" in limits ? String(limits.rpm) : "");
+    const saved = page.waitForResponse(response => new URL(response.url()).pathname === path && response.request().method() === "PATCH");
+    await page.getByRole("button", { name: "保存修改", exact: true }).click();
+    expect((await saved).status()).toBe(200);
+    expect((await jsonGet<{ rate_limit: object }>(page, path)).rate_limit).toEqual(limits);
+  }
+});
+
+test("直接展开的模型卡片可通配选择和取消，保存当前指定集合", async ({ page }) => {
+  writable();
+  await login(page);
+  const dialog = await newKey(page, `指定模型 ${crypto.randomUUID()}`);
+  await dialog.getByRole("radio", { name: "指定模型", exact: true }).check();
+  const options = dialog.getByRole("checkbox");
+  await expect(options.first()).toBeVisible();
+  const models = (await jsonGet<{ items: { id: string; name: string }[] }>(page, "/api/models")).items;
+  // 以当前可选项为准；该分组中未开放的组织模型不能进入匹配结果。
+  const available = [];
+  for (const model of models) {
+    if (await dialog.getByRole("checkbox", { name: model.name, exact: true }).count()) available.push(model);
+  }
+  expect(available.length, "隔离分组至少两个已授权模型").toBeGreaterThan(1);
+  const search = dialog.getByLabel("搜索模型", { exact: true });
+  const longest = available.reduce((a, b) => a.name.length >= b.name.length ? a : b).name;
+  await search.fill(longest + "*");
+  await expect(options).toHaveCount(available.filter(model => model.name.toLowerCase().startsWith(longest.toLowerCase())).length);
+  await expect(dialog.getByRole("checkbox", { name: longest, exact: true })).toBeVisible();
+  await search.fill("*");
+  await dialog.getByRole("button", { name: "选择全部匹配模型", exact: true }).click();
+  for (const model of available) await expect(dialog.getByRole("checkbox", { name: model.name, exact: true })).toBeChecked();
+  await dialog.getByRole("checkbox", { name: available[0]!.name, exact: true }).uncheck();
+  const { key } = await submit(page, dialog);
+  const selected = available.slice(1).map(model => model.id).sort();
+  expect(key.model_ids?.slice().sort()).toEqual(selected);
+  const stored = await jsonGet<CreatedKey>(page, `/api/keys/${key.id}`);
+  expect(stored.model_ids?.slice().sort()).toEqual(selected);
 });

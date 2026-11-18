@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useState } from "react";
 import { keyLimitText } from "./lib/keyRateLimits";
 import { ArrowLeft, Pencil } from "lucide-react";
+import { KeyBudgetEditor } from "./KeyBudgetEditor";
 import { KeyForm, stateOf, when } from "./Keys";
 import { ApiError, groups as groupApi, keys as keyApi, models as modelApi, org as readOrg, usageSummary, type Org, type PortalGroup, type PortalModel, type SessionMember, type TenantKey, type TenantStatus, type UsageSummaryRow } from "./lib/api";
 import { formMessageFor } from "./lib/errors";
@@ -160,7 +161,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
   />;
   if (error) return <>{header}<Card><CardMessage onRetry={() => setRevision(value => value + 1)}>{error}</CardMessage></Card></>;
   if (!key) return <>{header}<Loading /></>;
-  if (editing) return <>{header}{active ? <KeyForm
+  if (editing) return <>{header}{active ? <><KeyForm
     key={`${key.id}/${key.version}/${revision}`}
     initial={key}
     me={member}
@@ -179,7 +180,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
       setSaved(true);
       update({ edit: undefined });
     }}
-  /> : <Card><p className="note crit">组织已停用，暂时无法修改密钥。</p></Card>}</>;
+  /><KeyBudgetEditor key={key.id} keyId={key.id} role={member.role} onInactive={onSelfChanged} /></> : <Card><p className="note crit">组织已停用，暂时无法修改密钥。</p></Card>}</>;
   const state = stateOf(key);
   return <>
     {header}

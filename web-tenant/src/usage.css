@@ -47,7 +47,8 @@
 /* 调用筛选可随主页面吸顶；表格仍只在自己的区域横向滚动。 */
 .usage-record-section.usage-calls-section { overflow: visible; }
 .usage-calls-section > .usage-record-filters { padding: 12px 20px; }
-.usage-calls-section > .usage-call-notes { margin-block: 10px; }
+.usage-calls-section .bento-card-header .hint { margin: 0; }
+.usage-calls-section .bento-card-header:has(.usage-call-notes[open]) { align-items: flex-start; }
 .usage-calls-section > .hint { margin-block: 8px; }
 .usage-calls-section .usage-column-time { width: 7.25rem; }
 .usage-calls-section .usage-column-timing { width: 10rem; }

@@ -7,6 +7,8 @@
 .ops-record-table > .dt > :is(tbody, tfoot) > tr > td { padding: 10px 12px; font-size: var(--text-small); line-height: 21px; }
 /* 标识和说明按内容分配余宽，短字段只取所需空间，避免固定比例挤窄长值。 */
 @container (min-width: 761px) {
+  .ops-record-table > .dt > :is(thead, tbody, tfoot) > tr > :first-child { padding-inline-start: max(16px, var(--dt-edge)); }
+  .ops-record-table > .dt > :is(thead, tbody, tfoot) > tr > :last-child { padding-inline-end: max(16px, var(--dt-edge)); }
   .ops-record-table > .dt td[data-label]:first-child { min-width: 12rem; }
   .ops-record-table > .dt td:is([data-label="接口地址"], [data-label="上游账号 / 路由目标"], [data-label="详情"]) { min-width: 15rem; }
   .ops-record-table > .dt td:is([data-label="模型"], [data-label="上游模型名称"], [data-label="邮箱"], [data-label="成员"]) { min-width: 10rem; }

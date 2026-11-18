@@ -1,12 +1,13 @@
 /* 名称占用剩余宽度；金额与操作保留稳定列宽，横向滚动仅留在表格中。 */
 .tenant-keys .keys-list .dt { min-width: 1080px; table-layout: fixed; }
 .tenant-keys .keys-list .dt :is(th, td):nth-child(2) { width: 5rem; }
-.tenant-keys .keys-list .dt :is(th, td):nth-child(3) { width: 8rem; }
-.tenant-keys .keys-list .dt :is(th, td):nth-child(4) { width: 7rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(3) { width: 7.5rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(4) { width: 9.5rem; }
 .tenant-keys .keys-list .dt :is(th, td):nth-child(5) { width: 8rem; }
 .tenant-keys .keys-list .dt :is(th, td):nth-child(6) { width: 9rem; }
 .tenant-keys .keys-list .dt :is(th, td):nth-child(7) { width: 8rem; }
-.tenant-keys .keys-list .dt :is(th, td):last-child { width: 8rem; }
+.tenant-keys .keys-list .dt :is(th, td):nth-child(8) { width: 6rem; }
+.tenant-keys .keys-list .dt :is(th, td):last-child { width: 8.5rem; }
 .keys-list .key-name { display: block; min-width: 0; overflow-wrap: anywhere; }
 .keys-list .key-prefix { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; color: var(--muted-foreground); }
 .keys-list .key-prefix > code { font-size: var(--text-caption); }
@@ -14,7 +15,7 @@
 .keys-list .key-detail-link { display: inline-flex; min-height: 24px; align-items: center; color: var(--foreground); font-weight: 600; text-underline-offset: 3px; }
 .keys-list .key-detail-link:hover { text-decoration: underline; }
 .keys-list .key-detail-link:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
-.keys-list .dt td[data-label="操作"] > .acts { flex-wrap: wrap; justify-content: flex-end; }
+.keys-list .dt td[data-label="操作"] > .acts { display: inline-flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; vertical-align: middle; }
 .tenant-members-list .dt { min-width: 900px; table-layout: fixed; }
 .tenant-members-list .dt :is(th, td):nth-child(2) { width: 6rem; }
 .tenant-members-list .dt :is(th, td):nth-child(3) { width: 9rem; }
@@ -38,7 +39,27 @@
 .keys-summary-grid p { margin: 4px 0 0; color: var(--muted-foreground); font-size: var(--text-caption); line-height: 18px; }
 .keys-summary-period { margin: 0; padding-top: 12px; border-top: 1px solid var(--border); color: var(--muted-foreground); font-size: var(--text-caption); line-height: 1.6; }
 .tenant-keys .keys-list .dt :is(th, td) { padding: 8px 12px; font-size: var(--text-small); line-height: 20px; vertical-align: middle; }
+.tenant-keys .keys-list .dt :is(th, td):first-child { padding-inline-start: 20px; }
+.tenant-keys .keys-list .dt :is(th, td):last-child { padding-inline-end: 16px; }
 .keys-list .key-prefix { gap: 2px; }
+.tenant-keys .keys-list { container-type: inline-size; }
+.tenant-keys .key-list-header { align-items: center; }
+.key-list-header > :last-child { min-width: 0; max-width: 100%; }
+.key-list-header .record-table-toolbar { margin: 0; align-items: end; }
+.key-list-header .record-table-toolbar > label { margin: 0; }
+.keys-list .dt td[data-label="操作"] .two-step:not(.is-asking) { display: inline-flex; align-items: center; }
+.keys-list .dt td[data-label="操作"] .two-step .btn { margin: 0; }
+@container (min-width: 680px) {
+  .key-list-header > :last-child { flex: 1; flex-wrap: nowrap; justify-content: flex-end; align-items: flex-end; }
+  .key-list-header .record-table-toolbar { display: grid; flex: 1; max-width: 640px; grid-template-columns: minmax(10rem, 1fr) repeat(2, minmax(7rem, 9rem)); }
+  .key-list-header .record-table-toolbar > label { width: 100%; min-width: 0; }
+}
+@container (max-width: 679px) {
+  .key-list-header > :last-child { width: 100%; }
+  .key-list-header .record-table-toolbar { display: grid; flex: 1 0 100%; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .key-list-header .record-table-search { grid-column: 1 / -1; }
+  .key-list-header .record-table-toolbar > label { width: 100%; min-width: 0; }
+}
 .keys-list .dt td[data-label="操作"] > .acts { gap: 2px; }
 .keys-list .dt .cell-note { margin-top: 2px; font-size: var(--text-caption); line-height: 18px; }
 .keys-list .dt .two-step.is-asking { width: 100%; min-width: 0; align-items: stretch; white-space: normal; }
@@ -65,6 +86,22 @@
 .tenant-key-form fieldset.field > p:not(.hint, .field-problem),
 .tenant-key-form > .field > p:not(.hint, .field-problem) { margin: 0; }
 .tenant-key-form .key-model-scope-options { display: grid; gap: 8px; }
+/* 按名称长度换行，整张卡片可点；触屏保留足够的点击面积。 */
+.tenant-key-form .picks.key-model-cards {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 10rem), 1fr));
+  gap: 4px;
+}
+.tenant-key-form .key-model-cards .pick {
+  align-items: center;
+  min-height: 36px;
+  padding: 4px 8px;
+  background: var(--tint);
+}
+.tenant-key-form .key-model-cards .pick:has(input:checked) { background: var(--tint-strong); }
+.tenant-key-form .key-model-cards input { margin: 0; }
+@media (pointer: coarse) {
+  .tenant-key-form .key-model-cards .pick { min-height: 44px; }
+}
 .tenant-key-form .key-model-scope-options + .grid { margin-top: 12px; }
 .tenant-key-form .tenant-form-actions { padding-top: 12px; }
 @media (min-width: 720px) {

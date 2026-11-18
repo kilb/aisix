@@ -138,7 +138,6 @@ test("edit-complete-settings-and-clear-overrides", async ({ page }) => {
   await expect(page.getByRole("combobox", { name: "归属成员", exact: true })).toHaveCount(0);
   await page.getByLabel("名称", { exact: true }).fill("完整修改参数验收");
   await page.getByRole("radio", { name: "指定模型", exact: true }).check();
-  await page.getByRole("button", { name: "展开模型列表", exact: true }).click();
   await page.getByRole("checkbox", { name: model.name, exact: true }).check();
   await page.getByLabel("并发", { exact: true }).fill("1");
   await page.getByLabel("每分钟请求", { exact: true }).fill("1");
