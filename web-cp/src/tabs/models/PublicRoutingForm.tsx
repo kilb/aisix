@@ -125,6 +125,7 @@ export function PublicRoutingForm({
   // later read and is never sent back as the value it had at first edit.
   const [edits, setEdits] = useState<Record<string, Partial<TargetDraft>>>({});
   const [additions, setAdditions] = useState<Addition[]>([]);
+  const [group, setGroup] = useState(() => publicModel.served_by.find(target => target.enabled && target.groups.length > 0)?.groups[0] ?? "");
   const nextKey = useRef(1);
   const [form, focusRefusal] = useRefusalFocus<HTMLFormElement>();
   const [busy, setBusy] = useState(false);
@@ -148,12 +149,19 @@ export function PublicRoutingForm({
   const settingsChanged = settings !== null && !sameRouting(settingsBody, stored);
 
   const targets = targetsOf(publicModel);
+  const visibleTargets = group ? targets.filter(target => target.groups.includes(group)) : targets;
+  const groupNames = new Set(publicModel.served_by.flatMap(target => target.groups));
+  for (const account of catalog.accounts.values()) {
+    for (const name of account.doc.groups ?? []) groupNames.add(name);
+  }
+  if (group) groupNames.add(group);
   const shownOf = (t: ServedBy) => shownDraft(t, edits[t.provider_key_id]);
-  const changedTargets = targets.flatMap((t) => {
+  const changedTargets = visibleTargets.flatMap((t) => {
     const body = changedBody(shownOf(t), t);
     return body === null ? [] : [{ target: t, typed: shownOf(t), body }];
   });
-  const dirty = settingsChanged || changedTargets.length > 0 || additions.length > 0;
+  const targetsChanged = changedTargets.length > 0 || additions.length > 0;
+  const dirty = settingsChanged || targetsChanged;
   // A disabled mapping is not a target; adding its account enables it again.
   const disabledRows = new Map(
     publicModel.served_by.filter((s) => !s.enabled).map((s) => [s.provider_key_id, s] as const),
@@ -362,13 +370,16 @@ export function PublicRoutingForm({
       ...additions.filter((x) => x.key !== a.key && x.accountId !== "").map((x) => x.accountId),
     ]);
     return [...catalog.accounts.values()]
-      .filter((account) => !taken.has(account.id))
+      .filter((account) => !taken.has(account.id) && (!group || account.doc.groups?.includes(group)))
       .map((account) => ({
         id: account.id,
         label: `${account.doc.display_name || account.id}（${account.doc.groups?.length ? account.doc.groups.join("、") : "未设分组"}）`,
       }));
   }
-  const groupBadges = (groups: string[] | undefined) => <GroupBadges groups={groups ?? []} empty="—（账号未设分组）" />;
+  const groupBadges = (groups: string[] = []) => <>
+    <GroupBadges groups={groups} empty="—（账号未设分组）" />
+    {groups.length > 1 && <span>各分组共享此账号的映射</span>}
+  </>;
 
   return (
     <form ref={form} className="panel ops-routing-form mb-0" aria-label={title} onSubmit={submit}>
@@ -378,6 +389,7 @@ export function PublicRoutingForm({
       />
       <section className="pm-route-section @container" aria-label="选路设置">
         <div className="pm-section-heading"><h3>选路设置</h3><RoutePolicy routing={publicModel.effective_routing} compact /></div>
+        <p className="hint">此公共模型的选路设置适用于所有分组。</p>
         <details className="pm-routing-explanation"><summary>查看当前选路规则</summary><RoutePolicy routing={publicModel.effective_routing} /></details>
         {bad && (
           <div className="note crit mt-0" role="alert">
@@ -459,10 +471,16 @@ export function PublicRoutingForm({
       </section>
 
       <section className="ops-form-section pm-route-section @container" aria-label="路由目标">
-        <div className="pm-section-heading"><h3>路由目标 <span className="pm-section-count">{targets.length}</span></h3><span className="text-caption text-fg-3">按优先级从高到低使用</span></div>
-        {targets.length === 0 && additions.length === 0 ? (
+        <div className="pm-section-heading"><h3>路由目标 <span className="pm-section-count">{visibleTargets.length}</span></h3><span className="text-caption text-fg-3">按优先级从高到低使用</span></div>
+        {groupNames.size > 0 && <Field label="查看分组" hint={targetsChanged ? "保存或撤销目标改动后可切换分组。" : undefined}>
+          {aria => <Select value={group} disabled={writing || targetsChanged} onValueChange={value => { setGroup(value); setRemoving(null); }} {...aria}>
+            <option value="">全部分组</option>
+            {[...groupNames].sort().map(name => <option key={name} value={name}>{name}</option>)}
+          </Select>}
+        </Field>}
+        {visibleTargets.length === 0 && additions.length === 0 ? (
           <p className="hint rounded-field border border-dashed border-hairline px-4 py-6 text-center text-caption">
-            还没有账号服务这个模型：请求会以「上游不可用」失败。{!readOnly && "用下面的「添加目标」加一个账号。"}
+            {group ? "本分组没有已启用的路由目标。" : "还没有账号服务这个模型：请求会以「上游不可用」失败。"}{!readOnly && "用下面的「添加目标」加一个账号。"}
           </p>
         ) : (
           <div className="ops-target-list pm-target-list">
@@ -474,7 +492,7 @@ export function PublicRoutingForm({
               <span />
             </div>
             <ul>
-              {targets.map((t) => {
+              {visibleTargets.map((t) => {
                 const accountId = t.provider_key_id;
                 const accountName = t.display_name || "（账号已不存在）";
                 return (
