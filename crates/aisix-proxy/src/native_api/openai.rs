@@ -95,6 +95,9 @@ pub(crate) fn provider_entry_by_id(
     if matching.next().is_some() {
         return Err(not_found());
     }
+    if entry.disabled {
+        return Err(crate::dispatch::DISABLED_PROVIDER);
+    }
     Ok(entry)
 }
 

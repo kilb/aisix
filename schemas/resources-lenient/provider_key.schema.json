@@ -333,6 +333,10 @@
       ],
       "description": "API surfaces this upstream serves natively, beyond the one its `adapter` already implies, and the base URL each one lives at.\n\nOne upstream account often exposes more than one protocol, on different paths of the same host — an OpenAI-compatible `/v1/chat/completions` under `…/v1` and an Anthropic-compatible `/v1/messages` under `…/anthropic`, both authenticated by the same credential. `api_base` can only name one of them, so without this field every request the declared path cannot serve gets translated instead — losing whatever the target protocol carries that the canonical chat shape does not (prompt-cache breakpoints, thinking blocks). Declaring the second entry here lets each inbound protocol reach its own native path under the one credential.\n\nEach surface resolves on its own terms; see [`ProviderApis`]. Surfaces this map has no key for — embeddings, audio, images, videos, files/batches/fine-tuning, rerank — always use `api_base`, exactly as before."
     },
+    "disabled": {
+      "description": "暂停向此账号发送请求，保留模型映射及凭据以便重新启用。",
+      "type": "boolean"
+    },
     "display_name": {
       "description": "Operator-facing label, unique within the gateway. Surfaces in the Admin API list view and in dashboard UIs that wrap this resource.",
       "minLength": 1,

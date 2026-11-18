@@ -116,6 +116,40 @@ fn fixed_hash_fails_when_its_account_cools_instead_of_moving() {
 }
 
 #[test]
+fn account_disabled_preserves_fixed_owner_and_allows_normal_failover() {
+    let snapshot = snapshot();
+    let registry = RoutingRegistry::new();
+    let status = crate::ModelRuntimeStatusTracker::new();
+    let fixed = group(false);
+    let ordinary = group(true);
+    let headers = headers(0);
+    let select = |group: &Arc<Model>| pick(&registry, &status, &snapshot, group, &headers, None);
+    let before = select(&fixed).unwrap();
+    let id = before[0].model.provider_key_id.as_deref().unwrap();
+    let original = snapshot.provider_keys.get_by_id(id).unwrap();
+    let mut changed = serde_json::to_value(&*original.value).unwrap();
+    changed["disabled"] = json!(true);
+    snapshot.provider_keys.insert(ResourceEntry::new(
+        id,
+        serde_json::from_value(changed).unwrap(),
+        2,
+    ));
+    assert_eq!(
+        select(&fixed).err().unwrap().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let active = select(&ordinary).unwrap();
+    assert!(!active.is_empty());
+    assert!(active
+        .iter()
+        .all(|member| member.model.provider_key_id.as_deref() != Some(id)));
+    snapshot
+        .provider_keys
+        .insert(ResourceEntry::new(id, (*original.value).clone(), 3));
+    assert_eq!(select(&fixed).unwrap()[0].id, before[0].id);
+}
+
+#[test]
 fn fixed_hash_missing_header_cannot_fall_back_to_caller_key() {
     let snapshot = snapshot();
     let error = pick(

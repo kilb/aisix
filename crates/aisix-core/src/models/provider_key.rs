@@ -34,6 +34,10 @@ pub struct ProviderKey {
     #[schemars(length(min = 1))]
     pub display_name: String,
 
+    /// 暂停向此账号发送请求，保留模型映射及凭据以便重新启用。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
+
     /// Upstream provider's API key. The gateway receives plaintext so it
     /// can authenticate to the upstream provider. Protect the configuration
     /// store and transport accordingly.
@@ -1133,6 +1137,7 @@ mod tests {
         // because None). Re-deserializing must reproduce the original
         // struct.
         let original = ProviderKey {
+            disabled: false,
             display_name: "openai-prod".into(),
             api_key: "sk-x".into(),
             api_base: None,

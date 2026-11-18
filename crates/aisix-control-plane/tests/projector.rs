@@ -733,6 +733,123 @@ async fn a_created_resource_lands_under_the_env_prefix_with_its_credential_in_pl
 }
 
 #[tokio::test]
+async fn account_off_and_on_reproject_the_same_secret_and_preserve_individual_mappings() {
+    let Some(cp) = TestCp::start_with_kine().await else {
+        return;
+    };
+    let kine = raw_kine(&support::kine_endpoint().expect("kine is configured")).await;
+    let op = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let original = provider_key(&unique("switch"), SECRET);
+    let id = api_create(&cp, op.cookie(), "provider_keys", original.clone()).await;
+    // 一个已启用、一个手动停用的映射都必须保留各自的设置和直接模型 ID。
+    for enabled in [true, false] {
+        let created = cp
+            .send(
+                "POST",
+                "/admin/public-models",
+                Some(op.cookie()),
+                Some(json!({"name": unique("model")})),
+            )
+            .await;
+        assert_eq!(created.status, 201, "{created:?}");
+        let model = created.body["id"].as_str().expect("public model id");
+        let mapped = cp
+            .send(
+                "PUT",
+                &format!("/admin/provider-keys/{id}/channel-models/{model}"),
+                Some(op.cookie()),
+                Some(json!({"upstream_model": "vendor-name", "enabled": enabled,
+                "priority": 7, "weight": 13})),
+            )
+            .await;
+        assert_eq!(mapped.status, 200, "{mapped:?}");
+    }
+    let mappings = || {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(cm) FROM channel_models cm WHERE provider_key_id = $1 ORDER BY public_model_id",
+        )
+        .bind(id)
+        .fetch_all(cp.db().pool())
+    };
+    let rates = || {
+        sqlx::query_scalar::<_, Value>(
+            "SELECT to_jsonb(r) FROM pricing_cost_rates r WHERE provider_key_id = $1 ORDER BY revision_id",
+        )
+        .bind(id)
+        .fetch_all(cp.db().pool())
+    };
+    let created_rate = cp
+        .send(
+            "POST",
+            &format!("/admin/provider-keys/{id}/cost-rates"),
+            Some(op.cookie()),
+            Some(json!({"cny_per_usd": "0.37", "effective_from": chrono::Utc::now()})),
+        )
+        .await;
+    assert_eq!(created_rate.status, 201, "{created_rate:?}");
+    let original_rates = rates().await.expect("configured account rate");
+    assert_eq!(original_rates.len(), 1);
+    let before = mappings().await.expect("initial mappings");
+    assert_eq!(before.len(), 2);
+    assert!(before.iter().any(|row| row["enabled"] == true));
+    assert!(before.iter().any(|row| row["enabled"] == false));
+    let bundle = cp.issue_bundle(&op, "late-old-account-switch").await;
+    let gateway = cp.dp_client(&bundle);
+    let path = format!("/admin/resources/provider_keys/{id}");
+    let key = key_for(cp.env(), Kind::ProviderKeys, id);
+    all_projected(cp.db()).await;
+    let (_, mut revision) = raw_json(&kine, &key).await.expect("initial projection");
+    for disabled in [true, false] {
+        let current = cp.send("GET", &path, Some(op.cookie()), None).await;
+        assert_eq!(current.status, 200, "{current:?}");
+        let mut doc = current.body["doc"].clone();
+        assert_eq!(doc["api_key"], "[REDACTED]");
+        if disabled {
+            doc["disabled"] = json!(true);
+        } else {
+            doc.as_object_mut().unwrap().remove("disabled");
+        }
+        let version = current.body["version"].as_i64().expect("current version");
+        let changed = cp
+            .send_conditional("PUT", &path, op.cookie(), version, json!({"doc": doc}))
+            .await;
+        assert_eq!(changed.status, 200, "{changed:?}");
+        all_projected(cp.db()).await;
+        let (projected, next) = raw_json(&kine, &key).await.expect("reprojected account");
+        let mut expected = original.clone();
+        if disabled {
+            expected["disabled"] = json!(true);
+        }
+        assert_eq!(projected, expected);
+        assert!(next > revision);
+        revision = next;
+        assert_eq!(mappings().await.expect("preserved mappings"), before);
+        assert_eq!(rates().await.expect("preserved rates"), original_rates);
+        // 下架后加入的旧实例即使确认了版本号，也无法执行停用字段。
+        let beat = gateway
+            .heartbeat(json!({
+                "dp_id": bundle.dp_id, "instance_id": "late-account", "hostname": "late-account",
+                "uptime_seconds": 1, "applied_revision": revision, "version": "dev+sha-deadbee",
+                "supported_guardrail_kinds": [], "exporter_health": []
+            }))
+            .await;
+        assert_eq!(beat.status, 200, "{beat:?}");
+        let row = cp.send("GET", &path, Some(op.cookie()), None).await;
+        assert_eq!(row.status, 200, "{row:?}");
+        let expected = if disabled { "rejected" } else { "applied" };
+        assert_eq!(row.body["rollout"]["state"], expected, "{row:?}");
+        let summary = cp
+            .send("GET", "/admin/rollout", Some(op.cookie()), None)
+            .await;
+        assert_eq!(summary.status, 200, "{summary:?}");
+        let rejected = summary.body["rejected"]
+            .as_array()
+            .expect("rejected resources");
+        assert_eq!(rejected.iter().any(|r| r["id"] == id.to_string()), disabled);
+    }
+}
+
+#[tokio::test]
 async fn the_recorded_revision_is_the_writes_revision() {
     let Some(cp) = TestCp::start_with_kine().await else {
         return;

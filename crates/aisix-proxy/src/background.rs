@@ -72,9 +72,10 @@ impl CheckSchedule {
         snapshot: &AisixSnapshot,
         now: Instant,
     ) -> (Vec<Arc<ResourceEntry<Model>>>, Option<Instant>) {
-        let checked = snapshot
-            .models
-            .matching_entries(|e| enabled_check(&e.value).is_some());
+        let checked = snapshot.models.matching_entries(|e| {
+            enabled_check(&e.value).is_some()
+                && !dispatch::model_provider_disabled(snapshot, &e.value)
+        });
         // A row that left and came back is checked as soon as it returns.
         let present: HashSet<&str> = checked.iter().map(|e| e.id.as_str()).collect();
         self.last_started
@@ -130,7 +131,7 @@ pub async fn run_background_model_checks(
         let snap = snapshot.load();
         let (due, next) = schedule.take_due(&snap, Instant::now());
         for entry in due {
-            let snapshot = Arc::clone(&snap);
+            let snapshot = snapshot.clone();
             let hub = Arc::clone(&hub);
             let tracker = Arc::clone(&tracker);
             let permits = Arc::clone(&semaphore);
@@ -139,9 +140,14 @@ pub async fn run_background_model_checks(
                 // (only happens during shutdown), the check is skipped
                 // and the tracker stays at last-known state — fine.
                 if let Ok(_permit) = permits.acquire_owned().await {
+                    // 排队期间账号可能被停用，使用实际开始探活时的配置。
+                    let snapshot = snapshot.load();
+                    let Some(entry) = snapshot.models.get_by_id(&entry.id) else {
+                        return entry.id.clone();
+                    };
                     if let Some(cfg) = enabled_check(&entry.value) {
                         run_one(
-                            Arc::clone(&snapshot),
+                            snapshot,
                             hub,
                             tracker,
                             &entry.id,
@@ -197,6 +203,10 @@ async fn run_one(
     cfg: &BackgroundModelCheck,
     request_id: &str,
 ) {
+    // 人工下架不属于探活失败；恢复时沿用账号原有的健康状态。
+    if dispatch::model_provider_disabled(&snapshot, model) {
+        return;
+    }
     let outcome = check_direct_model(&snapshot, &hub, id, model, cfg, request_id).await;
     match outcome {
         Ok(()) => tracker.clear_unhealthy(id),

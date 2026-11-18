@@ -99,6 +99,7 @@ pub struct ResourceRollout {
 /// What a document's rollout is computed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RolloutInput {
+    pub disabled_account: bool,
     pub kind: Kind,
     pub id: Uuid,
     /// Whether the projector has written the latest version to kine.
@@ -112,6 +113,9 @@ pub struct RolloutInput {
 impl RolloutInput {
     pub fn of_row(row: &ResourceRow) -> RolloutInput {
         RolloutInput {
+            disabled_account: row.kind == Kind::ProviderKeys
+                && !row.deleted
+                && row.doc["disabled"] == true,
             kind: row.kind,
             id: row.id,
             projected: row.projected_version == Some(row.version),
@@ -123,6 +127,7 @@ impl RolloutInput {
 /// A gateway instance, as its latest heartbeat reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceView {
+    pub supports_account_disable: bool,
     pub instance_id: String,
     pub hostname: String,
     /// Heard from within `CP_INSTANCE_STALE_SECS`.
@@ -169,9 +174,14 @@ pub fn compute(r: &RolloutInput, instances: &[InstanceView]) -> ResourceRollout 
         let refused = instance
             .rejections
             .iter()
-            .find(|(kind, rid, _)| *kind == r.kind && *rid == id);
+            .find(|(kind, rid, _)| *kind == r.kind && *rid == id)
+            .map(|(_, _, error)| error.as_str())
+            .or_else(|| {
+                (r.disabled_account && !instance.supports_account_disable)
+                    .then_some("此网关版本未确认支持上游账号下架")
+            });
         match refused {
-            Some((_, _, error)) => out.rejections.push(json!({
+            Some(error) => out.rejections.push(json!({
                 "instance_id": instance.instance_id,
                 "hostname": instance.hostname,
                 "error": error,
@@ -284,6 +294,8 @@ impl Fleet {
                         ));
                     }
                     InstanceView {
+                        supports_account_disable: cp_version
+                            .is_none_or(|cp| crate::compat::supports_account_disable(&version, cp)),
                         instance_id,
                         hostname,
                         online,
@@ -434,22 +446,24 @@ pub async fn summary(
         &state.cfg.cp_version,
     )
     .await?;
-    /// `(kind, id, name, projected, kine_revision)` of a stored document.
-    type DocumentState = (String, Uuid, Option<String>, bool, Option<i64>);
+    /// `(kind, id, name, projected, kine_revision, disabled_account)` of a stored document.
+    type DocumentState = (String, Uuid, Option<String>, bool, Option<i64>, bool);
     let rows: Vec<DocumentState> = sqlx::query_as(
         "SELECT kind, id, COALESCE(doc->>'display_name', doc->>'name'), \
-           projected_version IS NOT DISTINCT FROM version, kine_revision \
+           projected_version IS NOT DISTINCT FROM version, kine_revision, \
+           kind = 'provider_keys' AND NOT deleted AND doc @> '{\"disabled\":true}' \
          FROM gw_resources ORDER BY seq",
     )
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
     let (mut pending, mut propagating, mut rejected) = (0u64, 0u64, Vec::new());
-    for (segment, id, name, projected, kine_revision) in rows {
+    for (segment, id, name, projected, kine_revision, disabled_account) in rows {
         let Some(kind) = Kind::from_segment(&segment) else {
             continue;
         };
         let rollout = fleet.rollout(&RolloutInput {
+            disabled_account,
             kind,
             id,
             projected,
@@ -579,6 +593,7 @@ mod tests {
 
     fn written(revision: i64) -> RolloutInput {
         RolloutInput {
+            disabled_account: false,
             kind: Kind::Models,
             id: Uuid::from_u128(0x7e1),
             projected: true,
@@ -588,6 +603,7 @@ mod tests {
 
     fn instance(name: &str, online: bool, applied_revision: i64) -> InstanceView {
         InstanceView {
+            supports_account_disable: true,
             instance_id: name.to_string(),
             hostname: format!("host-{name}"),
             online,

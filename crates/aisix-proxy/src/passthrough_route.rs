@@ -646,6 +646,9 @@ async fn dispatch(
                     &auth,
                 ));
             }
+            if entry.disabled {
+                return Err(RouteError::of(crate::dispatch::DISABLED_PROVIDER, &auth));
+            }
             Some(entry)
         }
         PassthroughCredentialMode::ForwardClient => None,

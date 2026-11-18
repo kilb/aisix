@@ -68,6 +68,19 @@ pub(crate) fn resolve_bridge(hub: &Hub, provider_key: &ProviderKey) -> Option<Ar
     hub.dispatch_two_tier(provider_key)
 }
 
+// 没有预计恢复时间；沿用不暴露真实账号的 503。
+pub(crate) const DISABLED_PROVIDER: ProxyError = ProxyError::AllCandidatesUnavailable {
+    retry_after_secs: None,
+};
+
+pub(crate) fn model_provider_disabled(snapshot: &AisixSnapshot, model: &Model) -> bool {
+    model
+        .provider_key_id
+        .as_deref()
+        .and_then(|id| snapshot.provider_keys.get_by_id(id))
+        .is_some_and(|key| key.disabled)
+}
+
 /// Look up the `ProviderKey` a given `Model` references. Returns a
 /// 400 if the Model is a virtual router (those don't dispatch
 /// directly — caller should walk `routing.targets` first), or if the
@@ -88,6 +101,9 @@ pub(crate) fn resolve_provider_key(
             model.display_name
         ))
     })?;
+    if entry.disabled {
+        return Err(DISABLED_PROVIDER);
+    }
     // The request has now committed to a concrete target. Everything that
     // can still go wrong from here — an unusable credential, the upstream
     // itself — produces an error that carries no upstream identity, so the

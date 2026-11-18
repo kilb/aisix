@@ -506,12 +506,15 @@ pub(crate) fn resolve_target(
                         m,
                         &auth.key().allowed_provider_groups,
                     )
-                    && m.provider_key_id
-                        .as_deref()
-                        .and_then(|id| snapshot.provider_keys.get_by_id(id))
-                        .is_some_and(|pk| supported_adapter(&pk.value).is_some())
             })
-            .min_by(|a, b| a.id.cmp(&b.id))
+            .filter_map(|entry| {
+                let pk = snapshot
+                    .provider_keys
+                    .get_by_id(entry.provider_key_id.as_deref()?)?;
+                supported_adapter(&pk).map(|_| (pk.disabled, entry))
+            })
+            .min_by(|(off_a, a), (off_b, b)| off_a.cmp(off_b).then_with(|| a.id.cmp(&b.id)))
+            .map(|(_, entry)| entry)
             .ok_or_else(|| {
                 ProxyError::InvalidRequest(
                     "no model specified and no accessible OpenAI-compatible model found; \

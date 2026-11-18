@@ -33,6 +33,7 @@ struct Case {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
     Direct,
+    DisabledDirect,
     Routing,
     FixedHash,
     FixedHashMissingProvider,
@@ -170,14 +171,14 @@ fn app(
     let provider: ProviderKey = serde_json::from_value(json!({
         "display_name":"private-provider","api_key":"component-upstream-secret",
         "provider":case.provider,"adapter":adapter,"api_base":base,
-        "groups":["private-provider-group"]
+        "groups":["private-provider-group"], "disabled":shape == Shape::DisabledDirect
     }))?;
     if shape != Shape::FixedHashMissingProvider {
         snapshot
             .provider_keys
             .insert(ResourceEntry::new(PROVIDER, provider, 1));
     }
-    let routing = shape != Shape::Direct;
+    let routing = !matches!(shape, Shape::Direct | Shape::DisabledDirect);
     let model: Model = serde_json::from_value(json!({
         "display_name":if routing { "private-target" } else { "entry" },
         "provider":case.provider,"model_name":"private-upstream-model",
@@ -496,6 +497,25 @@ async fn fixed_hash_group_refusal_preserves_its_wire_error_and_missing_provider_
         assert_operator(&denied, "provider_groups_unavailable", false);
         assert_operator(&missing, "provider_unavailable", false);
         assert!(!missing.logs.contains("provider_groups_unavailable"));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_disabled_stops_physical_dispatch_on_all_supported_families() -> TestResult {
+    // 上游端口真实可达；提前拒绝时不得留下任何待接受的 TCP 连接。
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let base = format!("http://{}/v1", listener.local_addr()?);
+    for &case in CASES {
+        for stream in [false, true] {
+            let outcome = call(&base, case, false, Shape::DisabledDirect, true, stream).await?;
+            assert_eq!(outcome.status, StatusCode::SERVICE_UNAVAILABLE, "{case:?}");
+            assert_eq!(outcome.event.upstream_dispatched, Some(false), "{case:?}");
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        }
     }
     Ok(())
 }

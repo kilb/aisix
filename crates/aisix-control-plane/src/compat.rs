@@ -95,6 +95,7 @@ const API_KEY_ENDPOINTS_SINCE: Since = Since::ThisRelease;
 const TOKEN_COUNTING_SINCE: Since = Since::ThisRelease;
 
 const CACHE_WRITE_12H: &str = "/cost/cache_write_12h_per_1k";
+const ACCOUNT_DISABLE_SINCE: Since = Since::ThisRelease;
 
 // 自定义账号的默认 Responses 计数语义晚于固定计数 kind，不继承旧构建白名单。
 const DEFAULT_RESPONSES_COUNTER_SINCE: Since = Since::ThisRelease;
@@ -132,6 +133,14 @@ const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
 /// `allowed_provider_groups`, which its own row already refuses while such
 /// a gateway is registered.
 pub const FIELD_FLOORS: &[FieldFloor] = &[
+    FieldFloor {
+        kind: Kind::ProviderKeys,
+        pointer: "/disabled",
+        trigger: Trigger::BoolEquals(true),
+        since: ACCOUNT_DISABLE_SINCE,
+        widens: never,
+        why: "an older gateway continues to send requests to the disabled account",
+    },
     FieldFloor {
         kind: Kind::TokenCounting,
         pointer: "/messages_count_tokens",
@@ -363,6 +372,10 @@ fn supports_token_counting_since(version: &str, cp_version: &str, since: &Since)
 
 pub(crate) fn supports_default_responses_counter(version: &str, cp_version: &str) -> bool {
     supports_since_exact_dev(version, cp_version, &DEFAULT_RESPONSES_COUNTER_SINCE)
+}
+
+pub(crate) fn supports_account_disable(version: &str, cp_version: &str) -> bool {
+    supports_since_exact_dev(version, cp_version, &ACCOUNT_DISABLE_SINCE)
 }
 
 fn supports_since_exact_dev(version: &str, cp_version: &str, since: &Since) -> bool {
@@ -766,7 +779,7 @@ fn too_old(pointer: &str, message: String) -> ApiError {
 /// has been incomplete within that window. With no gateway registered the
 /// write passes. A write that sets no floored field, or only fields whose
 /// minimum this control plane cannot judge, reads nothing.
-/// 客户新增族扩权、固定计数和十二小时费率必须另外核实构建支持。
+/// 客户新增族扩权、固定计数、十二小时费率和上游账号停用必须另外核实构建支持。
 pub async fn gate(
     conn: &mut PgConnection,
     ctx: &WriteCtx,
@@ -780,6 +793,9 @@ pub async fn gate(
         .iter()
         .copied()
         .find(|floor| floor.pointer == CACHE_WRITE_12H);
+    let disabled_account = triggered
+        .iter()
+        .any(|floor| floor.kind == Kind::ProviderKeys && floor.pointer == "/disabled");
     let token_counting_floor = triggered
         .iter()
         .copied()
@@ -794,23 +810,33 @@ pub async fn gate(
         .filter_map(|f| minimum(&f.since, &ctx.cp_version).map(|m| (f, m)))
         .collect();
     let first = floors.first();
-    if first.is_none()
-        && price_floor.is_none()
-        && !customer_expansion
-        && !native_expansion
-        && !token_counting
-    {
+    let build_check = customer_expansion
+        || native_expansion
+        || token_counting
+        || disabled_account
+        || price_floor.is_some();
+    if first.is_none() && !build_check {
         return Ok(());
     }
     let versions: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT version FROM dp_instances WHERE last_seen_at > now() - {FLEET_WINDOW} \
          AND (NOT $1 OR retired_at IS NULL)"
     ))
-    // 只缩小固定计数及其依赖账号的清单，其他写入保留完整窗口。
-    .bind(token_counting)
+    // 退役由管理员确认已停机；普通离线实例仍在窗口内。
+    .bind(token_counting || disabled_account)
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    if disabled_account
+        && versions
+            .iter()
+            .any(|v| !supports_account_disable(v, &ctx.cp_version))
+    {
+        return Err(too_old(
+            "/disabled",
+            "有未退役网关无法确认支持账号下架，请先升级网关".to_string(),
+        ));
+    }
     if let Some(pointer) = default_responses {
         let unsupported = versions
             .iter()
@@ -888,6 +914,11 @@ pub async fn gate(
                 CACHE_WRITE_12H,
                 "24 小时内有网关凭据达到实例上限，无法确认全部网关支持十二小时费率".to_string(),
             )
+        } else if disabled_account {
+            (
+                "/disabled",
+                "24 小时内有网关凭据达到实例上限，无法确认全部网关支持账号下架".to_string(),
+            )
         } else if let Some(pointer) = counter_pointer {
             (
                 pointer,
@@ -901,7 +932,7 @@ pub async fn gate(
         };
         return Err(too_old(pointer, message));
     }
-    if customer_expansion || native_expansion || token_counting || price_floor.is_some() {
+    if build_check {
         // 旧逻辑可无标记淘汰 Dev 实例；满额清单不能证明未遗漏旧构建。
         // 保留全部行判断，直到正常清理降到上限以下，不能仅统计最近 24 小时。
         let full: bool = sqlx::query_scalar(
@@ -915,9 +946,12 @@ pub async fn gate(
             return Err(too_old(
                 counter_pointer
                     .or(price_floor.map(|f| f.pointer))
+                    .or(disabled_account.then_some("/disabled"))
                     .unwrap_or("/allowed_endpoints"),
                 if price_floor.is_some() {
                     "网关凭据的实例记录已达上限，无法确认全部网关支持十二小时费率"
+                } else if disabled_account {
+                    "网关凭据的实例记录已达上限，无法确认全部网关支持账号下架"
                 } else if token_counting {
                     "网关凭据的实例记录已达上限，无法确认全部网关支持固定计数账号"
                 } else {
@@ -1543,6 +1577,7 @@ mod tests {
         assert_eq!(
             rows,
             [
+                (Kind::ProviderKeys, "/disabled"),
                 (Kind::TokenCounting, "/messages_count_tokens"),
                 (Kind::TokenCounting, "/responses_input_tokens"),
                 (Kind::Models, "/routing/hash_failover"),

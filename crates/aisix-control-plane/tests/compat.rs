@@ -134,6 +134,62 @@ fn refused_at(r: &Resp, path: &str) -> String {
         .to_string()
 }
 
+#[tokio::test]
+async fn disabling_an_account_requires_a_capable_fleet_but_restoring_it_does_not() {
+    for (stamp, old, capable) in [
+        (CP_VERSION, OLD, CURRENT),
+        ("dev+sha-12ab345", "dev+sha-abcd123", "dev+sha-12ab345"),
+    ] {
+        let Some(cp) = TestCp::start_stamped(stamp).await else {
+            return;
+        };
+        let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+        let gw = Gateway::issue(&cp, &admin).await;
+        gw.beat("account-toggle", old).await;
+        let created = create(
+            &cp,
+            &admin,
+            "provider_keys",
+            json!({
+                "provider": "openai", "display_name": "account-toggle", "api_key": "example"
+            }),
+        )
+        .await;
+        assert_eq!(created.status, 201, "{created:?}");
+        let path = format!(
+            "/admin/resources/provider_keys/{}",
+            created.body["id"].as_str().unwrap()
+        );
+        let mut doc = created.body["doc"].clone();
+        doc["disabled"] = json!(true);
+        let turn_off = json!({"doc": doc});
+        let refused = cp
+            .send_conditional("PUT", &path, admin.cookie(), 1, turn_off.clone())
+            .await;
+        refused_at(&refused, "/disabled");
+        gw.beat("account-toggle", capable).await;
+        let off = cp
+            .send_conditional("PUT", &path, admin.cookie(), 1, turn_off.clone())
+            .await;
+        assert_eq!(off.status, 200, "{off:?}");
+        gw.beat("account-toggle", old).await;
+        let on = cp
+            .send_conditional(
+                "PUT",
+                &path,
+                admin.cookie(),
+                2,
+                json!({"doc": created.body["doc"]}),
+            )
+            .await;
+        assert_eq!(on.status, 200, "{on:?}");
+        let refused = cp
+            .send_conditional("PUT", &path, admin.cookie(), 3, turn_off)
+            .await;
+        refused_at(&refused, "/disabled");
+    }
+}
+
 async fn age_instance(cp: &TestCp, instance: &str, interval: &str) {
     sqlx::query(&format!(
         "UPDATE dp_instances SET last_seen_at = now() - interval '{interval}' \

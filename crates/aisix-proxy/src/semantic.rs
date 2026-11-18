@@ -820,6 +820,12 @@ async fn classify_inner(
                 ),
             )
         })?;
+    if pk.disabled {
+        return Err((
+            ClassifierUnavailable,
+            "classifier account is disabled".into(),
+        ));
+    }
     if pk.value.provider != TYPESAFE_PROVIDER {
         return Err((
             ClassifierUnavailable,
@@ -986,6 +992,12 @@ fn select_eligible(
     });
     if candidates.is_empty() {
         return Err(ProxyError::ModelIpRestricted(router.display_name.clone()));
+    }
+    candidates.retain(|(candidate, _)| {
+        !crate::dispatch::model_provider_disabled(snapshot, &candidate.model)
+    });
+    if candidates.is_empty() {
+        return Err(crate::dispatch::DISABLED_PROVIDER);
     }
     // A candidate on a provider key whose budget is exhausted is excluded
     // as hard as one outside its allowlist.

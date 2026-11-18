@@ -33,6 +33,7 @@ import { Select } from "../ui/Select";
 /** The fields of a `provider_key` this page edits; every other field is kept as stored. */
 interface ProviderKeyDoc {
   display_name?: string;
+  disabled?: boolean;
   adapter?: string | null;
   provider?: string;
   api_base?: string | null;
@@ -121,6 +122,7 @@ export function Providers({ canEdit, initialSection }: TabProps) {
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteFailure, setDeleteFailure] = useState<{ name: string; error: ApiError } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [changingAvailability, setChangingAvailability] = useState<string | null>(null);
   const [adapterFilter, setAdapterFilter] = useState("");
   const accountTable = useRecordTable({ items: (pk.items ?? []).filter((a) => adapterFilter === "" || a.doc.adapter === adapterFilter), resetKey: adapterFilter, searchText: (a) => [nameOf(a), a.id, a.doc.adapter ?? "", a.doc.provider ?? "", ...(a.doc.groups ?? [])] });
 
@@ -169,6 +171,27 @@ export function Providers({ canEdit, initialSection }: TabProps) {
     setNote({ kind: "ok", text: `已保存「${nameOf(view)}」。` });
     // The row's badge follows the rollout; a failed read leaves the last view.
     pk.watch(view.id).catch(() => undefined);
+  }
+
+  async function changeAvailability(a: Account) {
+    const action = a.doc.disabled ? "上架" : "下架";
+    setChangingAvailability(a.id);
+    setNote(null);
+    try {
+      const doc = { ...a.doc };
+      if (a.doc.disabled) delete doc.disabled;
+      else doc.disabled = true;
+      const updated = await pk.save(a.id, doc, a.version);
+      setNote({ kind: "ok", text: `已保存「${nameOf(a)}」的${action}设置。` });
+      pk.watch(updated.id).catch(() => undefined);
+    } catch (e) {
+      const conflict = e instanceof ApiError && e.code === "version_mismatch";
+      const message = conflict ? "账号已被他人修改，请按最新状态重试。" : errorText(e);
+      setNote({ kind: "crit", text: `「${nameOf(a)}」${action}失败：${message}` });
+      if (conflict) await pk.reload();
+    } finally {
+      setChangingAvailability(null);
+    }
   }
 
   async function remove(a: Account) {
@@ -380,6 +403,7 @@ export function Providers({ canEdit, initialSection }: TabProps) {
                       </>}
                     </td>
                     <td>
+                      <span className="ops-cell-main">{a.doc.disabled ? "已下架" : "已上架"}</span>
                       <RolloutBadge rollout={a.rollout} />
                     </td>
                     <td className="right">
@@ -394,9 +418,21 @@ export function Providers({ canEdit, initialSection }: TabProps) {
                         </>
                       ) : (
                         <>
+                          {canEdit && (
+                            <Button
+                              size="sm"
+                              busy={changingAvailability === a.id}
+                              busyLabel={a.doc.disabled ? "正在上架" : "正在下架"}
+                              disabled={changingAvailability !== null}
+                              onClick={() => void changeAvailability(a)}
+                            >
+                              {a.doc.disabled ? "上架" : "下架"}
+                            </Button>
+                          )}
                           <Button
                             size="sm"
                             className="ops-table-action"
+                            disabled={changingAvailability === a.id}
                             data-account-id={a.id}
                             aria-label={canEdit ? "编辑" : "查看"}
                             title={canEdit ? "编辑账号" : "查看账号"}
@@ -418,7 +454,7 @@ export function Providers({ canEdit, initialSection }: TabProps) {
                               className="ops-table-action"
                               aria-label="删除"
                               title="删除账号"
-                              disabled={busy}
+                              disabled={busy || changingAvailability === a.id}
                               onClick={() => {
                                 setDeleteFailure(null);
                                 setDeleting(a.id);

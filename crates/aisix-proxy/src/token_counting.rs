@@ -77,6 +77,9 @@ impl Configuration {
             .ok_or_else(|| {
                 ProxyError::UnusableTarget("token counting account is unavailable".into())
             })?;
+        if key.disabled {
+            return Err(crate::dispatch::DISABLED_PROVIDER);
+        }
         if !aisix_core::models::token_count_provider_serves(&key.value, self.surface) {
             return Err(ProxyError::UnusableTarget(
                 "token counting account does not serve this protocol".into(),
@@ -354,6 +357,40 @@ mod tests {
             assert!(response.status().is_server_error());
             assert!(source.received_requests().await.unwrap().is_empty());
             assert_eq!(counter.received_requests().await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn account_disabled_stops_fixed_counter_and_restores_the_same_mapping() {
+        for wire in [Wire::Messages, Wire::Responses] {
+            let source = upstream(200).await;
+            let counter = upstream(200).await;
+            let snapshot = snapshot(wire, &source.uri(), &counter.uri());
+            configure(&snapshot, wire, "source-version");
+            let (state, _events) = state(snapshot);
+            let snap = state.snapshot.load();
+            let original = snap.provider_keys.get_by_id(COUNTER).unwrap();
+            let mut offline = (*original.value).clone();
+            offline.disabled = true;
+            snap.provider_keys
+                .insert(ResourceEntry::new(COUNTER, offline, 2));
+            let app = crate::build_router(state);
+            let response = app
+                .clone()
+                .oneshot(request(wire, wire.body()))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            );
+            assert!(counter.received_requests().await.unwrap().is_empty());
+            snap.provider_keys
+                .insert(ResourceEntry::new(COUNTER, (*original.value).clone(), 3));
+            let response = app.oneshot(request(wire, wire.body())).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK);
+            assert_eq!(counter.received_requests().await.unwrap().len(), 1);
+            assert!(source.received_requests().await.unwrap().is_empty());
         }
     }
 

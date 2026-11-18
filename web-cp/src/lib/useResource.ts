@@ -74,8 +74,9 @@ export function useResource<D = Record<string, unknown>>(kind: string) {
     if (!alive()) return;
     setItems((prev) => {
       const list = prev ?? [];
+      // 快速连续保存时，较早的下发轮询可能在新版本之后返回。
       return list.some((i) => i.id === view.id)
-        ? list.map((i) => (i.id === view.id ? view : i))
+        ? list.map((i) => (i.id === view.id && view.version >= i.version ? view : i))
         : [...list, view];
     });
   }, []);

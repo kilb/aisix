@@ -229,6 +229,9 @@ pub(super) fn resolve(
         .ok_or(ProxyError::ProviderUnavailable)?;
 
     // 从这里起只能检查选中的账号，任何拒绝都不能触发缩池重算。
+    if crate::dispatch::model_provider_disabled(snapshot, &selected.model) {
+        return Err(crate::dispatch::DISABLED_PROVIDER);
+    }
     if !selected.model.ip_allowed(req.source_ip) {
         return Err(ProxyError::ModelIpRestricted(name.to_string()));
     }

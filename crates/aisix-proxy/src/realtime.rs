@@ -1937,8 +1937,12 @@ impl SessionMeter<'_> {
                     return Some(error);
                 }
                 // 只复核已打开连接的账号；模型后来换绑不能替旧连接取得新组权限。
+                let provider = snap.provider_keys.get_by_id(self.pk_id);
+                if provider.as_ref().is_some_and(|pk| pk.disabled) {
+                    return Some(crate::dispatch::DISABLED_PROVIDER);
+                }
                 if !key.value.allowed_provider_groups.is_empty()
-                    && !snap.provider_keys.get_by_id(self.pk_id).is_some_and(|pk| {
+                    && !provider.is_some_and(|pk| {
                         crate::routing::provider_key_in_groups(
                             &pk.value,
                             &key.value.allowed_provider_groups,
@@ -4544,6 +4548,7 @@ mod tests {
             ("acl", 403),
             ("endpoint", 403),
             ("budget", 0),
+            ("provider_disabled", 503),
         ] {
             let up_addr = spawn_open_upstream().await;
             let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
@@ -4577,6 +4582,13 @@ mod tests {
                             Some(vec![aisix_core::models::EndpointFamily::ChatCompletions]);
                     }
                     live.apikeys.insert(ResourceEntry::new("k-1", changed, 2));
+                }
+                "provider_disabled" => {
+                    let provider = live.provider_keys.get_by_id(PK_ID).unwrap();
+                    let mut changed = (*provider.value).clone();
+                    changed.disabled = true;
+                    live.provider_keys
+                        .insert(ResourceEntry::new(PK_ID, changed, 2));
                 }
                 _ => {
                     let budget: aisix_core::models::Budget =
