@@ -59,8 +59,8 @@ test("一个服务档的多个上下文段按列对齐，项目只列一次且�
   assert.match(text(markup), /输入 > 400,000 token/);
 });
 
-test("任意档位保留十一维、精确小数、零、缺价、回退与按次单位", () => {
-  const dimensions: Dimension[] = ["input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning", "audio_input", "audio_output", "image_input", "image_output", "web_search"];
+test("任意档位保留十二维、精确小数、零、缺价、回退与按次单位", () => {
+  const dimensions: Dimension[] = ["input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning", "audio_input", "audio_output", "image_input", "image_output", "web_search", "cache_write_12h"];
   const base = dimensions.map((dimension) => rate(dimension, "1"));
   base[0] = rate("input", "9007199254740993.00000000000001");
   base[2] = rate("cache_read", "0");
@@ -69,7 +69,7 @@ test("任意档位保留十一维、精确小数、零、缺价、回退与按�
   base[10] = rate("web_search", "1250");
   const markup = render({ "custom.fast/v2": { base, long_context: [] } });
   assert.match(text(markup), /custom.fast\/v2/);
-  for (const dimension of ["输入", "输出", "缓存读", "缓存写", "1 小时缓存写", "推理", "音频输入", "音频输出", "图像输入", "图像输出", "联网搜索"]) {
+  for (const dimension of ["输入", "输出", "缓存读", "缓存写", "1 小时缓存写", "推理", "音频输入", "音频输出", "图像输入", "图像输出", "联网搜索", "12 小时缓存写"]) {
     assert.equal((markup.match(new RegExp(`<th\\b[^>]*scope="row"[^>]*>${dimension}</th>`, "g")) ?? []).length, 1, `${dimension}必须完整保留且不重复列出`);
   }
   assert.match(text(markup), /¥9,007,199,254,740,993\.00000000000001/);
@@ -95,8 +95,8 @@ test("标准、批量及自定义服务档同时存在时都可查看各自完�
 });
 
 
-test("美元基准保留六档十一维和两个价格段，不套用人民币金额或倍率", () => {
-  const dimensions: Dimension[] = ["input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning", "audio_input", "audio_output", "image_input", "image_output", "web_search"];
+test("美元基准保留六档十二维和两个价格段，不套用人民币金额或倍率", () => {
+  const dimensions: Dimension[] = ["input", "output", "cache_read", "cache_write", "cache_write_1h", "reasoning", "audio_input", "audio_output", "image_input", "image_output", "web_search", "cache_write_12h"];
   const tiers: Record<string, TierQuote<BasePriceRate>> = {};
   for (const [index, name] of ["default", "standard", "fast", "priority", "batch", "flex"].entries()) {
     const usdRate = (dimension: Dimension, amount: string | null): BasePriceRate => ({ dimension, unit: dimension === "web_search" ? "request" : "token", price_usd_per_million: amount });
@@ -109,8 +109,8 @@ test("美元基准保留六档十一维和两个价格段，不套用人民币�
   const markup = render(tiers, "USD");
   const visible = text(markup);
   assert.equal((markup.match(/<table\b/g) ?? []).length, 6);
-  assert.equal((markup.match(/scope="row"/g) ?? []).length, 66);
-  assert.equal((markup.match(/class="price-amount"/g) ?? []).length, 132);
+  assert.equal((markup.match(/scope="row"/g) ?? []).length, 72);
+  assert.equal((markup.match(/class="price-amount"/g) ?? []).length, 144);
   for (let value = 1; value <= 6; value++) assert.ok(visible.includes(`$${value}.00000000000001`));
   for (let value = 11; value <= 16; value++) assert.ok(visible.includes(`$${value}.00000000000001`));
   assert.equal((visible.match(/未提供价格/g) ?? []).length, 6);
@@ -118,4 +118,19 @@ test("美元基准保留六档十一维和两个价格段，不套用人民币�
   assert.equal((visible.match(/美元\/千次\$1\.25\$2\.50/g) ?? []).length, 6);
   assert.doesNotMatch(visible, /¥|组织实际单价/);
   assert.match(visible, /美元基准单价/);
+});
+
+
+test("只公布短段的档位在美元和人民币报价中都保留缺价上限", () => {
+  for (const currency of ["CNY", "USD"] as const) {
+    const base: DisplayPriceRate[] = currency === "USD"
+      ? [{ dimension: "input", unit: "token", price_usd_per_million: "5" }]
+      : [rate("input", "5")];
+    const visible = text(render({ priority: { base, long_context: [], unpriced_above_input_tokens: 272000 } }, currency));
+    assert.match(visible, /输入 ≤ 272,000 token/);
+    assert.match(visible, /输入 > 272,000 token/);
+    assert.match(visible, /未公布价格/);
+    assert.match(visible, /未提供价格/);
+    assert.doesNotMatch(visible, /全部输入长度/);
+  }
 });

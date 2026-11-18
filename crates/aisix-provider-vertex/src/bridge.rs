@@ -50,10 +50,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aisix_gateway::content_part::{
-    check_tool_result_parts, display_uri, parse_part, translate_user_parts, ContentPart, Media,
-    MediaKind, MediaSource,
+    display_uri, parse_part, translate_user_parts, ContentPart, Media, MediaKind, MediaSource,
 };
-use aisix_gateway::media_fetch::{fetch_media_urls, Encoding, FetchedMedia};
+use aisix_gateway::media_fetch::{
+    fetch_media_urls, fetch_media_urls_including_tool_results, Encoding, FetchedMedia,
+};
 
 use crate::gemini_tools::{
     function_call_parts, function_response_part, gemini_2_5, gemini_3_or_newer, gemini_model_name,
@@ -785,6 +786,11 @@ impl Bridge for VertexBridge {
         })
     }
 
+    fn reads_tool_result_media(&self, _req: &ChatFormat, ctx: &BridgeContext) -> bool {
+        upstream_model(ctx)
+            .is_ok_and(|id| VertexPublisher::from_upstream_id(id) == Some(VertexPublisher::Google))
+    }
+
     fn reads_file_uris(&self, _req: &ChatFormat, ctx: &BridgeContext) -> bool {
         upstream_model(ctx).is_ok_and(|id| {
             matches!(
@@ -1118,7 +1124,13 @@ impl VertexBridge {
             },
         )?;
 
-        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let fetched = fetch_media_urls_including_tool_results(
+            &req,
+            ctx,
+            Encoding::Base64,
+            gemini_needs_fetch,
+        )
+        .await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
         let shared_request_type = gemini_shared_request_type(&req)?;
@@ -2056,7 +2068,13 @@ impl VertexBridge {
             },
         )?;
 
-        let fetched = fetch_media_urls(&req, ctx, Encoding::Base64, gemini_needs_fetch).await?;
+        let fetched = fetch_media_urls_including_tool_results(
+            &req,
+            ctx,
+            Encoding::Base64,
+            gemini_needs_fetch,
+        )
+        .await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
         let shared_request_type = gemini_shared_request_type(&req)?;
@@ -2880,7 +2898,7 @@ fn gemini_user_parts(
 }
 
 /// An assistant turn's generated `images`, the part shape the same turn's
-/// response carried them in. Media downloads cover user turns only and are
+/// response carried them in. Media downloads cover user and tool-result turns and are
 /// counted per use, so these never draw on them.
 fn gemini_replayed_image_parts(
     m: &ChatMessage,
@@ -3048,11 +3066,30 @@ fn build_gemini_request_with(
                 parts: gemini_user_parts(m, index, fetched)?,
             }),
             Role::Tool | Role::Function => {
-                check_tool_result_parts(m, index).map_err(BridgeError::InvalidRequest)?;
-                tool_responses.push(GeminiPart::Raw(function_response_part(
-                    m,
-                    &prior_tool_calls,
-                )?))
+                let mut part = function_response_part(m, &prior_tool_calls)?;
+                let mut media_parts = Vec::new();
+                // 原生 v1 的 FunctionResponse.parts 持有媒体，不能与函数响应并列。
+                // https://aiplatform.googleapis.com/$discovery/rest?version=v1
+                for (part_index, block) in m.content_blocks.iter().flatten().enumerate() {
+                    let invalid = |reason: String| {
+                        BridgeError::InvalidRequest(format!(
+                            "messages[{index}].content[{part_index}]: {reason}"
+                        ))
+                    };
+                    match parse_part(block).map_err(invalid)? {
+                        ContentPart::Text(_) => {}
+                        ContentPart::Media(media) => {
+                            media_parts.push(gemini_media_part(&media, fetched).map_err(invalid)?);
+                        }
+                        ContentPart::Unsupported(kind) => {
+                            return Err(invalid(format!("unsupported content part {kind:?}")));
+                        }
+                    }
+                }
+                if !media_parts.is_empty() {
+                    part["functionResponse"]["parts"] = serde_json::Value::Array(media_parts);
+                }
+                tool_responses.push(GeminiPart::Raw(part))
             }
             Role::Assistant => {
                 let tool_calls = m

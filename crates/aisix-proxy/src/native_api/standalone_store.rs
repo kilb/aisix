@@ -2917,6 +2917,8 @@ fn canonical_terminal_event(
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_usage_reported: usage.cache_usage_reported,
         cache_write_tokens: usage.cache_write_tokens,
+        cache_write_30m_tokens: usage.cache_write_30m_tokens,
+        cache_write_12h_tokens: usage.cache_write_12h_tokens,
         cache_creation_tokens: usage.cache_creation_tokens,
         cache_creation_ttl: aisix_gateway::CacheCreationTtl {
             cache_creation_5m_tokens: usage.cache_creation_5m_tokens,
@@ -2970,6 +2972,8 @@ fn canonical_terminal_event(
                 usage.prompt_tokens,
                 usage.cached_prompt_tokens,
                 usage.cache_write_tokens,
+                usage.cache_write_30m_tokens,
+                usage.cache_write_12h_tokens,
                 usage.cache_read_tokens,
                 usage.cache_creation_tokens,
                 event.cache_creation_ttl,

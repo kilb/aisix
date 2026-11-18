@@ -675,6 +675,16 @@ fn the_handler_list_matches_what_is_on_disk() {
              to, ahead of the chain; it dispatches nothing and answers nothing.",
         ),
         (
+            "platform_errors.rs",
+            "共享错误分类与渲染助手；模型解析仅用于 cfg(test) 的来源归责回归，\
+             此处不负责请求准入、模型调度或配额预留。",
+        ),
+        (
+            "token_counting.rs",
+            "为已解析的源模型选择计数账号与名称的助手；直接模型解析仅在 cfg(test)，\
+             HTTP 计数入口仍由已登记的 count_tokens.rs 承担并接受全部共享规则。",
+        ),
+        (
             "native_api/origin.rs",
             "仅登记或校验持久对象归属；模型、账号和上游名称由响应处理器选定后传入，\
              此处不预留配额、不调用推理上游，也不构造面向 SDK 的 HTTP 响应。",

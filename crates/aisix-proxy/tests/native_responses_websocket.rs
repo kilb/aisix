@@ -1056,6 +1056,163 @@ async fn websocket_never_replays_a_create_after_uncertain_delivery_or_first_erro
     }
 }
 
+async fn provider_close_scenario(active: bool) {
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+    let mut f = fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut provider_key = f
+        .snapshot
+        .load()
+        .provider_keys
+        .get_by_id(PROVIDER)
+        .unwrap()
+        .value
+        .as_ref()
+        .clone();
+    provider_key.api_base = Some(format!("http://{}", listener.local_addr().unwrap()));
+    f.snapshot
+        .load()
+        .provider_keys
+        .insert(aisix_core::ResourceEntry::new(PROVIDER, provider_key, 2));
+    let mut socket = connect(&f).await;
+    let lanes = if active { &['a', 'b'][..] } else { &['a'][..] };
+    for lane in lanes {
+        socket
+            .send(ClientMessage::Text(
+                json!({"type":"response.create","model":"native-model","stream_id":lane.to_string(),"input":"before close"}).to_string(),
+            ))
+            .await
+            .unwrap();
+    }
+    let (tcp, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("first provider connection")
+        .unwrap();
+    let mut provider = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    for _ in lanes {
+        let create = provider.next().await.unwrap().unwrap();
+        let create: Value = serde_json::from_str(create.to_text().unwrap()).unwrap();
+        assert_eq!(create["input"], "before close");
+        let lane = create["stream_id"].as_str().unwrap();
+        provider
+            .send(ClientMessage::Text(
+                json!({"type":"response.created","stream_id":lane,"response":{"id":format!("resp_before_{lane}"),"object":"response","status":"in_progress","output":[]}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        if !active {
+            provider
+                .send(ClientMessage::Text(
+                    json!({"type":"response.completed","stream_id":lane,"response":{"id":format!("resp_before_{lane}"),"object":"response","status":"completed","output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    for _ in lanes {
+        if active {
+            assert_eq!(event(&mut socket).await["type"], "response.created");
+        } else {
+            completed(&mut socket).await;
+        }
+    }
+    let close = Some(CloseFrame {
+        code: CloseCode::Away,
+        reason: "provider maintenance".into(),
+    });
+    provider
+        .send(ClientMessage::Close(close.clone()))
+        .await
+        .unwrap();
+    let acknowledged = tokio::time::timeout(std::time::Duration::from_secs(2), provider.next())
+        .await
+        .expect("provider Close must be acknowledged promptly")
+        .expect("provider must receive a Close before disconnect")
+        .expect("provider must receive a clean closing handshake");
+    assert_eq!(acknowledged, ClientMessage::Close(close));
+    if active {
+        let mut failed_lanes = std::collections::HashSet::new();
+        for _ in lanes {
+            let failed = event(&mut socket).await;
+            assert_eq!(failed["type"], "error");
+            assert_eq!(failed["error"]["code"], "upstream_stream_error");
+            assert!(failed_lanes.insert(failed["stream_id"].as_str().unwrap().to_owned()));
+        }
+        assert_eq!(failed_lanes, ["a".to_owned(), "b".to_owned()].into());
+    }
+    let mut settled_requests = std::collections::HashSet::new();
+    for _ in lanes {
+        let row = tokio::time::timeout(std::time::Duration::from_secs(2), f.usage.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.is_final_attempt);
+        assert_eq!(row.status_code == 200, !active);
+        assert!(settled_requests.insert(row.request_id));
+    }
+    // 同一客户端在 provider 关闭后继续发起新轮，旧 create 不能重派到新连接。
+    socket
+        .send(ClientMessage::Text(
+            json!({"type":"response.create","model":"native-model","stream_id":"a","input":"after close"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let (tcp, _) = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+        .await
+        .expect("next create must open a fresh provider connection")
+        .unwrap();
+    let mut next_provider = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let create = next_provider.next().await.unwrap().unwrap();
+    let create: Value = serde_json::from_str(create.to_text().unwrap()).unwrap();
+    assert_eq!(create["input"], "after close");
+    assert_eq!(create["stream_id"], "a");
+    for (kind, status) in [
+        ("response.created", "in_progress"),
+        ("response.completed", "completed"),
+    ] {
+        next_provider
+            .send(ClientMessage::Text(
+                json!({"type":kind,"stream_id":"a","response":{"id":"resp_after_close","object":"response","status":status,"output":[],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}).to_string(),
+            ))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        completed(&mut socket).await["response"]["id"],
+        "resp_after_close"
+    );
+    let row = tokio::time::timeout(std::time::Duration::from_secs(2), f.usage.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.is_final_attempt);
+    assert_eq!(row.status_code, 200);
+    assert!(settled_requests.insert(row.request_id));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), f.usage.recv())
+            .await
+            .is_err(),
+        "each accepted round must settle once"
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "sent creates must not be replayed"
+    );
+}
+
+#[tokio::test]
+async fn websocket_provider_close_idle_acknowledges_exact_frame_and_reconnects() {
+    provider_close_scenario(false).await;
+}
+
+#[tokio::test]
+async fn websocket_provider_close_active_acknowledges_and_settles_each_round_once() {
+    provider_close_scenario(true).await;
+}
+
 #[tokio::test]
 async fn websocket_uncommitted_steering_returns_input_and_known_lane_without_dispatch() {
     let mut f = fixture().await;

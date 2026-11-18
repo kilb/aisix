@@ -249,10 +249,13 @@ pub enum Dimension {
     /// Web search requests: a rate per million searches, as providers price
     /// search per call rather than per token.
     WebSearch,
+    /// 12 小时写入必须有独立费率，不能默用短期写价。
+    #[serde(rename = "cache_write_12h")]
+    CacheWrite12h,
 }
 
 impl Dimension {
-    pub(crate) const ALL: [Dimension; 11] = [
+    pub(crate) const ALL: [Dimension; 12] = [
         Dimension::Input,
         Dimension::CacheRead,
         Dimension::CacheWrite,
@@ -264,6 +267,7 @@ impl Dimension {
         Dimension::ImageInput,
         Dimension::ImageOutput,
         Dimension::WebSearch,
+        Dimension::CacheWrite12h,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -279,6 +283,7 @@ impl Dimension {
             Dimension::ImageInput => "image_input",
             Dimension::ImageOutput => "image_output",
             Dimension::WebSearch => "web_search",
+            Dimension::CacheWrite12h => "cache_write_12h",
         }
     }
 }
@@ -304,6 +309,8 @@ pub struct Rates {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_1h: Option<Rate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h: Option<Rate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Rate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_input: Option<Rate>,
@@ -326,6 +333,7 @@ impl Rates {
             Dimension::CacheRead => self.cache_read,
             Dimension::CacheWrite => self.cache_write,
             Dimension::CacheWrite1h => self.cache_write_1h,
+            Dimension::CacheWrite12h => self.cache_write_12h,
             Dimension::Reasoning => self.reasoning,
             Dimension::AudioInput => self.audio_input,
             Dimension::AudioOutput => self.audio_output,
@@ -345,6 +353,7 @@ impl Rates {
     /// rate, a one-hour write without one at the write rate, and with no rate
     /// for reasoning, audio or image tokens those bill at the input or output
     /// rate of the side they are counted on.
+    /// 12 小时写入和联网搜索没有回退；缺少独立价格时保留缺价。
     pub(crate) fn rate_for(&self, d: Dimension) -> Option<Rate> {
         self.rate_with_source(d).map(|(rate, _)| rate)
     }
@@ -364,7 +373,10 @@ impl Rates {
             Dimension::Reasoning | Dimension::AudioOutput | Dimension::ImageOutput => {
                 Dimension::Output
             }
-            Dimension::Input | Dimension::Output | Dimension::WebSearch => return None,
+            Dimension::Input
+            | Dimension::Output
+            | Dimension::WebSearch
+            | Dimension::CacheWrite12h => return None,
         };
         self.explicit(source).map(|rate| (rate, Some(source)))
     }
@@ -398,6 +410,7 @@ impl Rates {
             cache_read: opt(self.cache_read)?,
             cache_write: opt(self.cache_write)?,
             cache_write_1h: opt(self.cache_write_1h)?,
+            cache_write_12h: opt(self.cache_write_12h)?,
             reasoning: opt(self.reasoning)?,
             audio_input: opt(self.audio_input)?,
             audio_output: opt(self.audio_output)?,
@@ -429,6 +442,9 @@ pub struct TierRates {
     pub base: Rates,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub long_context: Vec<LongContextBand>,
+    /// 这个档位仅有短段公布价；超过此输入量时拒绝计价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpriced_above_input_tokens: Option<u64>,
 }
 
 impl TierRates {
@@ -442,6 +458,7 @@ impl TierRates {
     ) -> Result<TierRates, RateCardError> {
         Ok(TierRates {
             base: self.base.try_map(f)?,
+            unpriced_above_input_tokens: self.unpriced_above_input_tokens,
             long_context: self
                 .long_context
                 .iter()
@@ -503,6 +520,19 @@ impl RateCard {
             if ServiceTier::normalize(Some(tier.as_str()), false).as_ref() != Some(tier) {
                 return Err(RateCardError::BadTierName(tier.0.clone()));
             }
+            if let Some(above) = rates.unpriced_above_input_tokens {
+                if *tier == default_tier
+                    || !rates.long_context.is_empty()
+                    || above == 0
+                    || default
+                        .long_context
+                        .first()
+                        .map(|band| band.above_input_tokens)
+                        != Some(above)
+                {
+                    return Err(RateCardError::InvalidUnpricedLimit { tier: tier.clone() });
+                }
+            }
             rates.base.check_cap()?;
             let mut below = 0;
             for band in &rates.long_context {
@@ -525,7 +555,9 @@ impl RateCard {
             if *tier == default_tier {
                 continue;
             }
-            if !rates.thresholds().eq(default.thresholds()) {
+            if rates.unpriced_above_input_tokens.is_none()
+                && !rates.thresholds().eq(default.thresholds())
+            {
                 return Err(RateCardError::BandsDifferFromDefault { tier: tier.clone() });
             }
             // Same thresholds, so the bands pair up by position.
@@ -741,6 +773,8 @@ pub enum RateCardError {
     },
     #[error("tier {tier}'s long-context bands are not at the default tier's thresholds")]
     BandsDifferFromDefault { tier: ServiceTier },
+    #[error("tier {tier}'s unpriced limit must equal the default tier's first threshold, with no long-context bands, and cannot be on the default tier")]
+    InvalidUnpricedLimit { tier: ServiceTier },
 }
 
 #[cfg(test)]
@@ -763,6 +797,7 @@ mod tests {
             cache_read: None,
             cache_write: None,
             cache_write_1h: None,
+            cache_write_12h: None,
             reasoning: None,
             audio_input: None,
             audio_output: None,
@@ -778,6 +813,7 @@ mod tests {
             TierRates {
                 base: two_rates(r, r),
                 long_context: Vec::new(),
+                unpriced_above_input_tokens: None,
             },
         )]))
     }
@@ -982,7 +1018,7 @@ mod tests {
     #[test]
     fn each_dimension_is_named_as_its_rate_field() {
         let all: std::collections::BTreeSet<_> = Dimension::ALL.into_iter().collect();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 12);
         for d in Dimension::ALL {
             let name = serde_json::to_value(d).unwrap();
             assert_eq!(name, d.as_str());
@@ -1008,6 +1044,7 @@ mod tests {
             cache_read: r,
             cache_write: r,
             cache_write_1h: r,
+            cache_write_12h: r,
             reasoning: r,
             audio_input: r,
             audio_output: r,
@@ -1096,6 +1133,7 @@ mod tests {
             (ImageInput, i),
             (ImageOutput, o),
             (WebSearch, None),
+            (CacheWrite12h, None),
         ] {
             assert_eq!(bare.rate_for(d), want, "{d}");
         }
@@ -1104,7 +1142,7 @@ mod tests {
         let full = rates(
             r#"{"input":"1","output":"2","cache_read":"3","cache_write":"4","cache_write_1h":"5",
                 "reasoning":"6","audio_input":"7","audio_output":"8","image_input":"9",
-                "image_output":"10","web_search":"11"}"#,
+                "image_output":"10","web_search":"11","cache_write_12h":"12"}"#,
         );
         for d in Dimension::ALL {
             assert!(full.explicit(d).is_some(), "{d}");

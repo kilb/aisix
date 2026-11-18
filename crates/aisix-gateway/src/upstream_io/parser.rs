@@ -3,6 +3,7 @@
 use super::Protocol;
 use aisix_core::usage_io::TextMeasurement;
 use serde_json::Value;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Default)]
 struct Count {
@@ -46,6 +47,7 @@ enum Target {
     Delta,
     Done,
     Snapshot,
+    Content,
 }
 
 #[derive(Clone, Copy)]
@@ -96,6 +98,7 @@ struct Event {
     nonempty_tool_delta: bool,
     incomplete: bool,
     response_key: u64,
+    content: bool,
 }
 
 impl Event {
@@ -105,6 +108,7 @@ impl Event {
             Target::Delta => self.delta.add(count),
             Target::Done => self.done.add(count),
             Target::Snapshot => self.snapshot.add(count),
+            Target::Content => self.content |= count.bytes != 0,
             Target::None => {}
         }
     }
@@ -368,6 +372,8 @@ fn known_key(key: &str) -> &'static str {
         "texts" => "texts",
         "contents" => "contents",
         "parts" => "parts",
+        "part" => "part",
+        "code" => "code",
         "systemInstruction" => "systemInstruction",
         "functionCall" => "functionCall",
         "functionResponse" => "functionResponse",
@@ -661,9 +667,24 @@ impl JsonObserver {
                     && (path.is(&["text"])
                         || path.is(&["arguments"])
                         || path.is(&["refusal"])
-                        || path.is(&["input"]))
+                        || path.is(&["input"])
+                        || path.is(&["code"]))
                 {
                     return Target::Done;
+                }
+                // added/done 的正文只供首内容识别，不重复加入已有长度计数。
+                if self.sse
+                    && (path.is(&["part", "text"])
+                        || path.is(&["part", "refusal"])
+                        || path.is(&["response", "output", "#", "code"])
+                        || (path.starts(&["item"])
+                            && ((self.stack.len() == 2
+                                && matches!(path.last(), "arguments" | "input" | "code"))
+                                || (self.stack.len() == 4
+                                    && matches!(self.stack[1].key, "content" | "summary")
+                                    && matches!(path.last(), "text" | "refusal")))))
+                {
+                    return Target::Content;
                 }
                 let prefix = if self.sse {
                     &["response", "output", "#"][..]
@@ -1226,7 +1247,8 @@ struct RealtimeSlot {
 
 #[derive(Clone)]
 pub(super) struct ResponseObserver {
-    first_sse_frame: bool,
+    first_sse_frame: Option<Instant>,
+    first_sse_content: Option<Instant>,
     protocol: Protocol,
     sse: bool,
     json: JsonObserver,
@@ -1257,7 +1279,8 @@ pub(super) struct ResponseObserver {
 impl ResponseObserver {
     pub(super) fn new(protocol: Protocol, sse: bool) -> Self {
         Self {
-            first_sse_frame: false,
+            first_sse_frame: None,
+            first_sse_content: None,
             protocol,
             sse,
             json: JsonObserver::new(protocol, sse),
@@ -1401,7 +1424,7 @@ impl ResponseObserver {
         if !self.event_data {
             return;
         }
-        self.first_sse_frame = true;
+        self.first_sse_frame.get_or_insert_with(Instant::now);
         if let Some(index) = self.sentinel {
             self.terminal |= index == b"[DONE]".len();
             self.invalid |= index != b"[DONE]".len();
@@ -1417,6 +1440,49 @@ impl ResponseObserver {
 
     fn accept(&mut self, event: Event, valid: bool) {
         self.invalid |= !valid;
+        if self.first_sse_content.is_none() && self.sse && !self.external_events && valid {
+            let content = match self.protocol {
+                Protocol::Chat | Protocol::Completions => event.primary.bytes != 0,
+                Protocol::Messages => {
+                    matches!(
+                        event.kind.text(),
+                        "content_block_start" | "content_block_delta"
+                    ) && event.primary.bytes != 0
+                }
+                Protocol::Responses => match event.kind.text() {
+                    "response.output_text.delta"
+                    | "response.refusal.delta"
+                    | "response.reasoning_text.delta"
+                    | "response.reasoning_summary_text.delta"
+                    | "response.function_call_arguments.delta"
+                    | "response.custom_tool_call_input.delta"
+                    | "response.mcp_call_arguments.delta"
+                    | "response.code_interpreter_call_code.delta" => event.delta.bytes != 0,
+                    "response.output_text.done"
+                    | "response.refusal.done"
+                    | "response.reasoning_text.done"
+                    | "response.reasoning_summary_text.done"
+                    | "response.function_call_arguments.done"
+                    | "response.custom_tool_call_input.done"
+                    | "response.mcp_call_arguments.done"
+                    | "response.code_interpreter_call_code.done" => event.done.bytes != 0,
+                    "response.content_part.added"
+                    | "response.content_part.done"
+                    | "response.reasoning_summary_part.added"
+                    | "response.reasoning_summary_part.done"
+                    | "response.output_item.added"
+                    | "response.output_item.done" => event.content,
+                    "response.completed" | "response.incomplete" => {
+                        event.snapshot.bytes != 0 || event.content
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if content {
+                self.first_sse_content = Some(Instant::now());
+            }
+        }
         if self.protocol == Protocol::Realtime {
             self.accept_realtime(event);
             return;
@@ -1653,8 +1719,12 @@ impl RequestObserver {
 }
 
 impl ResponseObserver {
-    pub(super) fn has_sse_frame(&self) -> bool {
+    pub(super) fn first_sse_frame_at(&self) -> Option<Instant> {
         self.first_sse_frame
+    }
+
+    pub(super) fn first_sse_content_at(&self) -> Option<Instant> {
+        self.first_sse_content
     }
 
     pub(super) fn terminal(&self) -> bool {

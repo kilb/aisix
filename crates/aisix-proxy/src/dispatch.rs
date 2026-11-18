@@ -749,7 +749,8 @@ pub(crate) fn bridge_ctx(
     // A bridge sends the base URL's userinfo as a Basic credential.
     note_base_url_userinfo(&provider_key);
     let ctx = aisix_gateway::BridgeContext::new(request_id, model, provider_key)
-        .with_resource_ids(model_id, provider_key_id);
+        .with_resource_ids(model_id, provider_key_id)
+        .with_platform(crate::platform_errors::active());
     match client {
         Some(c) => ctx
             .with_client(c.caller.clone(), Some(c.headers.clone()))
@@ -775,6 +776,7 @@ pub(crate) fn upstream_header_ctx<'a>(
 ) -> aisix_gateway::UpstreamHeaderContext<'a> {
     let caller = &client.caller;
     aisix_gateway::UpstreamHeaderContext::from_overrides(pk.request.as_ref())
+        .with_platform(crate::platform_errors::active())
         .with_vars(aisix_core::HeaderVars {
             request_id: Some(&client.request_id),
             api_key_id: Some(&caller.api_key_id),

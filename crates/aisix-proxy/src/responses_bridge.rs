@@ -1915,6 +1915,16 @@ fn responses_usage_json(u: &UsageStats) -> Value {
     if let Some(cache_write) = u.cache_write_tokens {
         input_details["cache_write_tokens"] = cache_write.into();
     }
+    if u.cache_write_30m_tokens.is_some() || u.cache_write_12h_tokens.is_some() {
+        let mut split = serde_json::Map::new();
+        if let Some(count) = u.cache_write_30m_tokens {
+            split.insert("ttl_30m_tokens".into(), count.into());
+        }
+        if let Some(count) = u.cache_write_12h_tokens {
+            split.insert("ttl_12h_tokens".into(), count.into());
+        }
+        input_details["cache_write_tokens_details"] = Value::Object(split);
+    }
     // Preserve the additive Anthropic counter separately from OpenAI's
     // raw cache_write_tokens value. Their accounting is different.
     let cache_creation = u.anthropic_cache_creation_input_tokens();
@@ -2145,6 +2155,8 @@ pub struct ResponsesSseEncoder {
     reasoning_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     cache_creation_tokens: u32,
@@ -2199,6 +2211,8 @@ impl ResponsesSseEncoder {
             reasoning_tokens: 0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            cache_write_30m_tokens: None,
+            cache_write_12h_tokens: None,
             modality: Default::default(),
             cache_creation_ttl: Default::default(),
             cache_creation_tokens: 0,
@@ -2275,6 +2289,8 @@ impl ResponsesSseEncoder {
             self.reasoning_tokens = self.reasoning_tokens.max(u.reasoning_tokens);
             self.cached_prompt_tokens = self.cached_prompt_tokens.max(u.cached_prompt_tokens);
             self.cache_write_tokens = self.cache_write_tokens.max(u.cache_write_tokens);
+            self.cache_write_30m_tokens = self.cache_write_30m_tokens.max(u.cache_write_30m_tokens);
+            self.cache_write_12h_tokens = self.cache_write_12h_tokens.max(u.cache_write_12h_tokens);
             self.modality = self.modality.max_fieldwise(&u.modality);
             self.cache_creation_ttl = self.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
             self.cache_creation_tokens = self.cache_creation_tokens.max(u.cache_creation_tokens);
@@ -2353,6 +2369,8 @@ impl ResponsesSseEncoder {
             total_tokens: self.total_tokens,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_write_30m_tokens: self.cache_write_30m_tokens,
+            cache_write_12h_tokens: self.cache_write_12h_tokens,
             modality: self.modality,
             cache_creation_ttl: self.cache_creation_ttl,
             reasoning_tokens: self.reasoning_tokens,
@@ -3163,6 +3181,8 @@ pub struct ResponsesStreamCompletion {
     pub web_search_requests: u32,
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
+    pub cache_write_30m_tokens: Option<u32>,
+    pub cache_write_12h_tokens: Option<u32>,
     pub modality: aisix_gateway::ModalityTokens,
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
     pub cache_creation_tokens: u32,
@@ -3482,6 +3502,8 @@ pub fn build_responses_bridge_stream(
                             comp.web_search_requests = comp.web_search_requests.max(u.web_search_requests);
                             comp.cached_prompt_tokens = comp.cached_prompt_tokens.max(u.cached_prompt_tokens);
                             comp.cache_write_tokens = comp.cache_write_tokens.max(u.cache_write_tokens);
+                            comp.cache_write_30m_tokens = comp.cache_write_30m_tokens.max(u.cache_write_30m_tokens);
+                            comp.cache_write_12h_tokens = comp.cache_write_12h_tokens.max(u.cache_write_12h_tokens);
                             comp.modality = comp.modality.max_fieldwise(&u.modality);
                             comp.cache_creation_ttl = comp.cache_creation_ttl.max_fieldwise(&u.cache_creation_ttl);
                             comp.cache_creation_tokens = comp.cache_creation_tokens.max(u.cache_creation_tokens);

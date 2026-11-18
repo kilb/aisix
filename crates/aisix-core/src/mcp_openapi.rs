@@ -55,6 +55,8 @@ pub struct ToolParam {
     /// The tool argument that carries its value: `name`, or `<name>__<in>`
     /// when another parameter of the operation, or its body, shares the name.
     pub argument: String,
+    /// 省略时使用 OpenAPI 默认值：query/form 为 true，path/simple 为 false。
+    pub explode: Option<bool>,
 }
 
 impl ToolParam {
@@ -64,6 +66,7 @@ impl ToolParam {
         Self {
             argument: name.clone(),
             name,
+            explode: None,
         }
     }
 }
@@ -98,7 +101,7 @@ pub fn check_spec_yields_tools(spec: &Value) -> Result<(), String> {
             .to_string();
     if !generation.skipped.is_empty() {
         message.push_str(&format!(
-            "; skipped operations without an application/json request body: {}",
+            "; skipped operations: {}",
             generation.skipped.join(", ")
         ));
     }
@@ -113,7 +116,7 @@ pub struct Generation {
     /// Every colliding operation is still generated, under a `_2` / `_3` …
     /// suffix.
     pub duplicates: Vec<String>,
-    /// `<METHOD> <path>` of operations skipped for an unsupported body.
+    /// 跳过的 `<METHOD> <path>`，附上不支持的正文或参数 style。
     pub skipped: Vec<String>,
 }
 
@@ -147,6 +150,26 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
             let mut resolver = RefResolver::new(spec);
             let params = merged_parameters(path_item, operation, &components, &mut resolver);
 
+            // 不把无法按声明编码的 operation 发布成可调用工具。
+            // 默认值与展开规则见 OpenAPI 3.1.1 §4.8.12.2.2 / §4.8.12.4。
+            if let Some((location, style)) = params.iter().find_map(|param| {
+                let location = param.get("in")?.as_str()?;
+                let default = match location {
+                    "path" => "simple",
+                    "query" => "form",
+                    _ => return None,
+                };
+                let style = param.get("style").and_then(Value::as_str)?;
+                (style != default).then_some((location, style))
+            }) {
+                skipped.push(format!(
+                    "{} {} (unsupported {location} parameter style '{style}')",
+                    method.to_uppercase(),
+                    path
+                ));
+                continue;
+            }
+
             // A request body we cannot express (no JSON variant) skips the
             // operation: a tool missing its body argument would mislead the
             // agent into calls that cannot succeed.
@@ -158,7 +181,11 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
                     BodyOutcome::Schema { media_type, schema } => Some((media_type, schema)),
                     BodyOutcome::None => None,
                     BodyOutcome::Unsupported => {
-                        skipped.push(format!("{} {}", method.to_uppercase(), path));
+                        skipped.push(format!(
+                            "{} {} (request body has no application/json content)",
+                            method.to_uppercase(),
+                            path
+                        ));
                         continue;
                     }
                 },
@@ -240,6 +267,7 @@ pub fn generate(spec: &Value) -> Result<Generation, String> {
                 let tool_param = ToolParam {
                     name: param_name.to_string(),
                     argument: argument.clone(),
+                    explode: param.get("explode").and_then(Value::as_bool),
                 };
                 if location == "path" {
                     path_params.push(tool_param);
@@ -595,6 +623,7 @@ mod tests {
         let arg = |name: &str, argument: &str| ToolParam {
             name: name.into(),
             argument: argument.into(),
+            explode: None,
         };
         assert_eq!(
             mixed.path_params,

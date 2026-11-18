@@ -59,7 +59,9 @@ pub(crate) async fn begin_response(
     let Some(registry) = state.native_objects.as_ref() else {
         return Ok(None);
     };
-    let platform = state.platform().ok_or(ProxyError::AccountUnavailable)?;
+    let origin_key = state
+        .native_origin_key()
+        .ok_or(ProxyError::AccountUnavailable)?;
     let api_key_id = super::openai::resource_id(state, "apikeys", api_key_id)?;
     let model_id = super::openai::resource_id(state, "models", model_id)?;
     let provider_key_id = super::openai::resource_id(state, "provider_keys", &provider.id)?;
@@ -71,7 +73,7 @@ pub(crate) async fn begin_response(
         model_id,
         provider_key_id,
         boundary: configured_native_origin(
-            &platform.id_key,
+            &origin_key,
             provider_key_id,
             &provider.value,
             NativeProtocol::Openai,
@@ -525,9 +527,9 @@ async fn admit_native_reasoning_references_inner(
     body: &Value,
     mut affinity: Option<&mut crate::responses_affinity::ContextAffinity>,
 ) -> Result<(), ProxyError> {
-    let Some(platform) = state.platform() else {
+    if state.platform().is_none() && state.native_objects.is_none() {
         return Ok(());
-    };
+    }
     let Some(items) = body.get("input").and_then(Value::as_array) else {
         return Ok(());
     };
@@ -565,7 +567,9 @@ async fn admit_native_reasoning_references_inner(
             })
             .ok_or_else(refused)?;
         let boundary = configured_native_origin(
-            &platform.id_key,
+            &state
+                .native_origin_key()
+                .ok_or(ProxyError::AccountUnavailable)?,
             origin.provider_key_id,
             &provider.value,
             NativeProtocol::Openai,

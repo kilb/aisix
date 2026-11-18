@@ -1510,8 +1510,11 @@ async fn run(mut cfg: Config, hangup: Option<HangupSignal>) -> anyhow::Result<()
             ),
         }
     }
-    // 原生对象归属使用独立 mTLS 连接池，失败时维持不可用而不降级为本地授权。
-    if let Some(h) = heartbeat_cfg.as_mut() {
+    // 托管平台的原生对象归属使用独立 mTLS 连接池，失败时不降级为本地授权。
+    if let Some(h) = heartbeat_cfg
+        .as_mut()
+        .filter(|_| cfg.proxy.platform.enabled)
+    {
         match native_objects::NativeObjectsClient::new(dpmgr_origin(&h.url), &h.mtls) {
             Ok(client) => {
                 h.native_capability_observer = Some(client.capability_observer());
@@ -2153,7 +2156,9 @@ fn platform_settings(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("proxy.platform.id_key_env is required"))?;
     let value = lookup(name).ok_or_else(|| {
-        anyhow::anyhow!("proxy.platform.id_key_env = {name:?} is set but the env var is missing")
+        anyhow::anyhow!(
+            "proxy.platform.id_key_env = {name:?}: the env var is missing or is not valid UTF-8"
+        )
     })?;
     let secret = value.trim();
     if decoded_secret_len(secret) < MIN_SECRET_BYTES {
@@ -4857,6 +4862,23 @@ mcp_servers:
         assert!(platform_settings(&off, |_| Some("k".to_string()))
             .unwrap()
             .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn platform_non_utf8_secret_names_the_invalid_environment_value() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let cfg = aisix_core::config::PlatformConfig {
+            enabled: true,
+            id_key_env: Some("P0_TEST_PLATFORM_KEY".into()),
+        };
+        let value = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let error = platform_settings(&cfg, |_| value.clone().into_string().ok())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("P0_TEST_PLATFORM_KEY"), "{error}");
+        assert!(error.contains("not valid UTF-8"), "{error}");
     }
 
     /// Retired assertion: this used to require `None` for the plain-HTTP

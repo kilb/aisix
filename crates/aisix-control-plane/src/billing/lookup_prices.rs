@@ -62,6 +62,8 @@ pub struct ModelPrice {
     pub input_cache_write: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_cache_write_1h: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cache_write_12h: Option<String>,
 }
 
 /// What a key's tenant pays, now.
@@ -229,6 +231,7 @@ fn model_price(model: &PricedModel) -> ModelPrice {
         input_cache_read: show(Dimension::CacheRead),
         input_cache_write: show(Dimension::CacheWrite),
         input_cache_write_1h: show(Dimension::CacheWrite1h),
+        input_cache_write_12h: show(Dimension::CacheWrite12h),
     }
 }
 
@@ -323,6 +326,7 @@ mod tests {
             cache_read: Some(Rate::parse("6").unwrap()),
             cache_write: None,
             cache_write_1h: None,
+            cache_write_12h: None,
             reasoning: None,
             audio_input: None,
             audio_output: None,
@@ -348,6 +352,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 cache_write_1h: None,
+                cache_write_12h: None,
                 reasoning: None,
                 audio_input: None,
                 audio_output: None,
@@ -371,6 +376,7 @@ mod tests {
                 cache_read: None,
                 cache_write: None,
                 cache_write_1h: None,
+                cache_write_12h: None,
                 reasoning: None,
                 audio_input: None,
                 audio_output: None,

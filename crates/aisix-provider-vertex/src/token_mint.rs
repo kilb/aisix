@@ -173,6 +173,33 @@ struct CachedToken {
     expires_at: Instant,
 }
 
+// 复用现有 mint 门闩保存失败退避；有效令牌的读取不经过它。
+#[derive(Default)]
+struct MintGate {
+    throttle: Option<MintThrottle>,
+}
+
+struct MintThrottle {
+    until: Instant,
+    status: u16,
+    message: String,
+    diagnostic: Option<String>,
+}
+
+impl MintThrottle {
+    fn error(&self) -> Option<BridgeError> {
+        let remaining = self.until.checked_duration_since(Instant::now())?;
+        Some(BridgeError::UpstreamStatus {
+            status: self.status,
+            message: self.message.clone(),
+            parsed: None,
+            wire: aisix_gateway::UpstreamWire::CredentialEndpoint,
+            retry_after: Some(remaining),
+            diagnostic: self.diagnostic.clone(),
+        })
+    }
+}
+
 /// In-process token cache + minter. One instance per VertexBridge.
 /// Cache is keyed by a fingerprint of the whole SA credential, so
 /// ProviderKeys backed by the same SA share a token slot while a
@@ -188,7 +215,7 @@ pub(crate) struct TokenMinter {
     /// service account at the same instant, and Google throttles its token
     /// endpoint: a throttled mint fails the request rather than slowing it.
     /// Bounded by credential count, like the cache beside it.
-    mint_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    mint_gates: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<MintGate>>>>>,
     mint_timeout: Duration,
     /// Test-only override for the SA-supplied `token_uri`. In
     /// production we POST directly to the SA's own `token_uri`
@@ -232,12 +259,34 @@ impl TokenMinter {
         // the cache: holding the cache's write lock across the mint would
         // block every OTHER credential's reads for a network round trip.
         let gate = self.gate_for(&key);
-        let _minting = gate.lock().await;
+        let mut minting = gate.lock().await;
         // A caller ahead of us in the queue may have just filled the cache.
         if let Some(token) = self.cached(&key).await {
             return Ok(token);
         }
-        let (access_token, expires_in_secs) = self.mint(sa).await?;
+        if let Some(error) = minting.throttle.as_ref().and_then(MintThrottle::error) {
+            return Err(error);
+        }
+        minting.throttle = None;
+        let minted = self.mint(sa).await;
+        if let Err(BridgeError::UpstreamStatus {
+            status,
+            message,
+            retry_after: Some(delay),
+            diagnostic,
+            ..
+        }) = &minted
+        {
+            minting.throttle = Instant::now()
+                .checked_add(*delay)
+                .map(|until| MintThrottle {
+                    until,
+                    status: *status,
+                    message: message.clone(),
+                    diagnostic: diagnostic.clone(),
+                });
+        }
+        let (access_token, expires_in_secs) = minted?;
         let cached = CachedToken {
             access_token: access_token.clone(),
             expires_at: Instant::now() + cache_lifetime(expires_in_secs),
@@ -256,7 +305,7 @@ impl TokenMinter {
     }
 
     /// The mint gate for `key`, creating it on first use.
-    fn gate_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn gate_for(&self, key: &str) -> Arc<tokio::sync::Mutex<MintGate>> {
         self.mint_gates
             .lock()
             .expect("vertex mint gate registry poisoned")
@@ -600,6 +649,114 @@ mod tests {
     /// Same contract as the Azure minter: a cold or just-expired cache is
     /// hit by everything in flight for that service account at once, and
     /// Google throttles its token endpoint. One POST, not one per caller.
+    // 去掉失败后的凭据级限流会让八个排队请求各自重发一次 POST。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mint_retry_after_stops_queued_callers_from_reminting() {
+        for status in [429, 503] {
+            let server = MockServer::builder().start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("Retry-After", "60")
+                        .set_delay(Duration::from_millis(20))
+                        .set_body_json(serde_json::json!({"error": "temporarily_unavailable"})),
+                )
+                .mount(&server)
+                .await;
+            let (pem, _) = test_key_pair();
+            let creds = sample_sa(&pem, &server.uri());
+            let minter = Arc::new(
+                TokenMinter::new(Client::builder().no_proxy().build().unwrap())
+                    .with_token_endpoint_override(server.uri()),
+            );
+            let mut tasks = Vec::new();
+            for _ in 0..8 {
+                let minter = minter.clone();
+                let creds = creds.clone();
+                tasks.push(tokio::spawn(async move { minter.get_token(&creds).await }));
+            }
+            for task in tasks {
+                let err = task.await.unwrap().unwrap_err();
+                let BridgeError::UpstreamStatus {
+                    status: actual,
+                    retry_after,
+                    wire,
+                    ..
+                } = err
+                else {
+                    panic!("expected the credential endpoint's throttling answer: {err:?}");
+                };
+                assert_eq!(actual, status);
+                assert_eq!(wire, aisix_gateway::UpstreamWire::CredentialEndpoint);
+                let remaining = retry_after.expect("queued callers must retain the retry hint");
+                assert!(!remaining.is_zero() && remaining <= Duration::from_secs(60));
+            }
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "the credential endpoint must receive one POST during Retry-After",
+            );
+        }
+    }
+
+    // 误用全局限流、永久缓存错误或让暖缓存等待 mint gate 都会使此检查失败。
+    #[tokio::test]
+    async fn mint_retry_after_is_per_credential_and_allows_refresh_after_expiry() {
+        let server = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "1")
+                    .set_body_json(serde_json::json!({"error": "temporarily_unavailable"})),
+            )
+            .mount(&server)
+            .await;
+        let (pem, _) = test_key_pair();
+        let creds = sample_sa(&pem, &server.uri());
+        let minter = TokenMinter::new(Client::builder().no_proxy().build().unwrap())
+            .with_token_endpoint_override(server.uri());
+        assert!(matches!(
+            minter.get_token(&creds).await,
+            Err(BridgeError::UpstreamStatus { status: 429, .. })
+        ));
+        server.reset().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mint.after-throttle",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })))
+            .mount(&server)
+            .await;
+        let mut rotated = creds.clone();
+        rotated.client_email = "other@example.iam.gserviceaccount.com".into();
+        assert_eq!(
+            minter.get_token(&rotated).await.unwrap(),
+            "mint.after-throttle"
+        );
+        assert!(matches!(
+            minter.get_token(&creds).await,
+            Err(BridgeError::UpstreamStatus { status: 429, .. })
+        ));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(
+            minter.get_token(&creds).await.unwrap(),
+            "mint.after-throttle"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let gate = minter.gate_for(&creds.cache_key());
+        let _held = gate.lock().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), minter.get_token(&creds))
+                .await
+                .expect("warm cache must bypass the mint gate")
+                .unwrap(),
+            "mint.after-throttle",
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_get_token_mints_once_not_once_per_caller() {
         let (private_pem, _) = test_key_pair();
@@ -1053,17 +1210,37 @@ mod tests {
         (out, logged)
     }
 
-    /// A loopback address nothing listens on, so a connect is refused at once.
-    fn refused_url(path: &str) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("http://{}{path}", listener.local_addr().unwrap())
+    #[tokio::test]
+    async fn refused_url_reserves_its_port_against_other_tests() {
+        let (endpoint, _reserved) = refused_url("/token");
+        let address: std::net::SocketAddr = endpoint
+            .strip_prefix("http://")
+            .unwrap()
+            .strip_suffix("/token")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            std::net::TcpListener::bind(address).is_err(),
+            "拒绝连接的端口必须保持占用，避免另一测试监听同一地址",
+        );
+    }
+
+    // 保持绑定但不监听，连接立即被拒绝，其他测试也无法抢占这个端口。
+    fn refused_url(path: &str) -> (String, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (
+            format!("http://{}{path}", socket.local_addr().unwrap()),
+            socket,
+        )
     }
 
     /// The `Transport` text reaches the usage event; the cause goes to the log.
     #[tokio::test]
     async fn a_failed_mint_logs_its_cause_and_keeps_the_error_text() {
         let (private_pem, _) = test_key_pair();
-        let endpoint = refused_url("/token");
+        let (endpoint, _reserved) = refused_url("/token");
         let minter = TokenMinter::new(Client::new()).with_token_endpoint_override(endpoint.clone());
         let sa = sample_sa(&private_pem, &endpoint);
         let (result, logged) = capture_logs(minter.get_token(&sa)).await;
@@ -1080,7 +1257,8 @@ mod tests {
     #[tokio::test]
     async fn a_token_uri_with_userinfo_is_never_displayed() {
         let (private_pem, _) = test_key_pair();
-        let endpoint = refused_url("/token").replace("http://", "http://user:pass-9f2b@");
+        let (endpoint, _reserved) = refused_url("/token");
+        let endpoint = endpoint.replace("http://", "http://user:pass-9f2b@");
         let sa = sample_sa(&private_pem, &endpoint);
         let debug = format!("{sa:?}");
         assert!(!debug.contains("pass-9f2b"), "{debug}");

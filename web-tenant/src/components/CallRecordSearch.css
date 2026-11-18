@@ -1,0 +1,5 @@
+/* 桌面把搜索放在筛选区右侧，窄屏保留完整的输入宽度。 */
+.usage-call-layout .usage-record-filter-primary > .call-record-search { min-width: 0; width: auto; order: 1; }
+@media (max-width: 719px) {
+  .usage-call-layout .usage-record-filter-primary > .call-record-search { grid-column: 1 / -1; }
+}

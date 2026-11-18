@@ -466,7 +466,7 @@ fn quote_rate<'a>(rates: &'a Value, dimension: &str) -> &'a Value {
 
 fn all_rates(input: &str, output: &str) -> Value {
     json!({"input": input, "output": output, "cache_read":"1", "cache_write":"5",
-        "cache_write_1h":"8", "reasoning":"9", "audio_input":"10", "audio_output":"11",
+        "cache_write_1h":"8", "cache_write_12h":"10", "reasoning":"9", "audio_input":"10", "audio_output":"11",
         "image_input":"12", "image_output":"13", "web_search":"1000"})
 }
 
@@ -715,13 +715,14 @@ async fn base_quote_preserves_every_dimension_tier_and_long_context_band() {
                 .into_iter()
                 .zip(expected)
         {
-            assert_eq!(rates.as_array().expect("11 dimensions").len(), 11, "{tier}");
+            assert_eq!(rates.as_array().expect("12 dimensions").len(), 12, "{tier}");
             for (dimension, value) in [
                 ("input", input),
                 ("output", output),
                 ("cache_read", "1"),
                 ("cache_write", "5"),
                 ("cache_write_1h", "8"),
+                ("cache_write_12h", "10"),
                 ("reasoning", "9"),
                 ("audio_input", "10"),
                 ("audio_output", "11"),
@@ -768,7 +769,10 @@ async fn base_quote_preserves_zero_null_and_fallback_without_group_or_discount_f
     assert_eq!(first.status, 200, "{first:?}");
     let baseline = base_model_of(&first.body, p.x);
     let base = &baseline["prices_by_tier"]["default"]["base"];
-    assert_eq!(base.as_array().expect("rates").len(), 11);
+    assert_eq!(base.as_array().expect("rates").len(), 12);
+    let twelve_hour = quote_rate(base, "cache_write_12h");
+    assert_eq!(twelve_hour["price_usd_per_million"], Value::Null);
+    assert!(twelve_hour.get("fallback_from").is_none());
     let output = quote_rate(base, "output");
     exact_keys(output, &["dimension", "price_usd_per_million", "unit"]);
     assert_eq!(output["price_usd_per_million"], "0");
@@ -937,13 +941,14 @@ async fn full_quote_preserves_every_dimension_tier_band_and_group_discount() {
     let tiers = &x["prices_by_tier"];
     assert_eq!(tiers.as_object().expect("tiers").len(), 3);
     let base = &tiers["default"]["base"];
-    assert_eq!(base.as_array().expect("base").len(), 11);
+    assert_eq!(base.as_array().expect("base").len(), 12);
     for (dimension, expected) in [
         ("input", "25.92"),
         ("output", "129.6"),
         ("cache_read", "6.48"),
         ("cache_write", "32.4"),
         ("cache_write_1h", "51.84"),
+        ("cache_write_12h", "64.8"),
         ("reasoning", "58.32"),
         ("audio_input", "64.8"),
         ("audio_output", "71.28"),
@@ -984,7 +989,7 @@ async fn full_quote_preserves_every_dimension_tier_band_and_group_discount() {
     for (band, threshold, expected) in [(&bands[0], 200000, "51.84"), (&bands[1], 400000, "77.76")]
     {
         assert_eq!(band["above_input_tokens"], threshold);
-        assert_eq!(band["rates"].as_array().expect("rates").len(), 11);
+        assert_eq!(band["rates"].as_array().expect("rates").len(), 12);
         assert_eq!(
             quote_rate(&band["rates"], "input")["price_cny_per_million"],
             expected
@@ -1059,8 +1064,16 @@ async fn full_quote_distinguishes_fallback_missing_search_and_explicit_zero() {
         .as_array()
         .expect("free rates")
     {
-        if rate["dimension"] == "web_search" {
-            assert!(rate["price_cny_per_million"].is_null());
+        if matches!(
+            rate["dimension"].as_str(),
+            Some("web_search" | "cache_write_12h")
+        ) {
+            assert_eq!(
+                rate.get("price_cny_per_million"),
+                Some(&Value::Null),
+                "{rate}"
+            );
+            assert!(rate.get("fallback_from").is_none(), "{rate}");
         } else {
             assert_eq!(rate["price_cny_per_million"], "0", "{rate}");
         }

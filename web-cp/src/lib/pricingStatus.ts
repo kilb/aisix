@@ -13,6 +13,7 @@ export const REASONS: Record<string, string> = {
   // A key an older control plane minted with no group: it is priced once its key takes one.
   no_group: "密钥未选分组",
   missing_tier_price: "缺少档位价",
+  missing_long_context_price: "缺少长上下文价",
   missing_dimension_price: "缺少计量价",
   inconsistent_usage: "用量不一致",
   unpriced_operation: "不支持计价的操作",
@@ -49,6 +50,8 @@ export function remedy(d: Pick<UnpricedDetail, "code" | "service_tier" | "group"
       return "密钥没有选分组；为密钥选定分组后用重计价更正";
     case "invalid_price":
       return "生效的价格版本无法使用（见上方「不可用的价格版本」）；写入新版本后用重计价更正";
+    case "missing_long_context_price":
+      return "该档位未公布长上下文价格；核对上游公布范围，补价并确认后用重计价更正";
     case "missing_dimension_price":
       return "基准价缺少这次用量所需的计量项价格；补上该项或确认后用重计价更正";
     case "discount_above_whole":
@@ -79,7 +82,7 @@ export function chargesFilterFor(d: Pick<UnpricedDetail, "code" | "model"> & Par
   return {
     status: "unpriced", error_code: d.code, model_id: d.model.id ?? "",
     priced_since: window.since, priced_before: window.until, exclude_corrected: "true",
-    ...(d.code === "missing_tier_price" ? { pricing_tier: d.service_tier ?? "" } : {}),
+    ...(["missing_tier_price", "missing_long_context_price"].includes(d.code) ? { pricing_tier: d.service_tier ?? "" } : {}),
     ...(d.code === "missing_rate" ? { group_id: d.group?.id ?? "" } : {}),
   };
 }
@@ -135,7 +138,7 @@ export function statusView(s: PricingStatus) {
       count: d.count,
       model: modelText(d.model.name, d.model.deleted),
       scope:
-        d.code === "missing_tier_price"
+        ["missing_tier_price", "missing_long_context_price"].includes(d.code)
           ? `档位 ${tierName(d.service_tier)}`
           : d.code === "missing_rate"
             ? `分组 ${groupName(d.group)}`

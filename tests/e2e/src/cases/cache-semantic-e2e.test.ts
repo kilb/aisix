@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import {
@@ -485,6 +485,52 @@ describe("semantic cache e2e", () => {
     expect(nearLoose.layer).toBe("semantic");
     expect(nearLoose.similarity!).toBeGreaterThanOrEqual(0.85);
     expect(nearLoose.similarity!).toBeLessThan(0.95);
+  });
+
+  test("team scope shares semantic candidates with teammates and excludes another team", async (ctx) => {
+    if (!etcdReachable || !app || !seed) return ctx.skip();
+    const upstream = await countingChatUpstream();
+    countingUpstreams.push(upstream);
+    const pk = await seed.createProviderKey({
+      display_name: "team-semantic-pk", secret: "sk-mock", api_base: `${upstream.baseUrl}/v1`,
+    });
+    await seed.createModel({
+      display_name: "chat-team", provider: "openai", model_name: "gpt-4o-mini", provider_key_id: pk.id,
+    });
+    await seed.createCachePolicy({
+      name: "team-semantic", backend: "memory", applies_to: "model:chat-team",
+      ttl_seconds: 600, scope: "team",
+      semantic: { embedding_model: "embed-cache", threshold: 0.85 },
+    });
+    const keys = ["sk-team-cache-a", "sk-team-cache-b", "sk-team-cache-other"];
+    const teamOne = randomUUID();
+    const teamTwo = randomUUID();
+    await seed.update("teams", teamOne, { name: "Cache team one" });
+    await seed.update("teams", teamTwo, { name: "Cache team two" });
+    for (const [index, key] of keys.entries()) {
+      await seed.createApiKey({
+        key_hash: createHash("sha256").update(key).digest("hex"),
+        allowed_models: ["*"], team_id: index < 2 ? teamOne : teamTwo,
+      });
+    }
+    await sealSeedBatch();
+
+    const first = await chat("chat-team", "tell me about topic-a", { bearer: keys[0] });
+    expect(first.status).toBe(200);
+    expect(first.cache).toBe("miss");
+    expect(first.content).toBe("reply-1");
+    const teammate = await chat("chat-team", "explain topic-a differently", { bearer: keys[1] });
+    expect(teammate.status).toBe(200);
+    expect(teammate.cache).toBe("hit");
+    expect(teammate.layer).toBe("semantic");
+    expect(teammate.content).toBe("reply-1");
+    expect(upstream.callCount()).toBe(1);
+
+    const otherTeam = await chat("chat-team", "another topic-a question", { bearer: keys[2] });
+    expect(otherTeam.status).toBe(200);
+    expect(otherTeam.cache).toBe("miss");
+    expect(otherTeam.content).toBe("reply-2");
+    expect(upstream.callCount()).toBe(2);
   });
 
   test("scope defaults to api_key: another caller never sees the entry; scope env shares it", async (ctx) => {

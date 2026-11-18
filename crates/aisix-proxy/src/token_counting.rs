@@ -16,6 +16,8 @@ pub(crate) struct Configuration {
 pub(crate) struct ResolvedCounter {
     pub key: Arc<ResourceEntry<ProviderKey>>,
     pub model_name: String,
+    /// 无显式映射时沿用源模型选择；映射指定的模型名由 operator 负责。
+    pub model_name_from_source: bool,
 }
 
 pub(crate) fn configuration(
@@ -81,7 +83,9 @@ impl Configuration {
             ));
         }
         let source_name = crate::dispatch::require_upstream_model(source)?;
-        let model_name = if let Some(mapping) = target.mapping_for(source_id) {
+        let (model_name, model_name_from_source) = if let Some(mapping) =
+            target.mapping_for(source_id)
+        {
             let exact_source = snapshot.models.get_by_id(source_id).is_some_and(|row| {
                 !row.display_name.contains('*')
                     && row.model_name.as_deref() == Some(mapping.source_model_name.as_str())
@@ -90,11 +94,15 @@ impl Configuration {
             if !exact_source || source_name != mapping.source_model_name {
                 return Err(ProxyError::UnusableTarget("token counting model mapping no longer matches the source model; update the mapping".into()));
             }
-            mapping.model_name.clone()
+            (mapping.model_name.clone(), false)
         } else {
-            source_name.to_owned()
+            (source_name.to_owned(), true)
         };
-        Ok(ResolvedCounter { key, model_name })
+        Ok(ResolvedCounter {
+            key,
+            model_name,
+            model_name_from_source,
+        })
     }
 }
 
@@ -1024,6 +1032,18 @@ mod tests {
                 serde_json::from_value(json!({wire.block():{"provider_key_id":COUNTER}})).unwrap(),
                 1,
             ));
+            let resolved =
+                crate::model_resolve::resolve_model(&snapshot, "service/2026-exact").unwrap();
+            let surface = match wire {
+                Wire::Messages => aisix_core::ApiSurface::Messages,
+                Wire::Responses => aisix_core::ApiSurface::Responses,
+            };
+            let resolved_counter = super::configuration(&snapshot, surface)
+                .unwrap()
+                .unwrap()
+                .resolve(&snapshot, MODEL, &resolved.value)
+                .unwrap();
+            assert!(resolved_counter.model_name_from_source);
             let (app, _) = app(snapshot);
             let mut body = wire.body();
             body["model"] = json!("service/2026-exact");
@@ -1076,6 +1096,7 @@ mod tests {
                 let elapsed = started.elapsed().as_nanos();
                 let allocation = allocation.finish();
                 assert_eq!(selected.model_name, "counter-version");
+                assert!(!selected.model_name_from_source);
                 assert!(allocation.bytes <= 512, "{allocation:?}");
                 max_calls = max_calls.max(allocation.calls);
                 max_bytes = max_bytes.max(allocation.bytes);

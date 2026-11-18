@@ -3270,6 +3270,19 @@ admin:
         assert!(err.contains("proxy.platform.id_key_env"), "{err}");
     }
 
+    #[test]
+    fn platform_refuses_a_whitespace_only_id_key_env() {
+        for name in ["\" \"", "\"\\t \""] {
+            let error = load_with_platform(&format!(
+                "  platform: {{ enabled: true, id_key_env: {name} }}"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("proxy.platform.id_key_env"), "{error}");
+            assert!(error.contains("must name"), "{error}");
+        }
+    }
+
     /// A name with whitespace around it names no variable: refused here,
     /// where the error can say so, rather than at boot as a variable that is
     /// missing although the one the operator meant is set.

@@ -24,6 +24,9 @@ export function cardShapeProblem(card: unknown): string | null {
       const problem = rateProblem(value.base, `${at}/base`);
       if (problem !== null) return problem;
     }
+    if (value.unpriced_above_input_tokens !== undefined && value.unpriced_above_input_tokens !== null && typeof value.unpriced_above_input_tokens === "object") {
+      return `${at}/unpriced_above_input_tokens：缺价上限不能是对象或数组`;
+    }
     if (value.long_context === undefined) continue;
     if (!Array.isArray(value.long_context)) return `${at}/long_context：长上下文档应是一个数组`;
     for (const [n, band] of (value.long_context as unknown[]).entries()) {

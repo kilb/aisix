@@ -13,7 +13,10 @@
 //! `aisix_core::one_hour_cache_writes`; the gateway's own spend computation
 //! calls both too, and this module calls them and keeps no second copy.
 
-use aisix_core::{input_tokens_for_pricing, one_hour_cache_writes, reasoning_beside_completion};
+use aisix_core::{
+    input_tokens_for_pricing, one_hour_cache_writes, reasoning_beside_completion,
+    twelve_hour_cache_writes,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +68,15 @@ pub struct BillableUsage {
     /// OpenAI-shape prompt-cache write: a subset of `prompt_tokens`.
     #[serde(default)]
     pub cache_write_tokens: Option<u32>,
+    /// 总写入量内的 30 分钟分量，缺失与明确的 0 分开保留。
+    #[serde(default)]
+    pub cache_write_30m_tokens: Option<u32>,
+    /// 总写入量内的 12 小时分量，只有上游明确报告时才设置。
+    #[serde(default)]
+    pub cache_write_12h_tokens: Option<u32>,
+    /// 网关聚合的完整性状态；缺省兼容旧事件，true 不能用于正式计费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_split_incomplete: Option<bool>,
     /// Reasoning tokens: a subset of `completion_tokens`, unless the
     /// upstream total says they are counted beside it.
     #[serde(default)]
@@ -146,6 +158,7 @@ pub(crate) struct Quantities {
     pub(crate) cache_read: u64,
     pub(crate) cache_write: u64,
     pub(crate) cache_write_1h: u64,
+    pub(crate) cache_write_12h: u64,
     pub(crate) output: u64,
     pub(crate) reasoning: u64,
     pub(crate) audio_input: u64,
@@ -162,6 +175,7 @@ impl Quantities {
             Dimension::CacheRead => self.cache_read,
             Dimension::CacheWrite => self.cache_write,
             Dimension::CacheWrite1h => self.cache_write_1h,
+            Dimension::CacheWrite12h => self.cache_write_12h,
             Dimension::Output => self.output,
             Dimension::Reasoning => self.reasoning,
             Dimension::AudioInput => self.audio_input,
@@ -183,6 +197,7 @@ impl Quantities {
             + self.cache_read
             + self.cache_write
             + self.cache_write_1h
+            + self.cache_write_12h
             + self.audio_input
             + self.image_input
     }
@@ -211,6 +226,9 @@ impl Quantities {
 ///    total, the modality counts each capped by what is left; the remainder
 ///    is text output.
 pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency> {
+    if u.cache_write_split_incomplete == Some(true) {
+        return Err(Inconsistency::CacheWriteSplitMismatch);
+    }
     let prompt = u64::from(u.prompt_tokens);
     let cached = u64::from(u.cached_prompt_tokens);
     let cache_read = u64::from(u.cache_read_tokens);
@@ -230,6 +248,13 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
         creation,
         u.cache_creation_5m_tokens,
         u.cache_creation_1h_tokens,
+    )
+    .ok_or(Inconsistency::CacheWriteSplitMismatch)?;
+
+    let twelve_hour = twelve_hour_cache_writes(
+        u64::from(u.cache_write_tokens.unwrap_or(0)),
+        u.cache_write_30m_tokens,
+        u.cache_write_12h_tokens,
     )
     .ok_or(Inconsistency::CacheWriteSplitMismatch)?;
 
@@ -265,7 +290,8 @@ pub(crate) fn quantities(u: &BillableUsage) -> Result<Quantities, Inconsistency>
     Ok(Quantities {
         input: b.uncached - audio_input - image_input,
         cache_read: b.cache_read,
-        cache_write: b.cache_write - one_hour,
+        cache_write: b.cache_write - one_hour - twelve_hour,
+        cache_write_12h: twelve_hour,
         cache_write_1h: one_hour,
         output: rest,
         reasoning,
@@ -296,6 +322,68 @@ mod tests {
     }
 
     // ---- one test per cache-token shape ----
+
+    #[test]
+    fn incomplete_legacy_batch_cache_write_split_is_unpriced_before_amount_or_missing_price() {
+        let rows: crate::PriceRows =
+            serde_json::from_str(include_str!("../tests/golden/book.json")).unwrap();
+        let book = crate::PriceBook::from_rows(rows);
+        let payer = crate::Payer {
+            tenant_id: "tenant-golden".into(),
+            group_id: Some("group-golden".into()),
+        };
+        let mut value = serde_json::json!({"event_id":"legacy-batch","occurred_at":"2026-11-06T00:00:00Z",
+            "team_id":"tenant-golden","requested_model_id":"model-openai-cache-write-mixed-ttl",
+            "operation":"batch_completion","is_batch":true,"status_code":200,"prompt_tokens":24000,
+            "completion_tokens":200,"cached_prompt_tokens":8000,"cache_write_tokens":14000,
+            "cache_write_30m_tokens":6000,"cache_write_12h_tokens":8000,"cache_write_split_incomplete":true});
+        for empty in [false, true] {
+            let mut flagged = value.clone();
+            if empty {
+                for key in [
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "cached_prompt_tokens",
+                    "cache_write_tokens",
+                    "cache_write_30m_tokens",
+                    "cache_write_12h_tokens",
+                ] {
+                    flagged.as_object_mut().unwrap().remove(key);
+                }
+            }
+            let usage: BillableUsage = serde_json::from_value(flagged).unwrap();
+            assert!(matches!(
+                crate::price_event(
+                    &book,
+                    &usage,
+                    &payer,
+                    "2026-11-06T00:00:01Z".parse().unwrap()
+                ),
+                Err(crate::PricingError::InconsistentUsage(
+                    Inconsistency::CacheWriteSplitMismatch
+                ))
+            ));
+        }
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_write_split_incomplete");
+        let ordinary: BillableUsage = serde_json::from_value(value.clone()).unwrap();
+        assert!(
+            crate::price_event(
+                &book,
+                &ordinary,
+                &payer,
+                "2026-11-06T00:00:01Z".parse().unwrap()
+            )
+            .unwrap()
+            .charge
+            .0 > 0
+        );
+        value["cache_write_split_incomplete"] = serde_json::json!(false);
+        let explicit_false: BillableUsage = serde_json::from_value(value).unwrap();
+        assert_eq!(quantities(&ordinary), quantities(&explicit_false));
+    }
 
     #[test]
     fn an_openai_cache_hit_is_a_subset_of_the_prompt() {
@@ -603,6 +691,9 @@ mod tests {
             completion_tokens: 2,
             cached_prompt_tokens: 3,
             cache_write_tokens: Some(4),
+            cache_write_30m_tokens: Some(16),
+            cache_write_12h_tokens: Some(17),
+            cache_write_split_incomplete: Some(true),
             reasoning_tokens: 5,
             total_tokens: 6,
             cache_creation_tokens: 7,
@@ -644,6 +735,9 @@ mod tests {
                 completion_tokens: 2,
                 cached_prompt_tokens: 3,
                 cache_write_tokens: Some(4),
+                cache_write_30m_tokens: Some(16),
+                cache_write_12h_tokens: Some(17),
+                cache_write_split_incomplete: Some(true),
                 reasoning_tokens: 5,
                 total_tokens: 6,
                 cache_creation_tokens: 7,
@@ -679,6 +773,8 @@ mod tests {
             completion_tokens: _,
             cached_prompt_tokens: _,
             cache_write_tokens: _,
+            cache_write_30m_tokens: _,
+            cache_write_12h_tokens: _,
             // 监测采样元数据，不参与计价。
             cache_usage_reported: _,
             reasoning_tokens: _,
@@ -790,6 +886,13 @@ mod tests {
                 },
             ),
             (Dimension::WebSearch, Quantities { web_search: 1, ..z }),
+            (
+                Dimension::CacheWrite12h,
+                Quantities {
+                    cache_write_12h: 1,
+                    ..z
+                },
+            ),
         ];
         assert!(z.is_zero());
         assert_eq!(singles.len(), Dimension::ALL.len());
@@ -819,8 +922,9 @@ mod tests {
             image_input: 256,
             image_output: 512,
             web_search: 1024,
+            cache_write_12h: 2048,
         };
-        assert_eq!(q.input_total(), 1 + 2 + 4 + 8 + 64 + 256);
+        assert_eq!(q.input_total(), 1 + 2 + 4 + 8 + 64 + 256 + 2048);
     }
 
     /// Ruling R1: `MAX_QUANTITY` bounds every quantity a row can bill, which

@@ -6,7 +6,7 @@
     "charge": 1250,
     "cost": null,
     "discount": null,
-    "engine_version": 2,
+    "engine_version": 3,
     "estimated": false,
     "event_id": "evt-openai-responses-1",
     "group_id": "group-golden",

@@ -180,11 +180,17 @@ export function Keys({
     return parts.length > 0 ? parts.join(" · ") : "不限";
   }
 
+  function creatorOf(k: TenantKey): string {
+    if (k.created_by?.kind === "operator") return "平台管理员";
+    if (k.created_by?.kind !== "member") return "未知";
+    return k.created_by.display_name ?? (k.created_by.id === member.id ? "我" : k.created_by.id ? `成员 ${k.created_by.id}` : "成员");
+  }
+
   const [stateFilter, setStateFilter] = useState("");
   const [groupFilter, setGroupFilter] = useState("");
   const table = useRecordTable({
     items: (items ?? []).filter((key) => (!stateFilter || stateOf(key).text === stateFilter) && (!groupFilter || key.group?.id === groupFilter)),
-    searchText: (key) => [key.label, key.prefix, ownerOf(key), key.group?.display_name ?? ""],
+    searchText: (key) => [key.label, key.prefix, ownerOf(key), creatorOf(key), key.group?.display_name ?? ""],
     resetKey: `${stateFilter}/${groupFilter}`,
   });
 
@@ -216,8 +222,9 @@ export function Keys({
         </Card>
         <Card padding="table" className={cn(span.d12, "keys-list")}>
           <CardHeader number={3} title="密钥列表" description="复制或查看明文会重新获取密钥；吊销后立即失效，无法恢复。" actions={<Button onClick={() => void load()}>刷新列表</Button>} />
+          <p className="hint px-5">组织密钥归组织所有；创建者被停用或移除后仍保留，不会自动吊销。</p>
           {costErr && <div className="note crit" role="alert">费用读取失败：{costErr}<Button onClick={() => void load()}>重新读取费用</Button></div>}
-          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属或分组" }}>
+          <RecordTableToolbar search={{ value: table.query, onChange: table.setQuery, label: "搜索密钥", placeholder: "名称、公开前缀、归属、创建者或分组" }}>
             <Field label="密钥状态"><Select value={stateFilter} onValueChange={setStateFilter} size="compact"><option value="">全部状态</option>{["可用", "已被平台停用", "已停用", "已过期"].map((value) => <option key={value}>{value}</option>)}</Select></Field>
             <Field label="密钥分组"><Select value={groupFilter} onValueChange={setGroupFilter} size="compact"><option value="">全部分组</option>{(groups ?? []).map((group) => <option key={group.id} value={group.id}>{group.display_name}</option>)}</Select></Field>
           </RecordTableToolbar>
@@ -242,6 +249,7 @@ export function Keys({
                 <tr>
                   <th>名称</th>
                   <th>归属</th>
+                  <th>创建者</th>
                   <th>模型</th>
                   <th>分组</th>
                   <th>限制</th>
@@ -290,6 +298,7 @@ export function Keys({
                           {owner}
                         </span>
                       </td>
+                      <td data-label="创建者"><span className="trunc [--trunc:128px]" title={creatorOf(k)}>{creatorOf(k)}</span></td>
                       <td data-label="模型">
                         <span className="trunc [--trunc:120px] min-[1800px]:[--trunc:216px]" title={models}>
                           {models}

@@ -221,6 +221,205 @@ mod compat_tests {
         );
     }
 
+    fn ttl_snapshot(base: &str) -> AisixSnapshot {
+        let snap = snapshot(base);
+        let entry = snap.models.get_by_id("m-a").unwrap();
+        let mut value = serde_json::to_value(&*entry.value).unwrap();
+        value["cost"] = serde_json::json!({"input_per_1k":0.001,"output_per_1k":0.002,
+            "cached_input_per_1k":0.0001,"cache_write_per_1k":0.00125,"cache_write_12h_per_1k":0.0025});
+        snap.models.insert(ResourceEntry::new(
+            "m-a",
+            serde_json::from_value::<Model>(value).unwrap(),
+            2,
+        ));
+        snap
+    }
+
+    fn ttl_response(write: Option<u32>, split: Option<Value>) -> Value {
+        let mut details = serde_json::json!({"cached_tokens":4000});
+        if let Some(write) = write {
+            details["cache_write_tokens"] = write.into();
+        }
+        if let Some(split) = split {
+            details["cache_write_tokens_details"] = split;
+        }
+        serde_json::json!({"model":"ttl-model","usage":{"input_tokens":12000,"output_tokens":100,
+            "total_tokens":12100,"input_tokens_details":details}})
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_batch_ttl_preserves_complete_sums_and_prices_twelve_hour_writes() {
+        let body = ttl_response(
+            Some(7000),
+            Some(serde_json::json!({"ttl_30m_tokens":3000,"ttl_12h_tokens":4000})),
+        );
+        let upstream = batch_fixture("/v1/responses", vec![body.clone(), body]).await;
+        let (app, mut rx) = build_app_with_sink(ttl_snapshot(&upstream.base));
+        retrieve_batch(app).await;
+        let row = next_batch_row(&mut rx).await;
+        let wire = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            wire.get("cache_write_30m_tokens"),
+            Some(&serde_json::json!(6000))
+        );
+        assert_eq!(
+            wire.get("cache_write_12h_tokens"),
+            Some(&serde_json::json!(8000))
+        );
+        assert_eq!(
+            (
+                row.prompt_tokens,
+                row.cached_prompt_tokens,
+                row.cache_write_tokens,
+                row.total_tokens
+            ),
+            (24000, 8000, Some(14000), 24200)
+        );
+        assert_eq!(aisix_core::spend_micro_usd(row.cost_usd), 30700);
+        assert!(wire.get("cache_write_split_incomplete").is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_batch_ttl_keeps_zero_and_legacy_absence_distinct() {
+        for explicit in [false, true] {
+            let split =
+                explicit.then(|| serde_json::json!({"ttl_30m_tokens":0,"ttl_12h_tokens":0}));
+            let upstream = batch_fixture(
+                "/v1/responses",
+                vec![ttl_response(Some(0), split), ttl_response(Some(0), None)],
+            )
+            .await;
+            let (app, mut rx) = build_app_with_sink(ttl_snapshot(&upstream.base));
+            retrieve_batch(app).await;
+            let row = next_batch_row(&mut rx).await;
+            let wire = serde_json::to_value(&row).unwrap();
+            for field in ["cache_write_30m_tokens", "cache_write_12h_tokens"] {
+                assert_eq!(
+                    wire.get(field),
+                    explicit.then_some(&serde_json::json!(0)),
+                    "{field}, explicit={explicit}"
+                );
+            }
+            assert_eq!(row.cache_write_tokens, Some(0));
+            assert!(wire.get("cache_write_split_incomplete").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_batch_ttl_never_combines_incomplete_contributors_into_a_complete_split(
+    ) {
+        let full = || {
+            ttl_response(
+                Some(7000),
+                Some(serde_json::json!({"ttl_30m_tokens":3000,"ttl_12h_tokens":4000})),
+            )
+        };
+        for bodies in [
+            vec![
+                ttl_response(Some(3000), Some(serde_json::json!({"ttl_30m_tokens":3000}))),
+                ttl_response(Some(4000), Some(serde_json::json!({"ttl_12h_tokens":4000}))),
+            ],
+            vec![
+                ttl_response(
+                    Some(7000),
+                    Some(serde_json::json!({"ttl_30m_tokens":3001,"ttl_12h_tokens":4000})),
+                ),
+                ttl_response(
+                    Some(7000),
+                    Some(serde_json::json!({"ttl_30m_tokens":2999,"ttl_12h_tokens":4000})),
+                ),
+            ],
+            vec![full(), ttl_response(Some(7000), None)],
+            vec![
+                ttl_response(Some(0), Some(serde_json::json!({"ttl_30m_tokens":0}))),
+                ttl_response(Some(0), Some(serde_json::json!({"ttl_12h_tokens":0}))),
+            ],
+        ]
+        .into_iter()
+        .zip([
+            (3000, 4000, 7000, 18950),
+            (6000, 8000, 14000, 20700),
+            (3000, 4000, 14000, 25700),
+            (0, 0, 0, 17200),
+        ]) {
+            let (bodies, (thirty_m, twelve_h, write, cost)) = bodies;
+            let upstream = batch_fixture("/v1/responses", bodies).await;
+            let (app, mut rx) = build_app_with_sink(ttl_snapshot(&upstream.base));
+            retrieve_batch(app).await;
+            let row = next_batch_row(&mut rx).await;
+            let wire = serde_json::to_value(&row).unwrap();
+            assert_eq!(
+                wire.get("cache_write_split_incomplete"),
+                Some(&serde_json::json!(true)),
+                "逐行不完整不能被总和伪造成完整: {row:?}"
+            );
+            assert_eq!(row.cache_write_30m_tokens, Some(thirty_m));
+            assert_eq!(row.cache_write_12h_tokens, Some(twelve_h));
+            assert_eq!(
+                (
+                    row.prompt_tokens,
+                    row.cached_prompt_tokens,
+                    row.cache_write_tokens,
+                    row.total_tokens
+                ),
+                (24000, 8000, Some(write), 24200)
+            );
+            assert_eq!(aisix_core::spend_micro_usd(row.cost_usd), cost);
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_batch_ttl_all_unreported_preserves_the_legacy_contract() {
+        for write in [None, Some(0), Some(7000)] {
+            let body = ttl_response(write, None);
+            let upstream = batch_fixture("/v1/responses", vec![body.clone(), body]).await;
+            let (app, mut rx) = build_app_with_sink(ttl_snapshot(&upstream.base));
+            retrieve_batch(app).await;
+            let row = next_batch_row(&mut rx).await;
+            let wire = serde_json::to_value(&row).unwrap();
+            assert_eq!(row.cache_write_tokens, write.map(|n| n * 2));
+            for field in [
+                "cache_write_30m_tokens",
+                "cache_write_12h_tokens",
+                "cache_write_split_incomplete",
+            ] {
+                assert!(
+                    wire.get(field).is_none(),
+                    "{field}不应伪造上游未报的拆分: {row:?}"
+                );
+            }
+            assert_eq!(
+                aisix_core::spend_micro_usd(row.cost_usd),
+                if write == Some(7000) { 20700 } else { 17200 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_legacy_batch_ttl_overflow_cannot_clip_to_a_trustworthy_split() {
+        let body = serde_json::json!({"model":"ttl-model","usage":{"input_tokens":u32::MAX,"output_tokens":0,
+            "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":u32::MAX,
+                "cache_write_tokens_details":{"ttl_30m_tokens":u32::MAX,"ttl_12h_tokens":0}}}});
+        let upstream = batch_fixture("/v1/responses", vec![body.clone(), body]).await;
+        let (app, mut rx) = build_app_with_sink(ttl_snapshot(&upstream.base));
+        retrieve_batch(app).await;
+        let row = next_batch_row(&mut rx).await;
+        let wire = serde_json::to_value(&row).unwrap();
+        assert_eq!(
+            wire.get("cache_write_split_incomplete"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(
+            wire.get("cache_write_30m_tokens").is_none(),
+            "溢出的分量未知，不能clip成看似完整的计数"
+        );
+        assert_eq!(
+            wire.get("cache_write_12h_tokens"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(aisix_core::spend_micro_usd(row.cost_usd), 10_737_418_238);
+    }
+
     // 只解码 after；重复的其它参数、空值与转义必须保持，不能先塞进 HashMap。
     #[tokio::test]
     async fn routed_list_cursors_are_decoded_without_losing_query_pairs() {

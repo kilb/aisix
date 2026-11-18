@@ -97,6 +97,7 @@ export const COMPARED_DIMENSIONS: [string, string][] = [
   ["cache_read", "缓存读"],
   ["cache_write", "缓存写"],
   ["cache_write_1h", "1 小时缓存写"],
+  ["cache_write_12h", "12 小时缓存写"],
   ["web_search", "联网搜索"],
 ];
 

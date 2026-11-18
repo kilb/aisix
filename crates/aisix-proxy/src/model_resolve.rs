@@ -60,8 +60,12 @@ pub(crate) fn resolve_model(
         note_dispatchable_entry(&exact);
         return Some(exact);
     }
-    let (entry, upstream) = best_wildcard_row(snapshot, requested)?;
-    crate::attribution::note_requested_model(requested, &entry.id);
+    let (entry, upstream, caller_selected) = best_wildcard_row(snapshot, requested)?;
+    crate::attribution::note_requested_model_with_caller_selection(
+        requested,
+        &entry.id,
+        caller_selected,
+    );
     // A wildcard row is a direct model, and attribution stays on the ROW
     // (see the module docs), so the synthetic clone below inherits its id.
     note_dispatchable_entry(&entry);
@@ -138,8 +142,8 @@ fn note_dispatchable_entry(entry: &ResourceEntry<Model>) {
 fn best_wildcard_row(
     snapshot: &AisixSnapshot,
     requested: &str,
-) -> Option<(Arc<ResourceEntry<Model>>, String)> {
-    let mut best: Option<(usize, Arc<ResourceEntry<Model>>, String)> = None;
+) -> Option<(Arc<ResourceEntry<Model>>, String, bool)> {
+    let mut best: Option<(usize, Arc<ResourceEntry<Model>>, String, bool)> = None;
     // Only the wildcard rows, not the whole catalog. This runs on the
     // model-resolution path AND on the metric-label path that every endpoint
     // reaches — including for a name that resolves to nothing, which reaches
@@ -161,13 +165,13 @@ fn best_wildcard_row(
         let specificity = model.display_name.len() - 1;
         if best
             .as_ref()
-            .is_none_or(|(s, e, _)| specificity > *s || (specificity == *s && entry.id < e.id))
+            .is_none_or(|(s, e, _, _)| specificity > *s || (specificity == *s && entry.id < e.id))
         {
-            let upstream = resolve_upstream_model_name(model, &capture);
-            best = Some((specificity, entry.clone(), upstream));
+            let (upstream, caller_selected) = resolve_upstream_model_name(model, &capture);
+            best = Some((specificity, entry.clone(), upstream, caller_selected));
         }
     }
-    best.map(|(_, entry, upstream)| (entry, upstream))
+    best.map(|(_, entry, upstream, caller_selected)| (entry, upstream, caller_selected))
 }
 
 /// Whether `model` is a row that would actually serve the caller-facing
@@ -199,7 +203,7 @@ pub(crate) fn row_serves_name(model: &Model, requested: &str) -> bool {
 /// the configured row (`openai/*`), never as the caller-minted concrete
 /// string — the #451 cardinality guard extended to resolvable names.
 pub(crate) fn wildcard_row_name(snapshot: &AisixSnapshot, requested: &str) -> Option<String> {
-    best_wildcard_row(snapshot, requested).map(|(entry, _)| entry.value.display_name.clone())
+    best_wildcard_row(snapshot, requested).map(|(entry, _, _)| entry.value.display_name.clone())
 }
 
 /// The `(display_name, model_name template)` pair of the wildcard row
@@ -211,7 +215,7 @@ pub(crate) fn wildcard_row_identity(
     snapshot: &AisixSnapshot,
     requested: &str,
 ) -> Option<(String, String)> {
-    best_wildcard_row(snapshot, requested).map(|(entry, _)| {
+    best_wildcard_row(snapshot, requested).map(|(entry, _, _)| {
         (
             entry.value.display_name.clone(),
             entry
@@ -228,18 +232,18 @@ pub(crate) fn wildcard_row_identity(
 /// when the row's pattern does not cover the name.
 pub(crate) fn wildcard_upstream_model(row: &Model, requested: &str) -> Option<String> {
     let capture = wildcard_capture(&row.display_name, requested)?;
-    Some(resolve_upstream_model_name(row, &capture))
+    Some(resolve_upstream_model_name(row, &capture).0)
 }
 
 /// Concrete upstream model id for a wildcard match: substitute the captured
 /// segment into the `model_name` template's `*`, keep the template as-is when it
 /// has no `*` (a fixed upstream for every match), or send the captured segment
 /// verbatim when there is no template.
-fn resolve_upstream_model_name(model: &Model, capture: &str) -> String {
+fn resolve_upstream_model_name(model: &Model, capture: &str) -> (String, bool) {
     match model.model_name.as_deref() {
-        Some(t) if t.contains('*') => t.replacen('*', capture, 1),
-        Some(t) => t.to_string(),
-        None => capture.to_string(),
+        Some(t) if t.contains('*') => (t.replacen('*', capture, 1), true),
+        Some(t) => (t.to_string(), false),
+        None => (capture.to_string(), true),
     }
 }
 

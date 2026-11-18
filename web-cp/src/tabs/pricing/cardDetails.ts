@@ -24,7 +24,7 @@ export interface MatrixGroup {
 
 const DIMENSION_GROUPS = [
   { label: "文本与推理", keys: ["input", "output", "reasoning"] },
-  { label: "缓存", keys: ["cache_read", "cache_write", "cache_write_1h"] },
+  { label: "缓存", keys: ["cache_read", "cache_write", "cache_write_1h", "cache_write_12h"] },
   { label: "音频", keys: ["audio_input", "audio_output"] },
   { label: "图像", keys: ["image_input", "image_output"] },
   { label: "联网", keys: ["web_search"] },
@@ -53,6 +53,7 @@ export function cardDetails(card: unknown): { tiers: DisplayTier[]; problem: str
   if (problem !== null) return { tiers: [], problem };
   const source = card as Record<string, {
     base?: Record<string, string>;
+    unpriced_above_input_tokens?: unknown;
     long_context?: { above_input_tokens?: unknown; rates?: Record<string, string> }[];
   }>;
   const keys = Object.keys(source).sort((a, b) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b));
@@ -60,11 +61,13 @@ export function cardDetails(card: unknown): { tiers: DisplayTier[]; problem: str
     const part = source[key];
     const contexts = part?.long_context ?? [];
     const first = contexts[0];
+    const limit = part?.unpriced_above_input_tokens;
+    const baseThrough = first?.above_input_tokens ?? limit;
     return {
       key,
       label: tierText(key),
       bands: [
-        { key: "base", label: first ? `基础价 · 输入 ≤ ${String(first.above_input_tokens)} tokens` : "基础价 · 全部输入长度", rates: displayRates(part?.base ?? {}) },
+        { key: "base", label: baseThrough !== undefined ? `基础价 · 输入 ≤ ${String(baseThrough)} tokens` : "基础价 · 全部输入长度", rates: displayRates(part?.base ?? {}) },
         ...contexts.map((band, index) => {
           const next = contexts[index + 1];
           return {
@@ -73,6 +76,7 @@ export function cardDetails(card: unknown): { tiers: DisplayTier[]; problem: str
             rates: displayRates(band.rates ?? {}),
           };
         }),
+        ...(limit === undefined ? [] : [{ key: "unpriced", label: `输入 > ${String(limit)} tokens · 未公布价格`, rates: [] }]),
       ],
     };
   });

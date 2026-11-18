@@ -91,7 +91,7 @@ impl Capture {
     }
 
     // 等整个请求结束再读日志，既不依赖 drop 同步，也不只等第一条日志。
-    async fn wait_for_request_end(&self) {
+    pub(crate) async fn wait_for_request_end(&self) {
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             self.request_closed.notified(),

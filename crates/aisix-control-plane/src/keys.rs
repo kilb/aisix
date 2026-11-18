@@ -1391,6 +1391,14 @@ pub struct KeyOwner {
     display_name: Option<String>,
 }
 
+/// 租户可见的创建者；平台操作员的身份不进入租户响应。
+#[derive(Debug, Serialize)]
+pub struct TenantKeyCreator {
+    kind: String,
+    id: Option<Uuid>,
+    display_name: Option<String>,
+}
+
 /// `TenantKey` in the tenant API: the group it names by display name, and
 /// no routing name, endpoint family or upstream.
 #[derive(Debug, Serialize)]
@@ -1399,6 +1407,7 @@ pub struct TenantKeyView {
     label: String,
     prefix: String,
     owner: Option<KeyOwner>,
+    created_by: TenantKeyCreator,
     model_ids: Option<Vec<Uuid>>,
     /// The group the key routes to, as a tenant sees it; `null` for a key an
     /// older replica minted without one.
@@ -1437,6 +1446,17 @@ fn tenant_views(
                     id,
                     display_name: names.get(&id).cloned().flatten(),
                 }),
+                created_by: {
+                    let id = k
+                        .created_by
+                        .id
+                        .filter(|id| k.created_by.kind == "member" && names.contains_key(id));
+                    TenantKeyCreator {
+                        kind: k.created_by.kind,
+                        display_name: id.and_then(|id| names.get(&id).cloned().flatten()),
+                        id,
+                    }
+                },
                 group: k.group.as_ref().map(KeyGroup::view),
                 group_available,
                 model_ids: k.model_ids,
@@ -1452,15 +1472,26 @@ fn tenant_views(
         .collect()
 }
 
-/// The member display names of `keys`' owners, by member id.
+/// 归属成员与创建者的显示名称，包括已移除成员；查询始终限于当前租户。
 async fn owner_names(
     conn: &mut PgConnection,
+    tenant_id: Uuid,
     keys: &[KeyRow],
 ) -> Result<HashMap<Uuid, Option<String>>, ApiError> {
-    let members: Vec<Uuid> = keys.iter().filter_map(|k| k.member_id).collect();
+    let members: Vec<Uuid> = keys
+        .iter()
+        .flat_map(|k| {
+            [
+                k.member_id,
+                k.created_by.id.filter(|_| k.created_by.kind == "member"),
+            ]
+        })
+        .flatten()
+        .collect();
     Ok(sqlx::query_as::<_, (Uuid, Option<String>)>(
-        "SELECT id, display_name FROM members WHERE id = ANY($1)",
+        "SELECT id, display_name FROM members WHERE tenant_id = $1 AND id = ANY($2)",
     )
+    .bind(tenant_id)
     .bind(&members)
     .fetch_all(conn)
     .await
@@ -1474,7 +1505,7 @@ async fn tenant_view(
     t: &TenantRow,
     key: KeyRow,
 ) -> Result<TenantKeyView, ApiError> {
-    let names = owner_names(&mut *conn, std::slice::from_ref(&key)).await?;
+    let names = owner_names(&mut *conn, t.id, std::slice::from_ref(&key)).await?;
     tenant_views(t, vec![key], names)
         .pop()
         .ok_or_else(|| ApiError::internal("a key view went missing"))
@@ -1755,7 +1786,7 @@ pub async fn list(
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
     let tenant = tenants::find(&mut conn, auth.tenant_id).await?;
     let keys = select(&mut conn, None, Some(auth.tenant_id), own_only(&auth)).await?;
-    let names = owner_names(&mut conn, &keys).await?;
+    let names = owner_names(&mut conn, tenant.id, &keys).await?;
     let items = tenant_views(&tenant, keys, names);
     Ok(Json(json!({ "items": items })))
 }

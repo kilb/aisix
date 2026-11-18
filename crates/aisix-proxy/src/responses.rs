@@ -361,6 +361,8 @@ struct ResponseUsage {
     /// surfaced via `usage.input_tokens_details.cached_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -416,6 +418,8 @@ impl ResponseUsage {
         self.web_search_requests = 0;
         self.cached_prompt_tokens = 0;
         self.cache_write_tokens = None;
+        self.cache_write_30m_tokens = None;
+        self.cache_write_12h_tokens = None;
         self.cache_usage_reported = None;
         self.modality = Default::default();
         self.cache_creation_ttl = Default::default();
@@ -533,7 +537,7 @@ pub(crate) async fn responses_operation(
         None => crate::responses_affinity::ContextAffinity::unwrap_request(&mut body),
     };
     if affinity.needs_registered_previous()
-        || (state.platform().is_some()
+        || ((state.platform().is_some() || state.native_objects.is_some())
             && body
                 .get("previous_response_id")
                 .is_some_and(Value::is_string))
@@ -2179,7 +2183,13 @@ async fn responses_to_target(
     // 本块只保留出站字节和正式 ID；正文留给故障转移，reqwest 持有字节直到响应头。
     // 等待查找或响应头前先释放 Value 副本，避免同时持有第三份正文。
     // 参见 crate::util::outbound_json。
-    let (body_bytes, is_stream, (mut conversation_record_id, conversation_to_resolve)) = {
+    let admitted_previous = body.get("previous_response_id").and_then(Value::as_str);
+    let (
+        body_bytes,
+        is_stream,
+        (mut conversation_record_id, conversation_to_resolve),
+        previous_to_resolve,
+    ) = {
         let mapped = crate::effort_mapping::responses_request(body, model);
         // The common case only renames `model`: serialize the caller's body
         // with that one field swapped instead of deep-cloning it first, which
@@ -2203,6 +2213,7 @@ async fn responses_to_target(
                 crate::util::outbound_json(&wire)?,
                 is_stream,
                 crate::native_api::response_refs::final_conversation(body, admitted_conversation),
+                None,
             )
         } else {
             let mut body = mapped.into_owned();
@@ -2241,6 +2252,20 @@ async fn responses_to_target(
                     &r.default_body_fields,
                 );
             }
+            // 重命名或默认值新引入的正式续接槽不能沿用原槽的授权。
+            let previous_to_resolve = body
+                .get("previous_response_id")
+                .and_then(Value::as_str)
+                .filter(|raw| {
+                    (state.platform().is_some() || state.native_objects.is_some())
+                        && Some(*raw) != admitted_previous
+                })
+                .map(str::to_owned);
+            if let Some((_, original)) = previous_to_resolve.as_deref().and_then(|raw| {
+                crate::responses_affinity::legacy_response_reference(state.platform(), auth, raw)
+            }) {
+                body["previous_response_id"] = Value::String(original);
+            }
             let is_stream = body
                 .get("stream")
                 .and_then(|v| v.as_bool())
@@ -2250,9 +2275,23 @@ async fn responses_to_target(
                 crate::util::outbound_json(&body)?,
                 is_stream,
                 crate::native_api::response_refs::final_conversation(&body, admitted_conversation),
+                previous_to_resolve,
             )
         }
     };
+
+    if let Some(raw) = previous_to_resolve {
+        let reference = crate::native_api::origin::resolve_reference(state, auth, &raw).await?;
+        let origin = reference.origin.ok_or(ProxyError::ResponseNotFound)?;
+        // 路由已选定目标；最终续接只能读取同一提供方账号。
+        if origin.provider_key_id
+            != crate::native_api::openai::resource_id(state, "provider_keys", &pk_entry.id)?
+        {
+            return Err(ProxyError::ResponseNotFound);
+        }
+        crate::native_api::origin::verify_origin(state, snapshot, &origin)?;
+        affinity.admit_object_origin(origin)?;
+    }
 
     if operation.is_create() && state.native_objects.is_some() {
         if let Some(raw) = conversation_to_resolve {
@@ -3581,6 +3620,8 @@ async fn responses_cross_provider_to_target(
                     web_search_requests: comp.web_search_requests,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    cache_write_30m_tokens: comp.cache_write_30m_tokens,
+                    cache_write_12h_tokens: comp.cache_write_12h_tokens,
                     cache_usage_reported: comp.cache_usage_reported,
                     modality: comp.modality,
                     cache_creation_ttl: comp.cache_creation_ttl,
@@ -3769,6 +3810,8 @@ async fn responses_cross_provider_to_target(
             web_search_requests: resp.usage.web_search_requests,
             cached_prompt_tokens: resp.usage.cached_prompt_tokens,
             cache_write_tokens: resp.usage.cache_write_tokens,
+            cache_write_30m_tokens: resp.usage.cache_write_30m_tokens,
+            cache_write_12h_tokens: resp.usage.cache_write_12h_tokens,
             cache_usage_reported: resp.usage.cache_usage_reported(),
             modality: resp.usage.modality,
             cache_creation_ttl: resp.usage.cache_creation_ttl,
@@ -4015,6 +4058,17 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         .pointer("/input_tokens_details/cache_write_tokens")
         .and_then(Value::as_u64)
         .map(crate::usage_attr::token_count);
+    let write_details = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cache_write_tokens_details"));
+    let write_count = |name: &str| {
+        write_details
+            .and_then(|details| details.get(name))
+            .and_then(Value::as_u64)
+            .map(crate::usage_attr::token_count)
+    };
+    let cache_write_30m_tokens = write_count("ttl_30m_tokens");
+    let cache_write_12h_tokens = write_count("ttl_12h_tokens");
     let cache_usage_reported = Some(
         usage
             .pointer("/input_tokens_details/cached_tokens")
@@ -4042,6 +4096,8 @@ fn extract_response_usage(body: &Value) -> Option<ResponseUsage> {
         web_search_requests: reported_searches.unwrap_or(0),
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_write_30m_tokens,
+        cache_write_12h_tokens,
         cache_usage_reported,
         modality: aisix_gateway::ModalityTokens::from_openai_details(
             usage.get("input_tokens_details"),
@@ -4146,6 +4202,8 @@ impl ResponseUsage {
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_write_30m_tokens: self.cache_write_30m_tokens,
+            cache_write_12h_tokens: self.cache_write_12h_tokens,
             cache_usage_reported: self.cache_usage_reported,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_creation_ttl: self.cache_creation_ttl,
@@ -4155,12 +4213,15 @@ impl ResponseUsage {
             cost_usd: crate::usage_attr::request_cost_usd(
                 snap,
                 model_id,
-                crate::usage_attr::input_tokens_for_pricing(
-                    u64::from(self.prompt_tokens),
-                    u64::from(self.cached_prompt_tokens),
-                    u64::from(self.cache_write_tokens.unwrap_or(0)),
-                    u64::from(self.cache_read_tokens),
-                    u64::from(self.cache_creation_tokens),
+                crate::usage_attr::input_tokens_from_counts(
+                    self.prompt_tokens,
+                    self.cached_prompt_tokens,
+                    self.cache_write_tokens,
+                    self.cache_write_30m_tokens,
+                    self.cache_write_12h_tokens,
+                    self.cache_read_tokens,
+                    self.cache_creation_tokens,
+                    self.cache_creation_ttl,
                 ),
                 u64::from(self.completion_tokens),
             ),
@@ -4174,6 +4235,8 @@ impl ResponseUsage {
         aisix_gateway::UsageStats {
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_write_30m_tokens: self.cache_write_30m_tokens,
+            cache_write_12h_tokens: self.cache_write_12h_tokens,
             cache_usage_reported: self.cache_usage_reported,
             modality: self.modality,
             cache_creation_ttl: self.cache_creation_ttl,
@@ -6281,6 +6344,8 @@ fn emit_usage_event(
                 usage.prompt_tokens,
                 usage.cached_prompt_tokens,
                 usage.cache_write_tokens,
+                usage.cache_write_30m_tokens,
+                usage.cache_write_12h_tokens,
                 usage.cache_read_tokens,
                 usage.cache_creation_tokens,
                 usage.cache_creation_ttl,
@@ -6289,6 +6354,8 @@ fn emit_usage_event(
         ),
         cached_prompt_tokens: usage.cached_prompt_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        cache_write_30m_tokens: usage.cache_write_30m_tokens,
+        cache_write_12h_tokens: usage.cache_write_12h_tokens,
         cache_usage_reported: usage.cache_usage_reported,
         modality_tokens: usage.modality,
         cache_creation_ttl: usage.cache_creation_ttl,
@@ -12465,6 +12532,44 @@ mod resumed_raw_failure_tests {
         for response in snapshots {
             assert_eq!(response["id"], "resp_known_raw");
             assert_eq!(response["output"], serde_json::json!([]));
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_write_split_12h_tests {
+    use super::*;
+
+    #[test]
+    fn cache_write_split_12h_survives_buffered_and_terminal_usage() {
+        for split in [
+            serde_json::json!({"ttl_30m_tokens": 3000, "ttl_12h_tokens": 4000}),
+            serde_json::json!({"ttl_30m_tokens": 0, "ttl_12h_tokens": 0}),
+        ] {
+            let total = split["ttl_30m_tokens"].as_u64().unwrap()
+                + split["ttl_12h_tokens"].as_u64().unwrap();
+            let response = serde_json::json!({"id":"resp_split", "status":"completed", "usage":{"input_tokens":12000, "output_tokens":100, "total_tokens":12100, "input_tokens_details":{"cached_tokens":4000, "cache_write_tokens":total, "cache_write_tokens_details":split}}});
+            for stats in [
+                response_usage_stats(&response).unwrap(),
+                responses_terminal_usage_stats(
+                    &serde_json::json!({"type":"response.completed", "response":response}),
+                )
+                .unwrap(),
+            ] {
+                let mut event = aisix_obs::UsageEvent::default();
+                crate::usage_attr::AnsweredUsage::from_stats(&stats).apply(&mut event);
+                let wire = serde_json::to_value(&event).unwrap();
+                assert_eq!(
+                    wire.get("cache_write_30m_tokens"),
+                    Some(&split["ttl_30m_tokens"])
+                );
+                assert_eq!(
+                    wire.get("cache_write_12h_tokens"),
+                    Some(&split["ttl_12h_tokens"])
+                );
+                assert_eq!(event.prompt_tokens, 12000);
+                assert_eq!(event.cache_write_tokens, Some(total as u32));
+            }
         }
     }
 }

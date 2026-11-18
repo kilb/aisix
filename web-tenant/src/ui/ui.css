@@ -465,7 +465,6 @@ select.select-sm {
   --dt-edge: var(--pad, 28px);
   margin-left: calc(-1 * var(--pad, 28px));
   margin-right: calc(-1 * var(--pad, 28px));
-  border-top: 1px solid var(--border);
 }
 .panel > .dt-wrap:last-child {
   margin-bottom: calc(-1 * var(--pad, 28px));

@@ -66,7 +66,8 @@ failing unless it was written for them.
 - How a row's counters are read (the subset OpenAI-shape cache counters
   against the additive Anthropic-shape ones, the one-hour write split,
   reasoning beside the completion) is `aisix_core::input_tokens_for_pricing`,
-  `aisix_core::one_hour_cache_writes` and
+  `aisix_core::one_hour_cache_writes`,
+  `aisix_core::twelve_hour_cache_writes` and
   `aisix_core::reasoning_beside_completion`. The gateway's own spend calls the
   same functions. Call them; do not reimplement, inline or "simplify" any of
   them here, since a second copy is how the engine and the gateway would come
@@ -106,7 +107,9 @@ failing unless it was written for them.
   `BillableUsage`). Add the event field, its `BillableUsage` field and the
   dimension in the same change; a rate for a quantity nobody reports bills
   nothing, silently.
-- The same change bumps `ENGINE_VERSION`. It is 2: version 2 prices a row at
+- The same change bumps `ENGINE_VERSION`. It is 3: version 3 prices the
+  upstream-reported 12-hour cache-write subset separately and refuses a
+  short-only service tier above its explicit published limit. Version 2 prices a row at
   its model's baseline times its group's rate, with the tenant discount
   still applied, and version 1 priced it at a platform sell price. Every
   revision and charge is stamped with the version that wrote it, and an
@@ -119,14 +122,27 @@ failing unless it was written for them.
 - A quantity on a dimension the selected rates do not price refuses the row
   (`missing_dimension_price`); it is never billed at zero.
 
-## A price never starts in the past
+## Price writes and event clocks
 
 - Every price write refuses an `effective_from` more than
   `BACKDATE_TOLERANCE` (5 s) before the database's own `clock_timestamp()`
   (`crates/aisix-control-plane/src/pricing/store.rs`), for baselines, group
-  rates, cost rates and discounts alike, imports included. With no
-  backdating, the book at ingest equals the book at the row's `occurred_at`,
-  so a row that arrives late is priced exactly as one that arrived on time.
+  rates, cost rates and discounts alike, imports included. Prices are
+  selected at the row's `price_instant`, not its receipt time; a late row
+  uses the revisions in force when it occurred. This does not guarantee
+  that the book at ingest is identical to a book loaded later.
+- **Operating policy: retain the five-minute clock-skew bound.**
+  `price_instant = min(occurred_at, received_at + 5 min)`, where
+  `received_at` is the control plane's receipt time. Keep data-plane and
+  control-plane clocks synchronized with NTP. The bound limits how far a
+  gateway's clock can lead; it does not clamp the instant to receipt time.
+- If a gateway's clock leads, the price instant can still be in the future
+  when the charge is written. A revision written after that charge, with
+  `effective_from` at or before that future instant, was absent from the
+  ingest-time book. The existing charge stays as written; neither that
+  revision taking effect nor correcting the clock recomputes it. This is
+  the boundary of the retained five-minute policy, not an unconditional
+  equivalence between the ingest-time book and the book at the price instant.
 - Correcting past charges is re-pricing: it appends adjustments and never
   edits a charge or a revision. Do not add an `UPDATE` or `DELETE` on a
   revision table or on `pricing_charges`, and do not loosen the tolerance to

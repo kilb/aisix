@@ -523,7 +523,7 @@ provider key's budget.
 
 **Platform mode is for a deployment that serves many tenants through upstream accounts the platform owns. A tenant must not learn which upstream channel, provider or account served it, and must not reach anything another tenant left upstream. The mode is off by default, and with it off every exit answers byte for byte as it would without the feature.**
 
-Hiding the channel is best effort: some of what an upstream writes or does still tells channels apart (Known follow-ups lists what), and no rule here trades latency, throughput or what a caller receives for hiding it. Keeping tenants apart (stored objects, sealed ids, the cache, provider groups, model access and billing) is not best effort.
+Hiding the channel is best effort: some of what an upstream writes or does still tells channels apart (Known follow-ups lists what), and no rule here trades latency, throughput or what a caller receives for hiding it. Keeping tenants apart (stored objects, sealed ids, the gateway's response cache, provider groups, model access and billing) is not best effort.
 
 ### The switch
 
@@ -605,26 +605,25 @@ What still tells channels apart on the tenant endpoints, accepted because hiding
 - A URL the upstream fetches itself reveals the channel to the URL's owner: an image, document or `file_url` the request names, and a remote MCP server (`mcp` tool `server_url`, Messages `mcp_servers`). OpenAI, Azure and Anthropic fetch such a URL from their own addresses; for Bedrock and Vertex the gateway downloads it. The `413` for media too large to download names the gateway's download.
 - A relayed stream frame keeps the members its upstream wrote beside the documented ones (a Responses `obfuscation`, a channel's own top-level member), and every documented member a channel writes is kept on every exit (`service_tier` in a Response). Which documented members appear, and how a channel lays out its frames (`event:` lines, line endings), differs by channel.
 
-These surfaces are not adapted. A platform deployment confines tenant keys to the tenant endpoints with `allowed_endpoints`, listing the families `chat_completions`, `messages`, `count_tokens`, `responses`, `embeddings` and `models`; a tenant key is then refused on every surface below with `403` before any upstream call (`endpoint_acl`). Until a surface is adapted, its family stays off tenant keys.
+Managed tenant keys carry an explicit `allowed_endpoints` list. The control plane's `keys::FIRST_PHASE_ENDPOINTS` and its compatibility gate define the families it can grant to a deployed gateway; the original six-family list is no longer the contract. Completions, rerank, decisions, media, Realtime and the native object surfaces have since been integrated. MCP, A2A and passthrough remain outside that managed-key grant. `endpoint_acl` refuses a family omitted from a key with `403` before any upstream call. Retired APIs remain retired regardless of a legacy family name in the list.
 
-- `/v1/completions` returns the upstream's `id` and `system_fingerprint`.
-- `/v1/rerank`, `/v1/decisions` and `/v1/systemone` relay the upstream's body as sent apart from `model`, its ids and every channel-specific member included.
-- Realtime frames inside an established session (connect failures, relayed upstream `error` events) are not classed, because the session runs outside the request's attribution scope, and the relay hands out every upstream id as sent: session, conversation item and response ids, and `event_id`. Realtime and `/v1/audio/speech` voice ids are not checked as stored objects.
-- Passthrough routes relay the upstream's headers and body as sent, Responses bodies included, and the stored-object check does not read them.
-- The files, batches and fine-tuning surface, including Responses requests inside a batch file, is outside the id and stored-object rules. Its relayed error bodies are classed, a native request error included.
-- Images, audio, video, MCP and A2A have no adaptation beyond the shared error renderers.
+- Ordinary response members, including completions ids and `system_fingerprint`, follow the full-response contract. Provider-specific members alone are not grounds to delete a caller's result.
+- Files, batches, videos and custom voices use the native object ownership checks (`native_openai_jobs`, `native_voices` and the video tests). Responses inside a batch file pass through the native batch preparation path. Speech and ordinary Realtime validate the documented custom-voice object slots; a built-in voice name remains usable.
+- Ordinary Realtime sessions apply the shared platform error classes to connection failures and upstream `error` events. Actionable native request errors keep their words through the shared scrubber, and the official event and client-correlation ids remain intact. Session, conversation item and response ids still pass through by decision. Realtime Calls remain deferred.
+- A narrowed Realtime key is checked before new client work, after observed usage and on an existing persistent lease heartbeat. An idle session without that lease has no independent authorization timer, so a bounded close of every idle connection or in-flight upstream output is not promised. MCP is stateless JSON and reauthenticates each request.
+- Passthrough routes relay upstream headers and bodies, including Responses bodies, without native object interpretation. Granting these routes requires a separate operator decision; managed tenant keys do not receive that family.
 
 On the tenant endpoints themselves:
 
 - Paths that fail open forward an upstream's Responses ids as sent rather than corrupt the frame: a frame the JSON splice cannot rewrite, or an oversized unterminated one.
 - An operator's `param_renames` runs after the stored-object check, so it could map a caller's field onto a refused one.
 - Skills are refused by type `custom`. An allow-list of type `anthropic` would be stricter.
-- A bare-string `audio.voice` that names a custom voice is not refused; the object form is.
-- A broad `forward_client_headers` rule can forward `anthropic-workspace-id` or `anthropic-user-profile-id` upstream.
+- A bare-string `audio.voice` is passed through as a built-in name. Only the documented custom-voice object slot names a stored object and requires ownership proof; arbitrary strings are not inferred to be object references.
+- In platform mode `anthropic-workspace-id` and `anthropic-user-profile-id` require exact `forward_client_headers` entries. A wildcard does not select a workspace or end-customer identity in a shared upstream account. Operator `default_headers` and exact entries still apply; platform mode off retains the ordinary forwarding rules.
 
-Keeping tenants apart, which is not best effort either, still has this gap:
+The current upstream-cache deployment boundary:
 
-- Tenants share the platform's upstream accounts, and an upstream's prompt cache is shared within one account ("Caches are not shared across organizations", <https://developers.openai.com/api/docs/guides/prompt-caching>, so they are within one). A tenant can therefore send a candidate prompt of a cacheable length and read from its answer's cache counters (`cached_tokens`, `cache_read_input_tokens`), which every endpoint reports, whether another tenant sent the same prefix before: the probing the same page names. Nothing in the gateway scopes the upstream cache per tenant today. On the OpenAI wire a per-tenant `prompt_cache_key` would ("separate keys help prevent cache-hit probing across users"), written by the gateway in place of or around the caller's own, as a platform-mode exception to the request-field rule; the Messages API has no such key.
+- Tenants sharing one upstream account also share its prompt cache. The gateway provides no tenant partition for that upstream cache and preserves the caller's cache key. Cache counters can reveal whether a candidate prefix was already cached; this is an accepted deployment boundary, not a claim of hard isolation. See the provider's [prompt-caching scope and cache-hit probing guidance](https://developers.openai.com/api/docs/guides/prompt-caching).
 
 Billing, which is not best effort, still has this gap:
 

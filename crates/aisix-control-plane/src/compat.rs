@@ -155,6 +155,14 @@ pub const FIELD_FLOORS: &[FieldFloor] = &[
         why: "an older gateway ignores fixed-target routing and may switch a session to another account",
     },
     FieldFloor {
+        kind: Kind::Models,
+        pointer: "/cost/cache_write_12h_per_1k",
+        trigger: Trigger::Present,
+        since: Since::ThisRelease,
+        widens: never,
+        why: "an older gateway ignores the twelve-hour cache-write rate and can undercount spend against a budget",
+    },
+    FieldFloor {
         kind: Kind::CachePolicies,
         pointer: "/scope",
         trigger: Trigger::Equals("team"),
@@ -1109,6 +1117,51 @@ mod tests {
     }
 
     #[test]
+    fn a_new_twelve_hour_spend_rate_requires_a_gateway_that_reads_it() {
+        let explicit =
+            json!({"cost":{"input_per_1k":1,"output_per_1k":2,"cache_write_12h_per_1k":2.5}});
+        let floor: Vec<FieldFloor> = FIELD_FLOORS
+            .iter()
+            .copied()
+            .filter(|floor| floor.pointer == "/cost/cache_write_12h_per_1k")
+            .collect();
+        assert_eq!(floor.len(), 1);
+        for fleet in [versions(&["1.8.2"]), versions(&["unreadable"])] {
+            let error =
+                check_against(&floor, Kind::Models, &explicit, &fleet, "1.9.0").unwrap_err();
+            assert_eq!(error.pointer, "/cost/cache_write_12h_per_1k");
+        }
+        assert!(check_against(
+            &floor,
+            Kind::Models,
+            &explicit,
+            &versions(&["1.9.0"]),
+            "1.9.0"
+        )
+        .is_ok());
+        assert!(check_against(&floor, Kind::Models, &explicit, &[], "1.9.0").is_ok());
+        for legacy in [
+            json!({"cost":{"input_per_1k":1,"output_per_1k":2}}),
+            json!({"cost":{"cache_write_12h_per_1k":null}}),
+        ] {
+            assert!(check_against(
+                &floor,
+                Kind::Models,
+                &legacy,
+                &versions(&["1.8.2"]),
+                "1.9.0"
+            )
+            .is_ok());
+            assert_eq!(
+                newly_triggered(&floor, Kind::Models, &explicit, &legacy).len(),
+                1
+            );
+        }
+        // 已存配置的再投影与普通编辑不额外设门禁。
+        assert!(newly_triggered(&floor, Kind::Models, &explicit, &explicit).is_empty());
+    }
+
+    #[test]
     fn fixed_hash_floor_is_false_specific_and_rechecks_only_target_growth() {
         let model = |flag: Value, targets: Value| {
             json!({
@@ -1414,6 +1467,7 @@ mod tests {
                 (Kind::TokenCounting, "/messages_count_tokens"),
                 (Kind::TokenCounting, "/responses_input_tokens"),
                 (Kind::Models, "/routing/hash_failover"),
+                (Kind::Models, "/cost/cache_write_12h_per_1k"),
                 (Kind::CachePolicies, "/scope"),
                 (Kind::ApiKeys, "/allowed_endpoints"),
                 (Kind::ApiKeys, "/allowed_provider_groups"),

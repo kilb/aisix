@@ -41,7 +41,7 @@
   --bento-surface: #FFFFFF;
   --bento-well: #F5F4F0;
   --bento-stone: #ECEBE6;
-  --bento-line: #E5E4DF;
+  --bento-line: #E9E8E3;
   --bento-graphite: #7A7A73;
   --bento-ink: #111110;
   --bento-ink-soft: #4A4A45;
@@ -105,7 +105,7 @@
   --text: var(--foreground);
   --text-2: var(--bento-ink-soft);
   --text-muted: var(--muted-foreground);
-  --divider: var(--border);
+  --divider: color-mix(in srgb, var(--border) 65%, transparent);
   --input-border: var(--input);
   --input-border-hover: #6B6B64;
   --box-border: var(--input);
@@ -131,8 +131,8 @@
   --lamp-disabled: var(--bento-graphite);
   --shadow-xs: none;
   --shadow-sm: none;
-  --shadow-card: 0 0 0 1px rgb(17 17 16 / 0.05), 0 1px 2px rgb(17 17 16 / 0.04);
-  --shadow-float: 0 0 0 1px rgb(17 17 16 / 0.05), 0 24px 48px -28px rgb(17 17 16 / 0.32);
+  --shadow-card: 0 1px 2px rgb(17 17 16 / 0.035);
+  --shadow-float: 0 24px 48px -28px rgb(17 17 16 / 0.32);
   --shadow-btn: none;
 
   /* 旧页面角色继续指向同一主题，禁止新增第二套色值。 */
@@ -230,7 +230,7 @@
   --bento-surface: #1D1D1A;
   --bento-well: #292925;
   --bento-stone: #46463E;
-  --bento-line: #44443D;
+  --bento-line: #3B3B35;
   --bento-graphite: #A8A8A0;
   --bento-ink: #F3F2EE;
   --bento-ink-soft: #D4D4CB;
@@ -258,7 +258,7 @@
   --route-4: #FFD26A;
   --route-5: #D8BEFA;
   --route-6: #EEB3D2;
-  --shadow-float: 0 0 0 1px rgb(255 255 255 / 0.08), 0 24px 48px -28px rgb(0 0 0 / 0.55);
+  --shadow-float: 0 24px 48px -28px rgb(0 0 0 / 0.55);
 }
 
 @media (max-width: 719px) {

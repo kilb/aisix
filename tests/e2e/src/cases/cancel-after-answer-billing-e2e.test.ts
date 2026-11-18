@@ -9,6 +9,9 @@ import {
   startMockSls,
   waitConfigPropagation,
   waitForSlsLog,
+  slsLogsFor,
+  scrapeMetrics,
+  metricDelta,
   type MockSls,
   type SpawnedApp,
 } from "../harness/index.js";
@@ -43,13 +46,14 @@ const SLOW = "slow-scan-marker";
 const PROMPT = 500;
 const CACHED = 100;
 const COMPLETION = 300;
+const REASONING = 70;
 const COST = { input_per_1k: 1, output_per_1k: 1 };
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 
 type Json = Record<string, unknown>;
 type Endpoint = "chat" | "messages" | "responses";
-type Upstream = "openai" | "anthropic";
+type Upstream = "openai" | "anthropic" | "gemini";
 
 interface Cell {
   name: string;
@@ -63,6 +67,9 @@ const SHAPES: Array<[Endpoint, Upstream]> = [
   ["messages", "openai"],
   ["messages", "anthropic"],
   ["responses", "openai"],
+  ["chat", "gemini"],
+  ["messages", "gemini"],
+  ["responses", "gemini"],
 ];
 
 const CELLS: Cell[] = SHAPES.flatMap(([endpoint, upstream]) =>
@@ -73,6 +80,8 @@ const CELLS: Cell[] = SHAPES.flatMap(([endpoint, upstream]) =>
     stream,
   })),
 );
+
+const callerFor = (cell: Cell) => cell.upstream === "gemini" ? `${CALLER}-${cell.name}` : CALLER;
 
 /** The text of the last user turn, whichever protocol carried it. */
 function promptOf(body: Json): string {
@@ -86,9 +95,9 @@ function promptOf(body: Json): string {
             .join("")
         : "";
   if (typeof body.input === "string") return body.input;
-  const turns = (body.messages ?? body.input) as Json[] | undefined;
+  const turns = (body.messages ?? body.input ?? body.contents) as Json[] | undefined;
   const user = [...(turns ?? [])].reverse().find((t) => t.role === "user");
-  return text(user?.content);
+  return text(user?.content ?? user?.parts);
 }
 
 function sse(res: ServerResponse, events: Array<[string | null, unknown]>) {
@@ -124,6 +133,21 @@ async function startUpstream(): Promise<{ baseUrl: string; close(): Promise<void
         res.setHeader("content-type", "application/json");
         res.end(JSON.stringify(payload));
       };
+
+      if (path.endsWith(":generateContent") || path.endsWith(":streamGenerateContent")) {
+        const tiny = (body.generationConfig as Json | undefined)?.maxOutputTokens === 1;
+        const output = tiny ? 1 : COMPLETION;
+        const reasoning = tiny ? 0 : REASONING;
+        const response = {
+          candidates: [{content: {role: "model", parts: [{text: tiny ? "ok" : answer}]}, finishReason: "STOP"}],
+          usageMetadata: {
+            promptTokenCount: PROMPT, cachedContentTokenCount: CACHED,
+            candidatesTokenCount: output, thoughtsTokenCount: reasoning,
+            totalTokenCount: PROMPT + output + reasoning,
+          },
+        };
+        return path.endsWith(":streamGenerateContent") ? sse(res, [[null, response]]) : json(response);
+      }
 
       if (path === "/v1/chat/completions") {
         const id = `chatcmpl-${randomUUID()}`;
@@ -324,6 +348,11 @@ describe("a caller that hangs up after the upstream answered is billed the answe
       secret: "sk-ant-mock",
       api_base: upstream.baseUrl,
     });
+    const gemini = await seed.createProviderKey({
+      display_name: "cancel-paid-gemini", provider: "google", adapter: "vertex",
+      secret: JSON.stringify({ access_token: "ya29.cancel-test", project: "cancel-test", region: "us-central1" }),
+      api_base: upstream.baseUrl,
+    });
     const scan = await seed.createGuardrail(
       {
         name: "cancel-paid-output-scan",
@@ -338,12 +367,18 @@ describe("a caller that hangs up after the upstream answered is billed the answe
     for (const cell of CELLS) {
       const model = await seed.createModel({
         display_name: cell.name,
-        provider: cell.upstream,
-        model_name: cell.upstream === "anthropic" ? "claude-3-5-haiku-20241022" : "gpt-4o-mini",
-        provider_key_id: cell.upstream === "anthropic" ? anthropic.id : openai.id,
+        provider: cell.upstream === "gemini" ? "google" : cell.upstream,
+        model_name: cell.upstream === "gemini" ? "gemini-2.5-flash" : cell.upstream === "anthropic" ? "claude-3-5-haiku-20241022" : "gpt-4o-mini",
+        provider_key_id: cell.upstream === "gemini" ? gemini.id : cell.upstream === "anthropic" ? anthropic.id : openai.id,
         cost: COST,
       });
       await seed.attachGuardrailToModel(scan.id as string, model.id as string);
+    }
+    for (const cell of CELLS.filter((cell) => cell.upstream === "gemini")) {
+      await seed.createApiKey({
+        key_hash: hash(callerFor(cell)), allowed_models: [cell.name],
+        rate_limit: { tpm: 2 * (PROMPT + COMPLETION + REASONING) - 1 },
+      });
     }
     // The key last: once it authenticates, the rest is in the snapshot.
     await seed.createApiKey({ key_hash: hash(CALLER), allowed_models: ["*"] });
@@ -362,7 +397,7 @@ describe("a caller that hangs up after the upstream answered is billed the answe
     await sls?.close();
   });
 
-  const send = (cell: Cell, text: string, signal?: AbortSignal) => {
+  const send = (cell: Cell, text: string, signal?: AbortSignal, maxOutputTokens = 512) => {
     const path = {
       chat: "/v1/chat/completions",
       messages: "/v1/messages",
@@ -375,11 +410,14 @@ describe("a caller that hangs up after the upstream answered is billed the answe
           ? { model: cell.name, max_tokens: 64, messages: [{ role: "user", content: text }] }
           : { model: cell.name, messages: [{ role: "user", content: text }] };
     if (cell.stream) body.stream = true;
+    if (cell.upstream === "gemini") {
+      body[cell.endpoint === "responses" ? "max_output_tokens" : cell.endpoint === "chat" ? "max_completion_tokens" : "max_tokens"] = maxOutputTokens;
+    }
     return fetch(`${app!.proxyUrl}${path}`, {
       method: "POST",
       headers: {
-        authorization: `Bearer ${CALLER}`,
-        "x-api-key": CALLER,
+        authorization: `Bearer ${callerFor(cell)}`,
+        "x-api-key": callerFor(cell),
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
       },
@@ -402,6 +440,7 @@ describe("a caller that hangs up after the upstream answered is billed the answe
     "model_id",
     "prompt_tokens",
     "completion_tokens",
+    "reasoning_tokens",
     "total_tokens",
     "cached_prompt_tokens",
     "cache_read_tokens",
@@ -410,8 +449,16 @@ describe("a caller that hangs up after the upstream answered is billed the answe
   ];
 
   for (const cell of CELLS) {
-    test(`${cell.name}: the abandoned answer is billed as the delivered one is`, async (ctx) => {
+    const run = cell.upstream === "gemini" ? test.concurrent : test;
+    run(`${cell.name}: the abandoned answer is billed as the delivered one is`, async (ctx) => {
       if (!etcdReachable) ctx.skip();
+      // TPM 按整分钟重置；独立模型/密钥并行验收，避开窗口尾部再开始两笔已回答调用。
+      if (cell.upstream === "gemini") {
+        const remaining = 60_000 - Date.now() % 60_000;
+        if (remaining < 30_000) await new Promise((resolve) => setTimeout(resolve, remaining + 25));
+      }
+      const quotaWindow = Math.floor(Date.now() / 60_000);
+      const before = cell.upstream === "gemini" ? await scrapeMetrics(app!.metricsUrl) : undefined;
 
       // A delivered answer, for the row it bills.
       const clean = await send(cell, "hello");
@@ -421,6 +468,11 @@ describe("a caller that hangs up after the upstream answered is billed the answe
       const delivered = await rowOf(cell, "200");
       expect(delivered.get("prompt_tokens")).toBe(String(PROMPT));
       expect(delivered.get("completion_tokens")).toBe(String(COMPLETION));
+      if (cell.upstream === "gemini") {
+        expect(delivered.get("reasoning_tokens")).toBe(String(REASONING));
+        expect(delivered.get("total_tokens")).toBe(String(PROMPT + COMPLETION + REASONING));
+        expect(Number(delivered.get("cost_usd"))).toBeCloseTo(0.87, 10);
+      }
       expect(Number(delivered.get("cost_usd") ?? "0")).toBeGreaterThan(0);
 
       // The same answer, with the caller hanging up while the output scan
@@ -447,6 +499,11 @@ describe("a caller that hangs up after the upstream answered is billed the answe
       // Anthropic's cache read beside it.
       expect(row.get("prompt_tokens")).toBe(String(PROMPT));
       expect(row.get("completion_tokens")).toBe(String(COMPLETION));
+      if (cell.upstream === "gemini") {
+        expect(row.get("reasoning_tokens")).toBe(String(REASONING));
+        expect(row.get("total_tokens")).toBe(String(PROMPT + COMPLETION + REASONING));
+        expect(Number(row.get("cost_usd"))).toBeCloseTo(0.87, 10);
+      }
       if (cell.upstream === "anthropic") {
         expect(row.get("cache_read_tokens")).toBe(String(CACHED));
       } else {
@@ -456,6 +513,21 @@ describe("a caller that hangs up after the upstream answered is billed the answe
       const bill = (log: Map<string, string>) =>
         Object.fromEntries(BILLED.map((field) => [field, log.get(field) ?? ""]));
       expect(bill(row)).toEqual(bill(delivered));
+      if (cell.upstream === "gemini") {
+        // 计费后的取消必须耗用推理 token 配额，后发拒绝行也成为 SLS 队列屏障。
+        const limited = await send(cell, "hi", undefined, 1);
+        const limitedBody = await limited.text();
+        expect(Math.floor(Date.now() / 60_000), "the paid sequence must stay inside one TPM window").toBe(quotaWindow);
+        expect(limited.status, limitedBody).toBe(429);
+        await rowOf(cell, "429");
+        const cancelledId = row.get("request_id");
+        expect(cancelledId).toBeTruthy();
+        expect(slsLogsFor(sls!, LOGSTORE).filter((log) => log.get("request_id") === cancelledId)).toHaveLength(1);
+        const after = await scrapeMetrics(app!.metricsUrl);
+        expect(metricDelta(before!, after, "aisix_llm_input_tokens_total", {model: cell.name})).toBe(2 * PROMPT);
+        expect(metricDelta(before!, after, "aisix_llm_output_tokens_total", {model: cell.name})).toBe(2 * (COMPLETION + REASONING));
+        expect(metricDelta(before!, after, "aisix_llm_tokens_by_client_total", {model: cell.name, token_type: "total"})).toBe(2 * (PROMPT + COMPLETION + REASONING));
+      }
     });
   }
 });

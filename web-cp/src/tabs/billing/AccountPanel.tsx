@@ -521,6 +521,7 @@ const DIMENSION_LABEL: Record<string, string> = {
   cache_read: "缓存读",
   cache_write: "缓存写",
   cache_write_1h: "1 小时缓存写",
+  cache_write_12h: "12 小时缓存写",
   reasoning: "推理",
   audio_input: "音频输入",
   audio_output: "音频输出",

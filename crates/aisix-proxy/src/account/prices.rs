@@ -75,6 +75,8 @@ pub(crate) struct ModelPricing {
     input_cache_write: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input_cache_write_1h: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_cache_write_12h: Option<String>,
 }
 
 /// One model of the control plane's answer.

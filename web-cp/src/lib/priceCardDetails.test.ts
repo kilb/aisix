@@ -52,13 +52,13 @@ test("缺少价格与形状无效都不伪装成零，错误保留具体路径",
   assert.equal(cardDetails({ default: {} }).tiers[0]?.bands[0]?.rates.length, 0);
 });
 
-test("价格矩阵按十一维分组，长上下文独有维度与未来维度都保留，缺价为未知", () => {
+test("价格矩阵按十二维分组，长上下文独有维度与未来维度都保留，缺价为未知", () => {
   const tier = cardDetails({ default: { base: { input: "0" }, long_context: [{ above_input_tokens: 200000, rates: { audio_output: "9007199254740993.1", future_dimension: "0.000001" } }] } }).tiers[0];
   assert.ok(tier);
   const groups = matrixGroups(tier);
   assert.deepEqual(groups.map((group) => group.label), ["文本与推理", "缓存", "音频", "图像", "联网", "其他计量项"]);
   const rows = groups.flatMap((group) => group.rows);
-  assert.equal(rows.length, 12);
+  assert.equal(rows.length, 13);
   assert.deepEqual(rows.find((row) => row.key === "input")?.amounts, ["$0", null]);
   assert.deepEqual(rows.find((row) => row.key === "audio_output")?.amounts, [null, "$9007199254740993.1"]);
   assert.deepEqual(rows.find((row) => row.key === "future_dimension")?.amounts, [null, "$0.000001"]);
@@ -95,4 +95,14 @@ test("区间上界和下界逐字保留超安全整数字符串与未来 BigInt 
   ]);
   assert.equal(source.custom_tier.long_context[0]?.above_input_tokens, "9007199254740993");
   assert.equal(source.custom_tier.long_context[1]?.above_input_tokens, future);
+});
+
+
+test("只公布短段的档位显示上限和长段缺价，不宣称全部输入可用", () => {
+  const tier = cardDetails({ priority: { base: { input: "5", cache_write_12h: "2.5" }, unpriced_above_input_tokens: 272000 } }).tiers[0]!;
+  assert.deepEqual(tier.bands.map(band => band.label), ["基础价 · 输入 ≤ 272000 tokens", "输入 > 272000 tokens · 未公布价格"]);
+  const rows = matrixGroups(tier).flatMap(group => group.rows);
+  assert.deepEqual(rows.find(row => row.key === "input")?.amounts, ["$5", null]);
+  assert.deepEqual(rows.find(row => row.key === "cache_write_12h")?.amounts, ["$2.5", null]);
+  assert.equal(rows.find(row => row.key === "cache_write_12h")?.label, "12 小时缓存写");
 });

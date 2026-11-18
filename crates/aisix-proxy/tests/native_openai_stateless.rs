@@ -1415,3 +1415,97 @@ async fn explicit_stateless_body_model_selects_its_own_guardrail_over_conflictin
         }
     }
 }
+
+#[tokio::test]
+async fn responses_cache_write_split_12h_keeps_wire_presence_and_prices_only_reported_lifetimes() {
+    // 官方 Responses usage 形状；半报和冲突保留给计费端拒绝，不能补成可信拆分。
+    for (total, split) in [
+        (
+            7000,
+            Some(json!({"ttl_30m_tokens":3000,"ttl_12h_tokens":4000})),
+        ),
+        (0, Some(json!({"ttl_30m_tokens":0,"ttl_12h_tokens":0}))),
+        (7000, None),
+        (7000, Some(json!({"ttl_12h_tokens":4000}))),
+        (
+            7000,
+            Some(json!({"ttl_30m_tokens":3000,"ttl_12h_tokens":3999})),
+        ),
+    ] {
+        for stream in [false, true] {
+            let upstream = MockServer::builder().start().await;
+            let mut details = json!({"cached_tokens":4000,"cache_write_tokens":total});
+            if let Some(split) = &split {
+                details["cache_write_tokens_details"] = split.clone();
+            }
+            let answer = json!({"id":"resp_cache_split", "object":"response", "model":"provider-model", "status":"completed", "output":[], "usage":{"input_tokens":12000,"input_tokens_details":details,"output_tokens":100,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":12100}});
+            let reply = if stream {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!(
+                        "event: response.completed\ndata: {}\n\n",
+                        json!({"type":"response.completed","sequence_number":0,"response":answer})
+                    ))
+            } else {
+                ResponseTemplate::new(200).set_body_json(answer.clone())
+            };
+            Mock::given(method("POST"))
+                .and(path("/v1/responses"))
+                .respond_with(reply)
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let (router, _, mut events) = configured_app(&upstream.uri(), |snapshot| {
+                edit_model(snapshot, |model| {
+                    let mut value = serde_json::to_value(&*model).unwrap();
+                    value["cost"] = json!({"input_per_1k":0.001,"output_per_1k":0.002,"cached_input_per_1k":0.0001,"cache_write_per_1k":0.00125,"cache_write_12h_per_1k":0.0025});
+                    *model = serde_json::from_value(value).unwrap();
+                });
+            });
+            let request = Request::builder().method("POST").uri("/v1/responses")
+                .header("authorization", "Bearer caller").header("content-type", "application/json")
+                .body(Body::from(json!({"model":"native-model","input":"cache split","stream":stream,"store":false}).to_string())).unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1048576).await.unwrap();
+            let client: Value = if stream {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let payload = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                serde_json::from_str::<Value>(payload).unwrap()["response"].clone()
+            } else {
+                serde_json::from_slice(&bytes).unwrap()
+            };
+            assert_eq!(client["usage"]["input_tokens_details"], details);
+            let event = next_event(&mut events).await;
+            let wire = serde_json::to_value(&event).unwrap();
+            for (wire_key, source_key) in [
+                ("cache_write_30m_tokens", "ttl_30m_tokens"),
+                ("cache_write_12h_tokens", "ttl_12h_tokens"),
+            ] {
+                assert_eq!(
+                    wire.get(wire_key),
+                    split.as_ref().and_then(|value| value.get(source_key)),
+                    "{wire_key}, stream={stream}, split={split:?}"
+                );
+            }
+            assert_eq!(
+                (
+                    event.prompt_tokens,
+                    event.cached_prompt_tokens,
+                    event.cache_write_tokens,
+                    event.total_tokens
+                ),
+                (12000, 4000, Some(total), 12100)
+            );
+            if split.as_ref().and_then(|value| value.get("ttl_12h_tokens")) == Some(&json!(4000))
+                && split.as_ref().and_then(|value| value.get("ttl_30m_tokens"))
+                    == Some(&json!(3000))
+            {
+                assert!((event.cost_usd - 0.01535).abs() < 1e-12, "{event:?}");
+            }
+        }
+    }
+}

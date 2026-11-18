@@ -4,7 +4,7 @@ import { dimensionLabels, type Dimension, type DisplayPriceRate, type TierQuote 
 
 const RATE_GROUPS: { label: string; dimensions: readonly Dimension[] }[] = [
   { label: "文本与推理", dimensions: ["input", "output", "reasoning"] },
-  { label: "缓存", dimensions: ["cache_read", "cache_write", "cache_write_1h"] },
+  { label: "缓存", dimensions: ["cache_read", "cache_write", "cache_write_1h", "cache_write_12h"] },
   { label: "音频", dimensions: ["audio_input", "audio_output"] },
   { label: "图像", dimensions: ["image_input", "image_output"] },
   { label: "联网", dimensions: ["web_search"] },
@@ -44,13 +44,14 @@ function PriceBandLabel({ column }: { column: PriceColumn }) {
 function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<DisplayPriceRate>; currency: "CNY" | "USD" }) {
   const heading = useId();
   const columns: PriceColumn[] = [
-    { label: "基础价", through: tier.long_context[0]?.above_input_tokens, rates: tier.base },
+    { label: "基础价", through: tier.long_context[0]?.above_input_tokens ?? tier.unpriced_above_input_tokens, rates: tier.base },
     ...tier.long_context.map((band, index) => ({
       label: `长上下文 ${index + 1}`,
       above: band.above_input_tokens,
       through: tier.long_context[index + 1]?.above_input_tokens,
       rates: band.rates,
     })),
+    ...(tier.unpriced_above_input_tokens === undefined ? [] : [{ label: "未公布价格", above: tier.unpriced_above_input_tokens, rates: [] }]),
   ];
   const tierName = name === "default" ? "标准" : name;
   return <section className="price-tier" aria-labelledby={heading}>

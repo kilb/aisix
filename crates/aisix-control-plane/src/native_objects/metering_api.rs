@@ -102,6 +102,8 @@ fn quantities(usage: Value) -> Result<Value, ApiError> {
                 "cached_prompt_tokens":usage.cached_prompt_tokens,
                 "cache_usage_reported":usage.cache_usage_reported,
                 "cache_write_tokens":usage.cache_write_tokens,
+                "cache_write_30m_tokens":usage.cache_write_30m_tokens,
+                "cache_write_12h_tokens":usage.cache_write_12h_tokens,
                 "cache_creation_tokens":usage.cache_creation_tokens,
                 "cache_read_tokens":usage.cache_read_tokens,
                 "cache_creation_5m_tokens":usage.cache_creation_5m_tokens,
@@ -224,12 +226,21 @@ mod tests {
             "meter":{"kind":"tokens","usage":{
                 "entry_id":"entry","occurred_at":"2026-11-14T00:00:00Z","status_code":200,
                 "prompt_tokens":4,"completion_tokens":2,"total_tokens":6,
+                "cache_write_tokens":4,"cache_write_30m_tokens":0,"cache_write_12h_tokens":4,
                 "error_message":"request-body-secret","error_class":"private-provider-error"
             }}
         }]);
         let visible = quantities(reported).unwrap();
         assert_eq!(visible.pointer("/0/meter/prompt_tokens"), Some(&json!(4)));
         assert_eq!(visible.pointer("/0/meter/total_tokens"), Some(&json!(6)));
+        assert_eq!(
+            visible.pointer("/0/meter/cache_write_30m_tokens"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            visible.pointer("/0/meter/cache_write_12h_tokens"),
+            Some(&json!(4))
+        );
         assert!(!visible.to_string().contains("request-body-secret"));
         assert!(!visible.to_string().contains("private-provider-error"));
         assert!(visible.pointer("/0/meter/io_audit").is_none());

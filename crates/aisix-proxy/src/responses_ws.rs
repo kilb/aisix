@@ -108,7 +108,10 @@ struct UpstreamConnection {
 
 impl Drop for UpstreamConnection {
     fn drop(&mut self) {
-        self.task.abort();
+        // 已关闭命令通道的任务只剩有界收尾，不能中断其自动 Close 回复。
+        if !self.commands.is_closed() {
+            self.task.abort();
+        }
     }
 }
 
@@ -152,15 +155,13 @@ struct CancelRound {
 impl Drop for CancelRound {
     fn drop(&mut self) {
         // 终态前释放流时关闭共享连接，不能让迟到事件进入同lane的下一轮。
-        if self
-            .upstream
-            .commands
-            .try_send(UpstreamCommand::Cancel {
+        if matches!(
+            self.upstream.commands.try_send(UpstreamCommand::Cancel {
                 lane: self.lane.clone(),
                 token: self.token.clone(),
-            })
-            .is_err()
-        {
+            }),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
             self.upstream.task.abort();
         }
     }
@@ -231,7 +232,7 @@ pub(crate) async fn send_native(
     let mut connection = round.connection.lock().await;
     connection
         .upstreams
-        .retain(|_, upstream| !upstream.task.is_finished());
+        .retain(|_, upstream| !upstream.task.is_finished() && !upstream.commands.is_closed());
     if connection
         .upstreams
         .get(&target)
@@ -369,7 +370,9 @@ pub(crate) async fn send_native(
     if !sent {
         io.fail_request();
         io.fail_response();
-        upstream.task.abort();
+        if !upstream.commands.is_closed() {
+            upstream.task.abort();
+        }
         return Ok(stream_failure_response());
     }
     let cancel = CancelRound {
@@ -467,6 +470,14 @@ where
                     if socket.send(UpMessage::Pong(bytes)).await.is_err() { break; }
                 }
                 Some(Ok(UpMessage::Pong(_))) => {}
+                Some(Ok(UpMessage::Close(_))) => {
+                    // 先让后续 create 建立新连接，并使已接受轮立即独立结算。
+                    drop(commands);
+                    drop(rounds);
+                    // 库已排队原样 Close 回复；仅终止路径执行一次有界冲刷。
+                    let _ = tokio::time::timeout(Duration::from_secs(2), socket.flush()).await;
+                    return;
+                }
                 Some(Ok(UpMessage::Binary(bytes))) => {
                     observe_unroutable_payload(&rounds, &bytes);
                     break;
@@ -1201,6 +1212,197 @@ async fn dispatch_round(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HeldCloseFlush {
+        close: oneshot::Receiver<()>,
+        flushing: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+        sent: mpsc::UnboundedSender<UpMessage>,
+        closing: bool,
+    }
+
+    impl futures::Stream for HeldCloseFlush {
+        type Item = Result<UpMessage, tokio_tungstenite::tungstenite::Error>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if !self.closing
+                && std::future::Future::poll(std::pin::Pin::new(&mut self.close), cx).is_ready()
+            {
+                self.closing = true;
+                return std::task::Poll::Ready(Some(Ok(UpMessage::Close(None))));
+            }
+            std::task::Poll::Pending
+        }
+    }
+
+    impl futures::Sink<UpMessage> for HeldCloseFlush {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(
+            self: std::pin::Pin<&mut Self>,
+            message: UpMessage,
+        ) -> Result<(), Self::Error> {
+            let _ = self.sent.send(message);
+            Ok(())
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            if self.closing {
+                if let Some(flushing) = self.flushing.take() {
+                    let _ = flushing.send(());
+                }
+                if std::future::Future::poll(std::pin::Pin::new(&mut self.release), cx).is_pending()
+                {
+                    return std::task::Poll::Pending;
+                }
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_close_releases_rounds_and_reconnects_while_ack_flush_is_pending() {
+        let (close, closed) = oneshot::channel();
+        let (flushing, flush_started) = oneshot::channel();
+        let (release, held) = oneshot::channel();
+        let (sent, mut messages) = mpsc::unbounded_channel();
+        let (commands, receive) = mpsc::channel(4);
+        let actor = tokio::spawn(run_upstream(
+            HeldCloseFlush {
+                close: closed,
+                flushing: Some(flushing),
+                release: held,
+                sent,
+                closing: false,
+            },
+            receive,
+        ));
+        let upstream = Arc::new(UpstreamConnection {
+            commands,
+            task: actor.abort_handle(),
+        });
+        let (output, mut events) = mpsc::channel(4);
+        upstream
+            .commands
+            .send(UpstreamCommand::Create {
+                lane: None,
+                token: "before-close".into(),
+                payload: "before-close".into(),
+                output,
+                expires: None,
+                io: UpstreamIoObserver::websocket(Protocol::Responses),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            messages.recv().await,
+            Some(UpMessage::Text("before-close".into()))
+        );
+        close.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), flush_started)
+            .await
+            .expect("Close 必须开始冲刷自动回复")
+            .unwrap();
+        assert!(upstream.commands.is_closed(), "关闭中不能再接受 create");
+        assert!(tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("活动轮不能等待 ACK 冲刷才结算")
+            .is_none());
+        drop(CancelRound {
+            upstream: upstream.clone(),
+            lane: None,
+            token: "before-close".into(),
+        });
+        tokio::task::yield_now().await;
+        assert!(!actor.is_finished(), "轮次清理不能中断关闭回复");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/responses", listener.local_addr().unwrap());
+        // 该请求无自定义头，连接身份仅含 URL；将关闭中的连接放进相同缓存槽。
+        let target = format!("{:x}", Sha256::digest(url.as_bytes()));
+        let connection = Arc::new(Mutex::new(SessionConnection {
+            upstreams: [(target, upstream)].into(),
+        }));
+        let transport = RoundTransport {
+            connection,
+            stream_id: None,
+            create_attempted: Arc::new(AtomicBool::new(false)),
+        };
+        let next_round = tokio::spawn(ROUND.scope(transport, async move {
+            send_native(
+                reqwest::Client::new()
+                    .post(url)
+                    .body(r#"{"model":"fresh"}"#),
+                Some(Duration::from_secs(1)),
+                Instant::now(),
+            )
+            .await
+        }));
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("新 create 必须立即建立新连接，不等旧 ACK 冲刷")
+            .unwrap();
+        let mut provider = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let create = provider.next().await.unwrap().unwrap();
+        let create: Value = serde_json::from_str(create.to_text().unwrap()).unwrap();
+        assert_eq!(create, json!({"type":"response.create","model":"fresh"}));
+        let response = next_round.await.unwrap().unwrap();
+        assert!(!actor.is_finished(), "移除旧连接不能中断关闭回复");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_close_ack_flush_has_a_terminal_deadline() {
+        let (close, closed) = oneshot::channel();
+        let (flushing, flush_started) = oneshot::channel();
+        let (_release, held) = oneshot::channel();
+        let (sent, _messages) = mpsc::unbounded_channel();
+        let (commands, receive) = mpsc::channel(4);
+        let actor = tokio::spawn(run_upstream(
+            HeldCloseFlush {
+                close: closed,
+                flushing: Some(flushing),
+                release: held,
+                sent,
+                closing: false,
+            },
+            receive,
+        ));
+        close.send(()).unwrap();
+        flush_started.await.unwrap();
+        assert!(commands.is_closed());
+        assert!(!actor.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::timeout(Duration::from_millis(1), actor)
+            .await
+            .expect("无法写入的 Close ACK 必须在终止预算内结束")
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn upstream_event_overflow_closes_every_active_round_without_dropping_success() {

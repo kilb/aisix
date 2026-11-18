@@ -572,6 +572,8 @@ pub fn into_usage(u: OpenAiUsage) -> UsageStats {
             .or(u.prompt_cache_hit_tokens)
             .unwrap_or(0),
         cache_write_tokens: prompt.and_then(|d| d.cache_write_tokens),
+        cache_write_30m_tokens: None,
+        cache_write_12h_tokens: None,
         cache_usage_reported: None,
         reasoning_tokens: completion.and_then(|d| d.reasoning_tokens).unwrap_or(0),
         // OpenAI doesn't currently expose Anthropic-style cache

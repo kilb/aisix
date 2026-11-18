@@ -254,7 +254,7 @@ async fn terminal_response_failures_and_incomplete_results_retain_reported_usage
     result_file(&upstream, &[
         response("failed", "failed", json!({
             "input_tokens":17,"output_tokens":6,"total_tokens":23,
-            "input_tokens_details":{"cached_tokens":7,"cache_write_tokens":0},
+            "input_tokens_details":{"cached_tokens":7,"cache_write_tokens":0,"cache_write_tokens_details":{"ttl_30m_tokens":0,"ttl_12h_tokens":0}},
             "output_tokens_details":{"reasoning_tokens":3}
         })),
         response("incomplete", "incomplete", json!({
@@ -289,6 +289,11 @@ async fn terminal_response_failures_and_incomplete_results_retain_reported_usage
     );
     assert_eq!(failed.cached_prompt_tokens, 7);
     assert_eq!(failed.cache_write_tokens, Some(0));
+    assert_eq!(failed.cache_write_30m_tokens, Some(0));
+    assert_eq!(failed.cache_write_12h_tokens, Some(0));
+    let wire = serde_json::to_value(failed).unwrap();
+    assert_eq!(wire.get("cache_write_30m_tokens"), Some(&json!(0)));
+    assert_eq!(wire.get("cache_write_12h_tokens"), Some(&json!(0)));
     assert_eq!(failed.cache_usage_reported, Some(true));
     assert_eq!(failed.reasoning_tokens, 3);
     let incomplete = completed[0]

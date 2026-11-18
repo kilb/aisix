@@ -78,6 +78,7 @@ fn dimension_words(d: Dimension) -> &'static str {
         Dimension::CacheRead => "缓存读",
         Dimension::CacheWrite => "缓存写",
         Dimension::CacheWrite1h => "1 小时缓存写",
+        Dimension::CacheWrite12h => "12 小时缓存写",
         Dimension::Reasoning => "推理",
         Dimension::AudioInput => "音频输入",
         Dimension::AudioOutput => "音频输出",
@@ -134,7 +135,10 @@ fn undecodable(card: &Value, e: serde_path_to_error::Error<serde_json::Error>) -
     // A threshold is judged before any price: written as text it would
     // otherwise read as a price that does not parse.
     let message = match leaf {
-        Some(_) if path.ends_with("/above_input_tokens") => {
+        Some(_)
+            if path.ends_with("/above_input_tokens")
+                || path.ends_with("/unpriced_above_input_tokens") =>
+        {
             "长上下文门槛应是正整数（输入 token 数）".to_string()
         }
         Some(Value::String(text)) => match Rate::parse(text) {
@@ -195,6 +199,10 @@ fn card_refusal(card: &RateCard, e: &RateCardError) -> ApiError {
             ),
             None => refused("/card", format!("价目卡不合法：{e}")),
         },
+        RateCardError::InvalidUnpricedLimit { tier } => refused(
+            &format!("{}/unpriced_above_input_tokens", tier_path(tier)),
+            "仅非标准档可设置缺价上限；上限须等于标准档第一个长上下文门槛，且该档位不能再填写长上下文价格",
+        ),
         RateCardError::BandsDifferFromDefault { tier } => refused(
             &format!("{}/long_context", tier_path(tier)),
             "每个档位的长上下文门槛必须与标准档的完全相同",
@@ -1005,6 +1013,20 @@ mod tests {
     use aisix_pricing::{Rate, ServiceTier};
 
     use super::*;
+
+    #[test]
+    fn a_short_only_tier_and_twelve_hour_rate_are_validated_and_preserved() {
+        let mut raw = json!({
+            "default":{"base":{"input":"1","output":"2","cache_write_12h":"2.5"},
+                "long_context":[{"above_input_tokens":272000,"rates":{"input":"2","output":"3","cache_write_12h":"5"}}]},
+            "priority":{"base":{"input":"2","output":"4","cache_write_12h":"5"},"unpriced_above_input_tokens":272000}
+        });
+        let card = manual_card(&raw).unwrap();
+        assert_eq!(serde_json::to_value(card).unwrap(), raw);
+        raw["priority"]["unpriced_above_input_tokens"] = json!(1);
+        let error = manual_card(&raw).unwrap_err();
+        assert!(format!("{error:?}").contains("/card/priority/unpriced_above_input_tokens"));
+    }
 
     /// A catalogue with an announced price change (`openai/m1` from
     /// 2026-12-01 and 2027-02-01), a key only priced from 2027-01-01, and an

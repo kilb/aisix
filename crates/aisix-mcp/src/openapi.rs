@@ -17,9 +17,9 @@
 //!
 //! What the published schema describes is what is sent: a parameter is read
 //! from the argument it was published under, a body value the schema admits
-//! goes out as given, under the media type the schema came from, and a path
-//! parameter's array is written in the default `simple` style
-//! (<https://spec.openapis.org/oas/v3.1.1.html#style-values>).
+//! goes out as given, under the media type the schema came from.
+//! 参数按 `simple` path / `form` query 及其 `explode` 编码；其它 style 不生成工具
+//! (<https://spec.openapis.org/oas/v3.1.1.html#style-examples>)。
 //!
 //! The spec is read from the resource snapshot (shared, never re-fetched at
 //! runtime): the control plane validates and materializes it at write time, so
@@ -309,14 +309,22 @@ impl OpenApiBridge {
         // An argument-shaped failure is a tool-level error result, not a
         // protocol error: the agent sees the message and can correct the
         // call, mirroring how a non-2xx response is surfaced.
-        let url = match build_url(&self.server().url, tool, &args) {
+        let mut url = match build_url(&self.server().url, tool, &args) {
             Ok(url) => url,
             Err(message) => return Ok(tool_error(message)),
         };
         let method = reqwest::Method::from_bytes(tool.method.to_uppercase().as_bytes())
             .map_err(|_| McpError::Request(format!("unsupported HTTP method {}", tool.method)))?;
 
-        let query = build_query_pairs(tool, &args);
+        let query = build_query(tool, &args);
+        if !query.is_empty() {
+            // 数据先编码，再加入结构逗号；不能交给 `.query()` 二次编码分隔符。
+            let query = match url.query() {
+                Some(existing) if !existing.is_empty() => format!("{existing}&{query}"),
+                _ => query,
+            };
+            url.set_query(Some(&query));
+        }
         let body = match &tool.body_media_type {
             // 不猜测 schema 的准入规则：保留调用者的 JSON 值，只有缺省才不发 body。
             Some(_) => args.get("body").cloned(),
@@ -346,9 +354,6 @@ impl OpenApiBridge {
                 Err(error) if attempt > 1 => return Err(error.after_upstream_contact()),
                 Err(error) => return Err(error),
             };
-            if !query.is_empty() {
-                request = request.query(&query);
-            }
             if let (Some(body), Some(content_type)) = (&body, &content_type) {
                 request = request
                     .header(reqwest::header::CONTENT_TYPE, content_type.clone())
@@ -570,7 +575,7 @@ pub(crate) fn generate_tools(spec: &Value) -> Result<Vec<GeneratedTool>, McpErro
     for skipped in &generation.skipped {
         tracing::debug!(
             operation = %skipped,
-            "skipping operation: request body has no application/json content"
+            "skipping unsupported OpenAPI operation"
         );
     }
     Ok(generation.tools)
@@ -586,7 +591,7 @@ fn build_url(
     base_url: &str,
     tool: &GeneratedTool,
     args: &Map<String, Value>,
-) -> Result<String, String> {
+) -> Result<reqwest::Url, String> {
     let mut path = tool.path.clone();
     for param in &tool.path_params {
         let argument = param.argument.as_str();
@@ -615,11 +620,27 @@ fn build_url(
                 .collect::<Result<Vec<_>, _>>()?
                 .join(","),
             Value::Array(_) => return Err(format!("missing required path parameter '{argument}'")),
+            Value::Object(members) if !members.is_empty() => {
+                let mut parts = Vec::new();
+                for (key, value) in members {
+                    let key = sanitize_path_value(key, argument)?;
+                    let raw = scalar(value).ok_or_else(|| {
+                        format!("path parameter '{argument}' must contain scalar object values")
+                    })?;
+                    let value = sanitize_path_value(&raw, argument)?;
+                    if param.explode.unwrap_or(false) {
+                        parts.push(format!("{key}={value}"));
+                    } else {
+                        parts.extend([key, value]);
+                    }
+                }
+                parts.join(",")
+            }
             other => {
                 let raw = scalar(other).ok_or_else(|| {
                     format!(
                         "path parameter '{argument}' must be a string, number, boolean, or a \
-                         list of them"
+                         list of them, or an object of them"
                     )
                 })?;
                 sanitize_path_value(&raw, argument)?
@@ -627,7 +648,9 @@ fn build_url(
         };
         path = path.replace(&format!("{{{}}}", param.name), &safe);
     }
-    Ok(format!("{}{}", base_url.trim_end_matches('/'), path))
+    format!("{}{}", base_url.trim_end_matches('/'), path)
+        .parse()
+        .map_err(|_| "openapi server URL is invalid".to_string())
 }
 
 /// Reject path values that could change the request target (segment
@@ -647,26 +670,48 @@ fn sanitize_path_value(raw: &str, param: &str) -> Result<String, String> {
     Ok(utf8_percent_encode(raw, PATH_SEGMENT_ENCODE).to_string())
 }
 
-/// Build the query string pairs from the declared query parameters present in
-/// the arguments: scalars serialize plainly, arrays repeat the key per item,
-/// and objects are JSON-encoded.
-fn build_query_pairs(tool: &GeneratedTool, args: &Map<String, Value>) -> Vec<(String, String)> {
+/// 按 OpenAPI form/explode 编码；每个数据项先转义，结构分隔符最后加入。
+fn build_query(tool: &GeneratedTool, args: &Map<String, Value>) -> String {
+    let encode = |value: &str| utf8_percent_encode(value, PATH_SEGMENT_ENCODE).to_string();
     let mut pairs = Vec::new();
     for param in &tool.query_params {
         let Some(value) = args.get(param.argument.as_str()) else {
             continue;
         };
+        let name = encode(&param.name);
+        let explode = param.explode.unwrap_or(true);
         match value {
             Value::Null => {}
             Value::Array(items) => {
-                for item in items {
-                    pairs.push((param.name.clone(), scalar_to_string(item)));
+                let items: Vec<_> = items
+                    .iter()
+                    .map(|item| encode(&scalar_to_string(item)))
+                    .collect();
+                if explode {
+                    pairs.extend(items.into_iter().map(|item| format!("{name}={item}")));
+                } else {
+                    pairs.push(format!("{name}={}", items.join(",")));
                 }
             }
-            other => pairs.push((param.name.clone(), scalar_to_string(other))),
+            Value::Object(members) => {
+                let mut parts = Vec::new();
+                for (key, value) in members {
+                    let key = encode(key);
+                    let value = encode(&scalar_to_string(value));
+                    if explode {
+                        pairs.push(format!("{key}={value}"));
+                    } else {
+                        parts.extend([key, value]);
+                    }
+                }
+                if !explode {
+                    pairs.push(format!("{name}={}", parts.join(",")));
+                }
+            }
+            other => pairs.push(format!("{name}={}", encode(&scalar_to_string(other)))),
         }
     }
-    pairs
+    pairs.join("&")
 }
 
 fn scalar_to_string(value: &Value) -> String {
@@ -999,11 +1044,15 @@ mod tests {
         };
 
         assert_eq!(
-            build_url("https://api.example.com/v1/", &tool, &args(json!("a b#c"))).unwrap(),
+            build_url("https://api.example.com/v1/", &tool, &args(json!("a b#c")))
+                .unwrap()
+                .as_str(),
             "https://api.example.com/v1/items/a%20b%23c/sub"
         );
         assert_eq!(
-            build_url("https://api.example.com", &tool, &args(json!(42))).unwrap(),
+            build_url("https://api.example.com", &tool, &args(json!(42)))
+                .unwrap()
+                .as_str(),
             "https://api.example.com/items/42/sub"
         );
         for bad in [
@@ -1024,7 +1073,7 @@ mod tests {
     }
 
     #[test]
-    fn query_pairs_serialize_scalars_arrays_and_objects() {
+    fn query_serializes_scalars_arrays_and_objects() {
         let tool = GeneratedTool {
             name: "t".into(),
             description: String::new(),
@@ -1043,15 +1092,7 @@ mod tests {
         args.insert("tags".into(), json!(["a", 2]));
         args.insert("filter".into(), json!({"k": "v"}));
         args.insert("undeclared".into(), json!("dropped"));
-        assert_eq!(
-            build_query_pairs(&tool, &args),
-            vec![
-                ("q".to_string(), "text".to_string()),
-                ("tags".to_string(), "a".to_string()),
-                ("tags".to_string(), "2".to_string()),
-                ("filter".to_string(), r#"{"k":"v"}"#.to_string()),
-            ]
-        );
+        assert_eq!(build_query(&tool, &args), "q=text&tags=a&tags=2&k=v");
     }
 
     /// A failed upstream call's error lands in the gateway log, and

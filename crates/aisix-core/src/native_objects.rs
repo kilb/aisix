@@ -762,6 +762,10 @@ pub struct TerminalUsage {
     pub cache_usage_reported: Option<bool>,
     #[serde(default)]
     pub cache_write_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_30m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h_tokens: Option<u32>,
     #[serde(default)]
     pub cache_creation_tokens: u32,
     #[serde(default)]

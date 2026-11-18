@@ -468,11 +468,32 @@ export async function changePassword(current: string, next: string): Promise<voi
 
 const seg = encodeURIComponent;
 
+export interface ListPage<T> {
+  items: T[];
+  next_before: string | null;
+}
+
+/** 保留各页面的完整目录语义，每次 HTTP 读取限制为一页。 */
+async function readAllPages<T>(read: (before?: string) => Promise<ListPage<T>>): Promise<T[]> {
+  const items: T[] = [];
+  let before: string | undefined;
+  do {
+    const page = await read(before);
+    items.push(...page.items);
+    before = page.next_before ?? undefined;
+  } while (before !== undefined);
+  return items;
+}
+
 /** The generic resource API. `kind` is the plural, such as `provider_keys`. */
 export const resources = {
   async list<D>(kind: string): Promise<ResourceView<D>[]> {
-    return (await call<{ items: ResourceView<D>[] }>("GET", `/admin/resources/${seg(kind)}`)).data
-      .items;
+    return readAllPages((before) => resources.page<D>(kind, { before }));
+  },
+  async page<D>(kind: string, q: { before?: string; limit?: number } = {}): Promise<ListPage<ResourceView<D>>> {
+    const query = new URLSearchParams({ limit: String(q.limit ?? 200) });
+    if (q.before !== undefined) query.set("before", q.before);
+    return (await call<ListPage<ResourceView<D>>>("GET", `/admin/resources/${seg(kind)}?${query}`)).data;
   },
   async get<D>(kind: string, id: string, signal?: AbortSignal): Promise<ResourceView<D>> {
     return (
@@ -512,8 +533,13 @@ export const schemas = {
 /** Tenants, and their members and keys, as operators see them. */
 export const tenants = {
   async list(status?: Tenant["status"]): Promise<Tenant[]> {
-    const query = status ? `?status=${seg(status)}` : "";
-    return (await call<{ items: Tenant[] }>("GET", `/admin/tenants${query}`)).data.items;
+    return readAllPages((before) => tenants.page({ status, before }));
+  },
+  async page(q: { status?: Tenant["status"]; before?: string; limit?: number } = {}): Promise<ListPage<Tenant>> {
+    const query = new URLSearchParams({ limit: String(q.limit ?? 200) });
+    if (q.status) query.set("status", q.status);
+    if (q.before !== undefined) query.set("before", q.before);
+    return (await call<ListPage<Tenant>>("GET", `/admin/tenants?${query}`)).data;
   },
   async get(id: string, signal?: AbortSignal): Promise<Tenant> {
     return (await call<Tenant>("GET", `/admin/tenants/${seg(id)}`, undefined, undefined, signal)).data;

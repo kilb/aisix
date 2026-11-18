@@ -358,6 +358,7 @@ mod tests {
     const SHIPPED: &[(&str, u64)] = &[
         ("2026-11-10", 0x1475_1cdd_c88f_509d),
         ("2026-11-11", 0xc550_ec1e_42b7_38a7),
+        ("2026-11-18", 0x0add76d6a4d1a560),
     ];
 
     #[test]
@@ -725,6 +726,7 @@ mod tests {
             for (t, tr) in &e.card.0 {
                 for (band, r) in sets(tr) {
                     assert!(r.cache_write.is_some(), "{m} {t} {band:?}");
+                    assert!(r.cache_write_12h.is_some(), "{m} {t} {band:?}: 12h");
                 }
             }
         }
@@ -755,6 +757,7 @@ mod tests {
                     for dim in [
                         Dimension::CacheWrite,
                         Dimension::CacheWrite1h,
+                        Dimension::CacheWrite12h,
                         Dimension::ImageInput,
                         Dimension::AudioInput,
                     ] {
@@ -850,8 +853,26 @@ mod tests {
             for (t, tr) in &e.card.0 {
                 for (band, r) in sets(tr) {
                     assert!(ratio(r.cache_write, r.input, 5, 4), "{m} {t} {band:?}");
+                    assert!(
+                        ratio(r.cache_write_12h, r.input, 5, 2),
+                        "{m} {t} {band:?}: 12h"
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_published_short_fast_tier_keeps_its_explicit_unpriced_long_range() {
+        let c = builtin();
+        let e = c.get("openai", "gpt-5.4", read_day()).unwrap();
+        for name in ["priority", "fast"] {
+            let rates = &e.card.0[&tier(name)];
+            assert_eq!(rates.unpriced_above_input_tokens, Some(272000));
+            assert!(rates.long_context.is_empty());
+            assert_eq!(rates.base.input, Rate::parse("5").unwrap());
+            assert_eq!(rates.base.output, Rate::parse("30").unwrap());
+            assert_eq!(rates.base.cache_read, Rate::parse("0.5").ok());
         }
     }
 

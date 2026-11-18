@@ -176,7 +176,7 @@ function ModelRow({ model, discountBps, tier, groupId }: { model: CatalogEntry; 
     <tr className="price-model-row" data-price-group={group?.id ?? "base"} data-group-name={group?.display_name ?? "Base USD"}>
       <th scope="row"><div className="price-model-bar">
         <button ref={trigger} type="button" className="price-model-link" aria-label={`查看 ${model.name} 的价格详情`} onClick={() => { setDetailGroupId(groupId); setOpen(true); }}>
-          <span data-model-name>{model.name}</span><ArrowUpRight aria-hidden /><span className="price-model-tier">{tierName(tier)}{(selectedTier?.long_context.length ?? 0) > 0 ? " · 含长上下文价格" : ""}</span>
+          <span data-model-name>{model.name}</span><ArrowUpRight aria-hidden /><span className="price-model-tier">{tierName(tier)}{(selectedTier?.long_context.length ?? 0) > 0 ? " · 含长上下文价格" : selectedTier?.unpriced_above_input_tokens === undefined ? "" : " · 仅短上下文价格"}</span>
         </button>
         <CopyButton text={async () => { setCopyError(null); return model.name; }} label="复制模型名" size="sm" onFailed={(error) => setCopyError(`复制失败：${failure(error)}。请手动选择模型名。`)} />
       </div>{copyError !== null && <p className="field-problem" role="alert">{copyError}</p>}</th>

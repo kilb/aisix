@@ -78,6 +78,8 @@ pub(crate) struct Resolved {
     /// Id of the entry `requested_model` resolved to — for a routing group,
     /// semantic router or ensemble the group's own id, never a target's.
     pub requested_model_id: String,
+    /// 仅真正把客户端通配捕获段写入上游模型名的解析分支为 true。
+    pub caller_selected_upstream_model: bool,
     /// Vendor id of the last target the request selected.
     pub provider: String,
     /// That target's upstream model id.
@@ -1323,12 +1325,27 @@ pub(crate) fn detached<F: Future>(fut: F) -> impl Future<Output = F::Output> {
 /// wins, so the sub-dispatches a group makes to its members never replace
 /// the entry the caller addressed.
 pub(crate) fn note_requested_model(requested: &str, entry_id: &str) {
+    note_requested_model_with_caller_selection(requested, entry_id, false);
+}
+
+pub(crate) fn note_requested_model_with_caller_selection(
+    requested: &str,
+    entry_id: &str,
+    caller_selected: bool,
+) {
     with(|r| {
         if r.requested_model.is_empty() {
             r.requested_model = requested.to_string();
             r.requested_model_id = entry_id.to_string();
+            r.caller_selected_upstream_model = caller_selected;
         }
     });
+}
+
+pub(crate) fn caller_selected_upstream_model() -> bool {
+    CURRENT
+        .try_with(|a| a.lock().resolved.caller_selected_upstream_model)
+        .unwrap_or(false)
 }
 
 /// The id of the entry the current request resolved `requested` to, when
@@ -1383,6 +1400,7 @@ pub(crate) fn note_target(model: &Model, provider_key_id: &str) {
 /// 免费辅助调用保留源模型身份，实际账号和模型名单独记入传输归属。
 pub(crate) fn note_count_target(counter: &crate::token_counting::ResolvedCounter) {
     with(|r| {
+        r.caller_selected_upstream_model &= counter.model_name_from_source;
         r.provider = counter.key.provider.clone();
         r.upstream_model = counter.model_name.clone();
         r.provider_key_id = counter.key.id.clone();

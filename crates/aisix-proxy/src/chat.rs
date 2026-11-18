@@ -330,6 +330,8 @@ pub async fn chat_completions(
                     UsageExtras {
                         cached_prompt_tokens: success.cached_prompt_tokens,
                         cache_write_tokens: success.cache_write_tokens,
+                        cache_write_30m_tokens: success.cache_write_30m_tokens,
+                        cache_write_12h_tokens: success.cache_write_12h_tokens,
                         cache_usage_reported: success.cache_usage_reported,
                         modality: success.modality,
                         cache_creation_ttl: success.cache_creation_ttl,
@@ -614,6 +616,8 @@ pub async fn chat_completions(
                             c.prompt_tokens,
                             c.cached_prompt_tokens,
                             c.cache_write_tokens,
+                            c.cache_write_30m_tokens,
+                            c.cache_write_12h_tokens,
                             c.cache_read_tokens,
                             c.cache_creation_tokens,
                             c.cache_creation_ttl,
@@ -677,6 +681,8 @@ pub async fn chat_completions(
                             io_audit: None,
                             cached_prompt_tokens: c.cached_prompt_tokens,
                             cache_write_tokens: c.cache_write_tokens,
+                            cache_write_30m_tokens: c.cache_write_30m_tokens,
+                            cache_write_12h_tokens: c.cache_write_12h_tokens,
                             cache_usage_reported: c.cache_usage_reported,
                             modality: c.modality,
                             cache_creation_ttl: c.cache_creation_ttl,
@@ -819,6 +825,8 @@ struct Success {
     /// standard prompt / completion rate when these are 0.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -1601,6 +1609,8 @@ struct UpstreamCharge {
     usage_estimated: bool,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -2725,6 +2735,8 @@ async fn dispatch(
                         comp.prompt_tokens,
                         comp.cached_prompt_tokens,
                         comp.cache_write_tokens,
+                        comp.cache_write_30m_tokens,
+                        comp.cache_write_12h_tokens,
                         comp.cache_read_tokens,
                         comp.cache_creation_tokens,
                         comp.cache_creation_ttl,
@@ -2768,6 +2780,8 @@ async fn dispatch(
                         io_audit: None,
                         cached_prompt_tokens: comp.cached_prompt_tokens,
                         cache_write_tokens: comp.cache_write_tokens,
+                        cache_write_30m_tokens: comp.cache_write_30m_tokens,
+                        cache_write_12h_tokens: comp.cache_write_12h_tokens,
                         cache_usage_reported: comp.cache_usage_reported,
                         modality: comp.modality,
                         cache_creation_ttl: comp.cache_creation_ttl,
@@ -2940,6 +2954,8 @@ async fn dispatch(
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            cache_write_30m_tokens: None,
+            cache_write_12h_tokens: None,
             cache_usage_reported: None,
             modality: Default::default(),
             cache_creation_ttl: Default::default(),
@@ -3302,6 +3318,8 @@ async fn dispatch(
                 // original event accurately.
                 let cached_prompt_tokens = cached.usage.cached_prompt_tokens;
                 let cache_write_tokens = cached.usage.cache_write_tokens;
+                let cache_write_30m_tokens = cached.usage.cache_write_30m_tokens;
+                let cache_write_12h_tokens = cached.usage.cache_write_12h_tokens;
                 let cache_usage_reported = Some(false);
                 let modality = cached.usage.modality;
                 // Not kept by every cache backend (see `UsageStats`), so no
@@ -3453,6 +3471,8 @@ async fn dispatch(
                     usage_estimated,
                     cached_prompt_tokens,
                     cache_write_tokens,
+                    cache_write_30m_tokens,
+                    cache_write_12h_tokens,
                     cache_usage_reported,
                     modality,
                     cache_creation_ttl,
@@ -3962,6 +3982,8 @@ async fn dispatch(
     // on the Success struct for telemetry.
     let cached_prompt_tokens = upstream.usage.cached_prompt_tokens;
     let cache_write_tokens = upstream.usage.cache_write_tokens;
+    let cache_write_30m_tokens = upstream.usage.cache_write_30m_tokens;
+    let cache_write_12h_tokens = upstream.usage.cache_write_12h_tokens;
     let cache_usage_reported = upstream.usage.cache_usage_reported();
     let modality = upstream.usage.modality;
     let cache_creation_ttl = upstream.usage.cache_creation_ttl;
@@ -4003,6 +4025,8 @@ async fn dispatch(
             prompt_tokens_u32,
             cached_prompt_tokens,
             cache_write_tokens,
+            cache_write_30m_tokens,
+            cache_write_12h_tokens,
             cache_read_tokens,
             cache_creation_tokens,
             cache_creation_ttl,
@@ -4054,6 +4078,8 @@ async fn dispatch(
                 usage_estimated,
                 cached_prompt_tokens,
                 cache_write_tokens,
+                cache_write_30m_tokens,
+                cache_write_12h_tokens,
                 cache_usage_reported,
                 modality,
                 cache_creation_ttl,
@@ -4128,6 +4154,8 @@ async fn dispatch(
                 usage_estimated,
                 cached_prompt_tokens,
                 cache_write_tokens,
+                cache_write_30m_tokens,
+                cache_write_12h_tokens,
                 cache_usage_reported,
                 modality,
                 cache_creation_ttl,
@@ -4334,6 +4362,8 @@ async fn dispatch(
         usage_estimated,
         cached_prompt_tokens,
         cache_write_tokens,
+        cache_write_30m_tokens,
+        cache_write_12h_tokens,
         cache_usage_reported,
         modality,
         cache_creation_ttl,
@@ -4962,6 +4992,8 @@ async fn dispatch_ensemble(
                             comp.prompt_tokens,
                             comp.cached_prompt_tokens,
                             comp.cache_write_tokens,
+                            comp.cache_write_30m_tokens,
+                            comp.cache_write_12h_tokens,
                             comp.cache_read_tokens,
                             comp.cache_creation_tokens,
                             comp.cache_creation_ttl,
@@ -4993,6 +5025,8 @@ async fn dispatch_ensemble(
                             io_audit: judge_tap.capture().io.as_ref().map(|io| io.snapshot()),
                             cached_prompt_tokens: comp.cached_prompt_tokens,
                             cache_write_tokens: comp.cache_write_tokens,
+                            cache_write_30m_tokens: comp.cache_write_30m_tokens,
+                            cache_write_12h_tokens: comp.cache_write_12h_tokens,
                             cache_usage_reported: comp.cache_usage_reported,
                             modality: comp.modality,
                             cache_creation_ttl: comp.cache_creation_ttl,
@@ -5076,6 +5110,8 @@ async fn dispatch_ensemble(
             cost_usd: 0.0,
             cached_prompt_tokens: 0,
             cache_write_tokens: None,
+            cache_write_30m_tokens: None,
+            cache_write_12h_tokens: None,
             cache_usage_reported: None,
             modality: Default::default(),
             cache_creation_ttl: Default::default(),
@@ -5234,6 +5270,8 @@ async fn dispatch_ensemble(
                 io_audit: outcome.judge_io_audit.clone(),
                 cached_prompt_tokens: effective_judge.usage.cached_prompt_tokens,
                 cache_write_tokens: effective_judge.usage.cache_write_tokens,
+                cache_write_30m_tokens: effective_judge.usage.cache_write_30m_tokens,
+                cache_write_12h_tokens: effective_judge.usage.cache_write_12h_tokens,
                 cache_usage_reported: effective_judge.usage.cache_usage_reported(),
                 modality: effective_judge.usage.modality,
                 cache_creation_ttl: effective_judge.usage.cache_creation_ttl,
@@ -5407,6 +5445,8 @@ async fn dispatch_ensemble(
         usage_estimated: false,
         cached_prompt_tokens: metric_usage.cached_prompt_tokens,
         cache_write_tokens: metric_usage.cache_write_tokens,
+        cache_write_30m_tokens: metric_usage.cache_write_30m_tokens,
+        cache_write_12h_tokens: metric_usage.cache_write_12h_tokens,
         cache_usage_reported: metric_usage.cache_usage_reported(),
         modality: metric_usage.modality,
         cache_creation_ttl: metric_usage.cache_creation_ttl,
@@ -5602,6 +5642,8 @@ fn emit_usage_event(
         total_tokens: extras.upstream_total_tokens,
         cached_prompt_tokens: extras.cached_prompt_tokens,
         cache_write_tokens: extras.cache_write_tokens,
+        cache_write_30m_tokens: extras.cache_write_30m_tokens,
+        cache_write_12h_tokens: extras.cache_write_12h_tokens,
         cache_usage_reported: extras.cache_usage_reported,
         modality_tokens: extras.modality,
         cache_creation_ttl: extras.cache_creation_ttl,
@@ -5800,6 +5842,8 @@ struct UsageExtras {
     io_audit: Option<aisix_core::usage_io::UsageIoAudit>,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -6108,6 +6152,8 @@ struct StreamCompletion {
     reasoning_folded_into_completion: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -6471,6 +6517,8 @@ impl EnsembleSubcall {
             io_audit: self.io_audit.clone(),
             cached_prompt_tokens: self.usage.cached_prompt_tokens,
             cache_write_tokens: self.usage.cache_write_tokens,
+            cache_write_30m_tokens: self.usage.cache_write_30m_tokens,
+            cache_write_12h_tokens: self.usage.cache_write_12h_tokens,
             cache_usage_reported: self.usage.cache_usage_reported(),
             modality: self.usage.modality,
             cache_creation_ttl: self.usage.cache_creation_ttl,
@@ -7428,6 +7476,8 @@ where
                         comp.completion_tokens = acc.completion_tokens;
                         comp.total_tokens = acc.total_tokens as u64;
                         comp.cache_write_tokens = acc.cache_write_tokens;
+                        comp.cache_write_30m_tokens = acc.cache_write_30m_tokens;
+                        comp.cache_write_12h_tokens = acc.cache_write_12h_tokens;
                         comp.cache_usage_reported = acc.cache_usage_reported();
                         comp.modality = acc.modality;
                         comp.cache_creation_ttl = acc.cache_creation_ttl;

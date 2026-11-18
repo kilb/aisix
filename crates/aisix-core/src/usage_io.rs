@@ -17,6 +17,10 @@ pub struct UpstreamTiming {
     pub first_protocol_frame_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_canonical_chunk_ms: Option<u32>,
+    /// 上游正文被既有解析器消费为完整非空生成内容帧的时点，不是 socket 到达。
+    /// 与首 canonical 片段无先后约束；该片段可能只是元数据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_first_content_ms: Option<u32>,
     /// 既有首内容观察器把非空内容交给 HTTP server 的时点，不是客户端 ACK。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_content_ms: Option<u32>,
@@ -40,6 +44,21 @@ impl UpstreamTiming {
                 return false;
             }
             previous = current;
+        }
+        if let Some(content) = self.upstream_first_content_ms {
+            if [
+                self.http_send_started_ms,
+                self.response_headers_ms,
+                self.first_response_byte_ms,
+                self.first_protocol_frame_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|before| before > content)
+                || self.first_content_ms.is_some_and(|after| after < content)
+            {
+                return false;
+            }
         }
         true
     }
@@ -124,6 +143,45 @@ impl UsageIoAudit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_content_is_optional_and_ordered_independently_of_the_first_canonical_chunk() {
+        let mut wire = serde_json::json!({
+            "http_send_started_ms":0,"response_headers_ms":1,"first_response_byte_ms":2,
+            "first_protocol_frame_ms":3,"first_canonical_chunk_ms":4,
+            "upstream_first_content_ms":5,"first_content_ms":8
+        });
+        let timing: UpstreamTiming = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(timing).unwrap()["upstream_first_content_ms"],
+            5
+        );
+        assert!(timing.validate());
+        wire["first_canonical_chunk_ms"] = serde_json::json!(6);
+        assert!(serde_json::from_value::<UpstreamTiming>(wire.clone())
+            .unwrap()
+            .validate());
+        for reversed in [2, 9] {
+            wire["upstream_first_content_ms"] = serde_json::json!(reversed);
+            assert!(!serde_json::from_value::<UpstreamTiming>(wire.clone())
+                .unwrap()
+                .validate());
+        }
+        let old: UpstreamTiming =
+            serde_json::from_value(serde_json::json!({"first_content_ms":8})).unwrap();
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("upstream_first_content_ms")
+            .is_none());
+        let zero: UpstreamTiming =
+            serde_json::from_value(serde_json::json!({"upstream_first_content_ms":0})).unwrap();
+        assert_eq!(
+            serde_json::to_value(zero)
+                .unwrap()
+                .get("upstream_first_content_ms"),
+            Some(&serde_json::json!(0))
+        );
+    }
 
     #[test]
     fn upstream_timing_rejects_reversed_known_samples_without_inventing_missing_ones() {

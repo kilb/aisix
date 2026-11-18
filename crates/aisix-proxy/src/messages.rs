@@ -2118,6 +2118,8 @@ async fn anthropic_passthrough_dispatch(
                     // `cache_read_input_tokens`, never the OpenAI-shape subset.
                     cached_prompt_tokens: 0,
                     cache_write_tokens: None,
+                    cache_write_30m_tokens: None,
+                    cache_write_12h_tokens: None,
                     cache_usage_reported: usage.cache_usage_reported,
                     modality: Default::default(),
                     cache_creation_ttl: usage.cache_creation_ttl,
@@ -2925,6 +2927,8 @@ fn anthropic_metrics_from_response_json(body: &Value) -> AnthropicUsageMetrics {
         // Anthropic upstream: see the streaming sibling — no OpenAI-shape subset.
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
+        cache_write_30m_tokens: None,
+        cache_write_12h_tokens: None,
         cache_usage_reported: stats.cache_usage_reported(),
         modality: Default::default(),
         cache_creation_ttl: stats.cache_creation_ttl,
@@ -3312,6 +3316,8 @@ async fn cross_provider_dispatch(
                     completion_tokens: comp.completion_tokens,
                     cached_prompt_tokens: comp.cached_prompt_tokens,
                     cache_write_tokens: comp.cache_write_tokens,
+                    cache_write_30m_tokens: comp.cache_write_30m_tokens,
+                    cache_write_12h_tokens: comp.cache_write_12h_tokens,
                     cache_usage_reported: comp.cache_usage_reported,
                     modality: comp.modality,
                     cache_creation_ttl: comp.cache_creation_ttl,
@@ -3468,6 +3474,8 @@ async fn cross_provider_dispatch(
         completion_tokens: resp.usage.completion_tokens,
         cached_prompt_tokens: resp.usage.cached_prompt_tokens,
         cache_write_tokens: resp.usage.cache_write_tokens,
+        cache_write_30m_tokens: resp.usage.cache_write_30m_tokens,
+        cache_write_12h_tokens: resp.usage.cache_write_12h_tokens,
         cache_usage_reported: resp.usage.cache_usage_reported(),
         modality: resp.usage.modality,
         cache_creation_ttl: resp.usage.cache_creation_ttl,
@@ -4364,6 +4372,8 @@ struct AnthropicStreamCompletion {
     /// See [`AnthropicUsageMetrics::cached_prompt_tokens`].
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -4672,6 +4682,8 @@ struct AnthropicUsageMetrics {
     /// which sit ON TOP of `prompt_tokens`.
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -4722,6 +4734,8 @@ impl AnthropicUsageMetrics {
             reasoning_folded_into_completion: self.reasoning_folded_into_completion,
             cached_prompt_tokens: self.cached_prompt_tokens,
             cache_write_tokens: self.cache_write_tokens,
+            cache_write_30m_tokens: self.cache_write_30m_tokens,
+            cache_write_12h_tokens: self.cache_write_12h_tokens,
             cache_usage_reported: self.cache_usage_reported,
             cache_creation_tokens: self.cache_creation_tokens,
             cache_creation_ttl: self.cache_creation_ttl,
@@ -4734,12 +4748,15 @@ impl AnthropicUsageMetrics {
             cost_usd: crate::usage_attr::request_cost_usd(
                 snap,
                 model_id,
-                crate::usage_attr::input_tokens_for_pricing(
-                    u64::from(self.prompt_tokens),
-                    u64::from(self.cached_prompt_tokens),
-                    u64::from(self.cache_write_tokens.unwrap_or(0)),
-                    u64::from(self.cache_read_tokens),
-                    u64::from(self.cache_creation_tokens),
+                crate::usage_attr::input_tokens_from_counts(
+                    self.prompt_tokens,
+                    self.cached_prompt_tokens,
+                    self.cache_write_tokens,
+                    self.cache_write_30m_tokens,
+                    self.cache_write_12h_tokens,
+                    self.cache_read_tokens,
+                    self.cache_creation_tokens,
+                    self.cache_creation_ttl,
                 ),
                 u64::from(self.completion_tokens),
             ),
@@ -4847,6 +4864,8 @@ fn emit_anthropic_usage_event(
         total_tokens: metrics.upstream_total_tokens,
         cached_prompt_tokens: metrics.cached_prompt_tokens,
         cache_write_tokens: metrics.cache_write_tokens,
+        cache_write_30m_tokens: metrics.cache_write_30m_tokens,
+        cache_write_12h_tokens: metrics.cache_write_12h_tokens,
         cache_usage_reported: metrics.cache_usage_reported,
         modality_tokens: metrics.modality,
         cache_creation_ttl: metrics.cache_creation_ttl,
@@ -4871,6 +4890,8 @@ fn emit_anthropic_usage_event(
                 metrics.prompt_tokens,
                 metrics.cached_prompt_tokens,
                 metrics.cache_write_tokens,
+                metrics.cache_write_30m_tokens,
+                metrics.cache_write_12h_tokens,
                 metrics.cache_read_tokens,
                 metrics.cache_creation_tokens,
                 metrics.cache_creation_ttl,
@@ -8773,6 +8794,8 @@ event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
         // `prompt_tokens` EXCLUDES the two cache dimensions, so a line that
         // summed only the two visible columns would report 89 where the row
         // bills 102 — and the two are supposed to be one record.
+        // usage 先于 body guard 完成发送；冷结算在线程池运行，须等请求 span 关闭。
+        capture.wait_for_request_end().await;
         let line = capture.only("a streamed /v1/messages call");
         assert_eq!(line.status(), 200);
         assert_eq!(

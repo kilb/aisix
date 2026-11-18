@@ -372,6 +372,12 @@ fn terminal_observation(
             completion_tokens: count("/output_tokens").unwrap_or(0),
             cached_prompt_tokens: count("/input_tokens_details/cached_tokens").unwrap_or(0),
             cache_write_tokens: count("/input_tokens_details/cache_write_tokens"),
+            cache_write_30m_tokens: count(
+                "/input_tokens_details/cache_write_tokens_details/ttl_30m_tokens",
+            ),
+            cache_write_12h_tokens: count(
+                "/input_tokens_details/cache_write_tokens_details/ttl_12h_tokens",
+            ),
             cache_usage_reported: Some(
                 count("/input_tokens_details/cached_tokens").is_some()
                     || count("/input_tokens_details/cache_write_tokens").is_some(),

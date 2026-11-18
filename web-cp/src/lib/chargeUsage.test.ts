@@ -62,3 +62,14 @@ test("计费维度与换算率按页面的写法显示", () => {
   assert.equal(rateText(72_000), "7.2");
   assert.equal(rateText(10_000), "1");
 });
+
+
+test("混合写入时长保留明确零并按分量展示，摘要仍只计总写量", () => {
+  const usage = { prompt_tokens: 12000, completion_tokens: 0, cache_write_tokens: 7000, cache_write_30m_tokens: 3000, cache_write_12h_tokens: 4000 };
+  assert.deepEqual(reportedCounters(usage).filter(row => row.key.startsWith("cache_write")).map(row => [row.label, row.value]), [
+    ["其中缓存写入", 7000], ["其中 30 分钟缓存写入", 3000], ["其中 12 小时缓存写入", 4000],
+  ]);
+  assert.deepEqual(reportedCounters({ cache_write_30m_tokens: 0, cache_write_12h_tokens: 0 }).map(row => row.value), [0, 0]);
+  assert.equal(usageSummary(usage), "输入 12,000 · 输出 0 · 缓存写 7,000");
+  assert.equal(dimensionLabel("cache_write_12h"), "缓存写入（12 小时）");
+});

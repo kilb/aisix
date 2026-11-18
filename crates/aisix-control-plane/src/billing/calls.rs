@@ -265,6 +265,9 @@ pub(super) const EVENT_FIELDS: &str = "jsonb_build_object(\
         'completion_tokens', ue.event->'completion_tokens', \
         'cached_prompt_tokens', ue.event->'cached_prompt_tokens', \
         'cache_write_tokens', ue.event->'cache_write_tokens', \
+        'cache_write_30m_tokens', ue.event->'cache_write_30m_tokens', \
+        'cache_write_12h_tokens', ue.event->'cache_write_12h_tokens', \
+        'cache_write_split_incomplete', ue.event->'cache_write_split_incomplete', \
         'cache_creation_tokens', ue.event->'cache_creation_tokens', \
         'cache_creation_1h_tokens', ue.event->'cache_creation_1h_tokens', \
         'cache_read_tokens', ue.event->'cache_read_tokens', \

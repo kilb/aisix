@@ -147,7 +147,7 @@ export async function invitedMember(stack: Stack, world: RealWorld, role = "memb
   return { id: accepted.member.id, email, password: PASSWORD };
 }
 export const COMPLETE_RATES = {
-  input: "11", output: "22", cache_read: "0", cache_write: "33", cache_write_1h: "44",
+  input: "11", output: "22", cache_read: "0", cache_write: "33", cache_write_1h: "44", cache_write_12h: "55",
   reasoning: "55", audio_input: "66", audio_output: "77", image_input: "88", image_output: "99", web_search: "11000",
 };
 export async function fullPriceModel(stack: Stack, world: RealWorld): Promise<{ id: string; name: string }> {

@@ -151,6 +151,7 @@ fn cost_of(p: &Pricing) -> ModelCost {
         cached_input_per_1k: None,
         cache_write_per_1k: None,
         cache_write_1h_per_1k: None,
+        cache_write_12h_per_1k: None,
     }
 }
 

@@ -266,18 +266,59 @@ pub async fn incoming(
     except_unowned: &[Kind],
 ) -> Result<Vec<Referrer>, DbError> {
     let segments = |kinds: &[Kind]| -> Vec<&str> { kinds.iter().map(|k| k.segment()).collect() };
-    // Any reference holds the id as text, which narrows the documents to
-    // read before each one's references are worked out exactly.
+    // 先按引用方向收窄种类，让 (kind, id) 主键跳过无关文档；模型引用复用共享清单。
+    let candidates: Vec<Kind> = Kind::ALL
+        .into_iter()
+        .filter(|source| {
+            !except.contains(source)
+                && (kind == Kind::Models && !model_ref_id_fields(source.segment()).is_empty()
+                    || match kind {
+                        Kind::Models => matches!(
+                            source,
+                            Kind::ProviderKeys
+                                | Kind::GuardrailAttachments
+                                | Kind::RateLimitPolicies
+                        ),
+                        Kind::ProviderKeys => matches!(source, Kind::Models | Kind::TokenCounting),
+                        Kind::Guardrails => matches!(source, Kind::GuardrailAttachments),
+                        Kind::ApiKeys => matches!(
+                            source,
+                            Kind::ProviderKeys
+                                | Kind::CachePolicies
+                                | Kind::GuardrailAttachments
+                                | Kind::RateLimitPolicies
+                        ),
+                        Kind::Teams => matches!(
+                            source,
+                            Kind::ApiKeys | Kind::GuardrailAttachments | Kind::RateLimitPolicies
+                        ),
+                        Kind::Users => matches!(source, Kind::ApiKeys | Kind::RateLimitPolicies),
+                        Kind::CachePolicies
+                        | Kind::RateLimitPolicies
+                        | Kind::GuardrailAttachments
+                        | Kind::ObservabilityExporters
+                        | Kind::BudgetPolicy
+                        | Kind::TokenCounting
+                        | Kind::Budgets => false,
+                    })
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    // UUID 子串只作预筛，最后仍按 outgoing 的字段语义确认引用。
     let candidates: Vec<(String, Uuid, Value)> = sqlx::query_as(
         "SELECT kind, id, doc FROM gw_resources \
-         WHERE NOT deleted AND NOT (kind = ANY($1)) \
+         WHERE NOT deleted AND kind = ANY($1) \
            AND NOT (kind = ANY($3) AND managed_by IS NULL) \
            AND strpos(doc::text, $2) > 0 \
          ORDER BY kind, id",
     )
-    .bind(segments(except))
+    .bind(segments(&candidates))
     .bind(id.to_string())
     .bind(segments(except_unowned))
+    // 通用缓存计划看不到种类数组的选择率，会退回全表扫描；每次按实际种类规划。
+    .persistent(false)
     .fetch_all(&mut *conn)
     .await?;
     let target = id.to_string();

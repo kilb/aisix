@@ -18,7 +18,6 @@
   gap: 4px 16px;
   margin-top: 12px;
   padding-top: 8px;
-  border-top: 1px solid var(--border);
   font-size: var(--text-caption);
   line-height: 20px;
 }
@@ -123,6 +122,6 @@
 
 /* 表头与正文沿用同一列边界，浅色行带帮助横向追踪较宽的数据表。 */
 .dt > thead > tr > th:not(:first-child):not(:last-child) { padding-inline: 10px; }
-.dt > tbody > tr > td { border-bottom-color: color-mix(in srgb, var(--border) 72%, transparent); }
+.dt > tbody > tr > td { border-bottom-color: var(--divider); }
 .dt > tbody > tr:nth-child(even):not(.dt-detail):not(:hover):not(:focus-within) { background-color: color-mix(in srgb, var(--well) 24%, var(--card)); }
 .dt > tbody > tr.dt-detail > td { border-bottom-color: var(--border); }

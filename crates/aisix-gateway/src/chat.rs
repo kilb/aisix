@@ -720,6 +720,11 @@ pub struct UsageStats {
     /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
+    /// 上游报告的写入时长子集；不写共享缓存，兼容旧版严格读取器。
+    #[serde(skip)]
+    pub cache_write_30m_tokens: Option<u32>,
+    #[serde(skip)]
+    pub cache_write_12h_tokens: Option<u32>,
     /// 遥测缓存报告状态；不写入共享缓存，避免滚动升级的严格解码冲突。
     #[serde(skip)]
     pub cache_usage_reported: Option<bool>,
@@ -1238,6 +1243,14 @@ impl UsageStats {
                 .cached_prompt_tokens
                 .saturating_add(other.cached_prompt_tokens),
             cache_write_tokens: add_opt(self.cache_write_tokens, other.cache_write_tokens),
+            cache_write_30m_tokens: add_opt(
+                self.cache_write_30m_tokens,
+                other.cache_write_30m_tokens,
+            ),
+            cache_write_12h_tokens: add_opt(
+                self.cache_write_12h_tokens,
+                other.cache_write_12h_tokens,
+            ),
             cache_usage_reported: Some(
                 ((self.prompt_tokens == 0
                     && self.completion_tokens == 0
@@ -1308,6 +1321,12 @@ impl UsageStats {
             total_tokens: self.total_tokens.max(other.total_tokens),
             cached_prompt_tokens: self.cached_prompt_tokens.max(other.cached_prompt_tokens),
             cache_write_tokens: self.cache_write_tokens.max(other.cache_write_tokens),
+            cache_write_30m_tokens: self
+                .cache_write_30m_tokens
+                .max(other.cache_write_30m_tokens),
+            cache_write_12h_tokens: self
+                .cache_write_12h_tokens
+                .max(other.cache_write_12h_tokens),
             cache_usage_reported: Some(
                 self.cache_usage_reported() == Some(true)
                     || other.cache_usage_reported() == Some(true),
@@ -2636,6 +2655,8 @@ mod tests {
             total_tokens: 15,
             cached_prompt_tokens: 2,
             cache_write_tokens: Some(3),
+            cache_write_30m_tokens: None,
+            cache_write_12h_tokens: None,
             cache_usage_reported: None,
             reasoning_tokens: 3,
             cache_creation_tokens: 1,
@@ -2666,6 +2687,8 @@ mod tests {
             total_tokens: 27,
             cached_prompt_tokens: 1,
             cache_write_tokens: Some(5),
+            cache_write_30m_tokens: None,
+            cache_write_12h_tokens: None,
             cache_usage_reported: None,
             reasoning_tokens: 0,
             cache_creation_tokens: 0,

@@ -66,6 +66,7 @@ fn models_of(models: &[PricedModel]) -> Vec<Value> {
             ("cache_read_per_million", Dimension::CacheRead),
             ("cache_write_per_million", Dimension::CacheWrite),
             ("cache_write_1h_per_million", Dimension::CacheWrite1h),
+            ("cache_write_12h_per_million", Dimension::CacheWrite12h),
         ] {
             if let Some(text) = explicit(dimension) {
                 row[field] = json!(text);

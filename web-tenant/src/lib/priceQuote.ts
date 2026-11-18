@@ -1,6 +1,6 @@
 import { call, type PricedModel } from "./api";
 
-export type Dimension = "input" | "output" | "cache_read" | "cache_write" | "cache_write_1h" |
+export type Dimension = "input" | "output" | "cache_read" | "cache_write" | "cache_write_1h" | "cache_write_12h" |
   "reasoning" | "audio_input" | "audio_output" | "image_input" | "image_output" | "web_search";
 
 export interface PriceRate {
@@ -22,6 +22,7 @@ export type DisplayPriceRate = PriceRate | BasePriceRate;
 export interface TierQuote<Rate extends DisplayPriceRate = PriceRate> {
   base: Rate[];
   long_context: { above_input_tokens: number; rates: Rate[] }[];
+  unpriced_above_input_tokens?: number;
 }
 
 export interface BaseQuotedModel {
@@ -61,7 +62,7 @@ export async function currentPrices(): Promise<PriceQuoteList> {
 
 export const dimensionLabels: Record<Dimension, string> = {
   input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
-  cache_write_1h: "1 小时缓存写", reasoning: "推理", audio_input: "音频输入",
+  cache_write_1h: "1 小时缓存写", cache_write_12h: "12 小时缓存写", reasoning: "推理", audio_input: "音频输入",
   audio_output: "音频输出", image_input: "图像输入", image_output: "图像输出", web_search: "联网搜索",
 };
 

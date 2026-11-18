@@ -609,10 +609,13 @@ pub(crate) use aisix_core::input_tokens_for_pricing;
 /// event: the spend prices a one-hour write exactly when the event reports
 /// one. A split that does not account for the whole write is reported as no
 /// split, and every write is priced at the five-minute rate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn input_tokens_from_counts(
     prompt_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_read_tokens: u32,
     cache_creation_tokens: u32,
     ttl: aisix_gateway::CacheCreationTtl,
@@ -634,6 +637,14 @@ pub(crate) fn input_tokens_from_counts(
         u64::from(cache_creation_tokens),
     )
     .with_one_hour_writes(one_hour)
+    .with_twelve_hour_writes(
+        aisix_core::twelve_hour_cache_writes(
+            u64::from(cache_write_tokens.unwrap_or(0)),
+            cache_write_30m_tokens,
+            cache_write_12h_tokens,
+        )
+        .unwrap_or(0),
+    )
 }
 
 /// [`input_tokens_from_counts`] over a `UsageStats`.
@@ -642,6 +653,8 @@ pub(crate) fn input_tokens_of(u: &aisix_gateway::UsageStats) -> aisix_core::Inpu
         u.prompt_tokens,
         u.cached_prompt_tokens,
         u.cache_write_tokens,
+        u.cache_write_30m_tokens,
+        u.cache_write_12h_tokens,
         u.cache_read_tokens,
         u.cache_creation_tokens,
         u.cache_creation_ttl,
@@ -1325,6 +1338,8 @@ pub(crate) struct AnsweredUsage {
     pub reasoning_folded_into_completion: u32,
     pub cached_prompt_tokens: u32,
     pub cache_write_tokens: Option<u32>,
+    pub cache_write_30m_tokens: Option<u32>,
+    pub cache_write_12h_tokens: Option<u32>,
     pub cache_usage_reported: Option<bool>,
     pub cache_creation_tokens: u32,
     pub cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -1369,6 +1384,8 @@ impl AnsweredUsage {
             reasoning_folded_into_completion: stats.reasoning_folded_into_completion,
             cached_prompt_tokens: stats.cached_prompt_tokens,
             cache_write_tokens: stats.cache_write_tokens,
+            cache_write_30m_tokens: stats.cache_write_30m_tokens,
+            cache_write_12h_tokens: stats.cache_write_12h_tokens,
             cache_usage_reported: stats.cache_usage_reported(),
             cache_creation_tokens: stats.cache_creation_tokens,
             cache_creation_ttl: stats.cache_creation_ttl,
@@ -1399,6 +1416,8 @@ impl AnsweredUsage {
         event.total_tokens = self.upstream_total_tokens;
         event.cached_prompt_tokens = self.cached_prompt_tokens;
         event.cache_write_tokens = self.cache_write_tokens;
+        event.cache_write_30m_tokens = self.cache_write_30m_tokens;
+        event.cache_write_12h_tokens = self.cache_write_12h_tokens;
         event.cache_usage_reported = self.cache_usage_reported;
         event.cache_creation_tokens = self.cache_creation_tokens;
         event.cache_creation_ttl = self.cache_creation_ttl;
@@ -1869,6 +1888,12 @@ pub(crate) fn reconcile_observed_stream_usage(
         .cached_prompt_tokens
         .max(previous.cached_prompt_tokens);
     usage.cache_write_tokens = usage.cache_write_tokens.max(previous.cache_write_tokens);
+    usage.cache_write_30m_tokens = usage
+        .cache_write_30m_tokens
+        .max(previous.cache_write_30m_tokens);
+    usage.cache_write_12h_tokens = usage
+        .cache_write_12h_tokens
+        .max(previous.cache_write_12h_tokens);
     usage.cache_usage_reported = match (usage.cache_usage_reported, previous.cache_usage_reported) {
         (Some(a), Some(b)) => Some(a || b),
         (a, b) => a.or(b),
@@ -1911,6 +1936,8 @@ pub(crate) fn apply_observed_stream_usage(
         reasoning_folded_into_completion: event.reasoning_unfolded_from_completion,
         cached_prompt_tokens: event.cached_prompt_tokens,
         cache_write_tokens: event.cache_write_tokens,
+        cache_write_30m_tokens: event.cache_write_30m_tokens,
+        cache_write_12h_tokens: event.cache_write_12h_tokens,
         cache_usage_reported: event.cache_usage_reported,
         cache_creation_tokens: event.cache_creation_tokens,
         cache_creation_ttl: event.cache_creation_ttl,
@@ -1933,6 +1960,8 @@ pub(crate) fn apply_observed_stream_usage(
             usage.prompt_tokens,
             usage.cached_prompt_tokens,
             usage.cache_write_tokens,
+            usage.cache_write_30m_tokens,
+            usage.cache_write_12h_tokens,
             usage.cache_read_tokens,
             usage.cache_creation_tokens,
             usage.cache_creation_ttl,
@@ -2075,6 +2104,8 @@ macro_rules! resolve_observed_stream_completion {
                 reasoning_folded_into_completion: $comp.reasoning_folded_into_completion,
                 cached_prompt_tokens: $comp.cached_prompt_tokens,
                 cache_write_tokens: $comp.cache_write_tokens,
+                cache_write_30m_tokens: $comp.cache_write_30m_tokens,
+                cache_write_12h_tokens: $comp.cache_write_12h_tokens,
                 cache_usage_reported: $comp.cache_usage_reported,
                 cache_creation_tokens: $comp.cache_creation_tokens,
                 cache_read_tokens: $comp.cache_read_tokens,

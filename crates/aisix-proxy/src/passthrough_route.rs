@@ -3952,6 +3952,8 @@ struct PassthroughUsage {
     completion_tokens: u32,
     cached_prompt_tokens: u32,
     cache_write_tokens: Option<u32>,
+    cache_write_30m_tokens: Option<u32>,
+    cache_write_12h_tokens: Option<u32>,
     cache_usage_reported: Option<bool>,
     modality: aisix_gateway::ModalityTokens,
     cache_creation_ttl: aisix_gateway::CacheCreationTtl,
@@ -3972,6 +3974,8 @@ impl PassthroughUsage {
             completion_tokens: u.completion_tokens,
             cached_prompt_tokens: u.cached_prompt_tokens,
             cache_write_tokens: u.cache_write_tokens,
+            cache_write_30m_tokens: u.cache_write_30m_tokens,
+            cache_write_12h_tokens: u.cache_write_12h_tokens,
             cache_usage_reported: u.cache_usage_reported().filter(|reported| *reported),
             modality: u.modality,
             cache_creation_ttl: u.cache_creation_ttl,
@@ -3995,6 +3999,12 @@ impl PassthroughUsage {
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_prompt_tokens = self.cached_prompt_tokens.max(other.cached_prompt_tokens);
         self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
+        self.cache_write_30m_tokens = self
+            .cache_write_30m_tokens
+            .max(other.cache_write_30m_tokens);
+        self.cache_write_12h_tokens = self
+            .cache_write_12h_tokens
+            .max(other.cache_write_12h_tokens);
         self.cache_usage_reported = self.cache_usage_reported.max(other.cache_usage_reported);
         self.modality = self.modality.max_fieldwise(&other.modality);
         self.cache_creation_ttl = self
@@ -4036,6 +4046,7 @@ fn observe_frame_usage(
         telemetry.metering,
         frame,
         Some(&mut telemetry.anthropic_usage),
+        None,
     );
     if let Some(u) = labelled {
         merge_usage(&mut telemetry.labelled_usage, u);
@@ -4871,6 +4882,37 @@ struct StreamContinuation {
     identity: String,
     identity_is_ambiguous: bool,
     text: String,
+    // 参数文档跨窗口保留；普通扫描只读尚未检查的后缀。
+    scanned_bytes: usize,
+}
+
+impl StreamContinuation {
+    fn is_argument_document(&self) -> bool {
+        (self.family.starts_with("chat:")
+            && (self.identity == "function:arguments" || self.identity == "arguments"))
+            || (self.family.starts_with("anthropic:") && self.identity == "partial_json")
+            || (self.family.starts_with("responses:")
+                && (self
+                    .identity
+                    .starts_with("\"response.function_call_arguments.")
+                    || self.identity.starts_with("\"response.mcp_call_arguments."))
+                && !self.identity.ends_with(":name"))
+    }
+
+    fn unscanned(&self) -> &str {
+        &self.text[self.scanned_bytes..]
+    }
+
+    // first/last 是同一源值的两份证明；不同来源或不同值仍需各自保留。
+    fn repeats_previous_source_value(&self, previous: Option<&Self>) -> bool {
+        self.key.ends_with(":last")
+            && previous.is_some_and(|first| {
+                first.key.ends_with(":first")
+                    && first.family == self.family
+                    && first.identity == self.identity
+                    && first.text == self.text
+            })
+    }
 }
 
 enum SourceContinuations {
@@ -4918,6 +4960,7 @@ fn append_source_branches(
             identity: identity.clone(),
             identity_is_ambiguous,
             text: value.clone(),
+            scanned_bytes: 0,
         });
     }
     Ok(())
@@ -5592,6 +5635,7 @@ fn stream_source_continuations(
                     identity: "payload".to_owned(),
                     identity_is_ambiguous: false,
                     text,
+                    scanned_bytes: 0,
                 }])
             }
         }
@@ -5774,10 +5818,20 @@ struct StreamGuardrailText {
     closed_prefixes: Vec<String>,
 }
 
+#[cfg(test)]
 fn stream_guardrail_text(
     protocol: PassthroughProtocol,
     frame: &[u8],
     continuation: String,
+) -> StreamGuardrailText {
+    stream_guardrail_text_with_completions(protocol, frame, continuation, Vec::new())
+}
+
+fn stream_guardrail_text_with_completions(
+    protocol: PassthroughProtocol,
+    frame: &[u8],
+    continuation: String,
+    completed: Vec<String>,
 ) -> StreamGuardrailText {
     let payload = crate::redact::frame_payload(frame);
     let hidden_reasoning = is_messages_family(protocol)
@@ -5820,7 +5874,7 @@ fn stream_guardrail_text(
                 stream_source_continuations(protocol, payload.trim().as_bytes())
             })
     };
-    let (closed_prefixes, terminal_unevaluable) =
+    let (mut closed_prefixes, terminal_unevaluable) =
         if matches!(protocol, PassthroughProtocol::OpenaiResponses) {
             match payload
                 .as_ref()
@@ -5833,6 +5887,7 @@ fn stream_guardrail_text(
         } else {
             (Vec::new(), false)
         };
+    closed_prefixes.extend(completed);
     let (continuations, has_source_continuations, source_unevaluable) = match source {
         SourceContinuations::Ready(source) => {
             let has_source_continuations = !source.is_empty();
@@ -6108,7 +6163,7 @@ fn stream_guardrail_scan_text(
             .find(|candidate| candidate.key == continuation.key)
             .map(|candidate| candidate.text.as_str())
             .unwrap_or_default();
-        let candidate = format!("{tail}{}", continuation.text);
+        let candidate = format!("{tail}{}", continuation.unscanned());
         if !candidate.is_empty() && scanned.insert(candidate.clone()) {
             text.push(candidate);
         }
@@ -6119,6 +6174,82 @@ fn stream_guardrail_scan_text(
         }
     }
     text
+}
+
+// 只在工具完成或 EOF 时解码完整参数；原始候选保留，解码副本不参与 mask 写回。
+fn completed_argument_scan_text(
+    tails: &[StreamContinuation],
+    continuations: &[StreamContinuation],
+    supplemental: &[String],
+    closed: &[String],
+    end: bool,
+) -> Result<Vec<String>, ()> {
+    let mut candidates = stream_guardrail_scan_text(tails, continuations, supplemental);
+    if !end && closed.is_empty() {
+        return Ok(candidates);
+    }
+    for (index, continuation) in continuations.iter().enumerate() {
+        if !continuation.is_argument_document()
+            || (!end
+                && !closed
+                    .iter()
+                    .any(|prefix| continuation.key.starts_with(prefix)))
+            || !continuation.text.contains('\\')
+        {
+            continue;
+        }
+        // 同一源的 first/last 证明相邻；无重复字段时只解码一次，不另建集合。
+        if continuation.repeats_previous_source_value(
+            index
+                .checked_sub(1)
+                .and_then(|previous| continuations.get(previous)),
+        ) {
+            continue;
+        }
+        match crate::json_splice::collect_string_values(continuation.text.as_bytes()) {
+            Ok(decoded) if !decoded.is_empty() && !candidates.contains(&decoded) => {
+                candidates.push(decoded);
+            }
+            Err(error) if error.is_unevaluable() => return Err(()),
+            // 非法 JSON 仍只按现有原文扫描；不假定工具 runner 会宽松修复。
+            Ok(_) | Err(_) => {}
+        }
+    }
+    Ok(candidates)
+}
+
+// 复用帧已经解析的外层对象，不再解析 SSE/JSON；仅启用输出检查时调用。
+fn note_argument_completion(value: &serde_json::Value, closed: &mut Vec<String>) {
+    if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
+        for choice in choices {
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                if let Some(index) = choice.get("index").and_then(serde_json::Value::as_u64) {
+                    closed.push(format!("chat:{index}:"));
+                }
+            }
+        }
+    }
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("content_block_stop") => {
+            if let Some(index) = value.get("index").and_then(serde_json::Value::as_u64) {
+                closed.push(format!("anthropic:{index}:"));
+            }
+        }
+        Some("response.function_call_arguments.done" | "response.mcp_call_arguments.done") => {
+            if let (Some(kind), Some(id)) = (
+                value.get("type").and_then(serde_json::Value::as_str),
+                value.get("item_id").and_then(serde_json::Value::as_str),
+            ) {
+                let base = kind.trim_end_matches("done");
+                closed.push(format!("responses:{id:?}:\"{base}delta\":"));
+                closed.push(format!("responses:{id:?}:\"{base}done\":"));
+            }
+        }
+        _ => {}
+    }
 }
 
 /// One frame's generated content, split by [`crate::held_content::Parts`]
@@ -6165,7 +6296,7 @@ fn frame_parts_and_tier(
     Option<String>,
     Option<PassthroughUsage>,
 ) {
-    frame_parts_and_tier_with_usage(protocol, metering, frame, None)
+    frame_parts_and_tier_with_usage(protocol, metering, frame, None, None)
 }
 
 fn frame_parts_and_tier_with_usage(
@@ -6173,6 +6304,7 @@ fn frame_parts_and_tier_with_usage(
     metering: Metering,
     frame: &[u8],
     anthropic_usage: Option<&mut aisix_provider_anthropic::wire::AnthropicUsageAccumulator>,
+    argument_completions: Option<&mut Vec<String>>,
 ) -> (
     crate::held_content::Parts,
     Option<PassthroughUsage>,
@@ -6247,6 +6379,9 @@ fn frame_parts_and_tier_with_usage(
             );
             break 'payload;
         };
+        if let Some(closed) = argument_completions {
+            note_argument_completion(&v, closed);
+        }
         // Each frame is read by the typed endpoint's parser for the
         // protocol that frame belongs to. Anthropic events are identified
         // by their own `type` (disjoint from an OpenAI chunk's), so a chat
@@ -6740,8 +6875,9 @@ fn stream_response(
                     }
                     None => frame,
                 };
+                let mut completed = output_guardrail_active.then(Vec::new);
                 let (parts, usage, tier, labelled) =
-                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &frame, Some(&mut telemetry.anthropic_usage));
+                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &frame, Some(&mut telemetry.anthropic_usage), completed.as_mut());
                 if let Some(u) = labelled {
                     merge_usage(&mut telemetry.labelled_usage, u);
                 }
@@ -6810,7 +6946,7 @@ fn stream_response(
                     && !scan_budget_exhausted
                     && !fail_opened
                     && !live_scan_outgrown)
-                    .then(|| stream_guardrail_text(protocol, &frame, delta.clone()));
+                    .then(|| stream_guardrail_text_with_completions(protocol, &frame, delta.clone(), completed.unwrap_or_default()));
                 let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
                         || stream_continuation_would_exceed_cap(
@@ -6930,18 +7066,32 @@ fn stream_response(
                             }
                         } else if continuation_bufs
                             .iter()
-                            .any(|continuation| continuation.text.chars().count() >= *size_chars)
+                            .any(|continuation| continuation.unscanned().chars().count() >= *size_chars
+                                || (continuation.is_argument_document()
+                                    && closed_continuation_prefixes.iter().any(|prefix| continuation.key.starts_with(prefix))))
                             || supplemental_buf
                                 .iter()
                                 .map(|value| value.chars().count())
                                 .sum::<usize>()
                                 >= *size_chars
                         {
-                            let candidates = stream_guardrail_scan_text(
+                            let candidates = match completed_argument_scan_text(
                                 &continuation_tails,
                                 &continuation_bufs,
                                 &supplemental_buf,
-                            );
+                                &closed_continuation_prefixes,
+                                false,
+                            ) {
+                                Ok(candidates) => candidates,
+                                Err(()) => {
+                                    blocked = true;
+                                    telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
+                                    pending.clear();
+                                    pending_held.clear();
+                                    yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_UNSCANNABLE_BODY)));
+                                    break 'outer;
+                                }
+                            };
                             match scan_output_candidates(
                                 &chain,
                                 &route_name,
@@ -6980,7 +7130,7 @@ fn stream_response(
                                             .find(|tail| tail.key == continuation.key)
                                             .map(|tail| tail.text.as_str())
                                             .unwrap_or_default();
-                                        let combined = format!("{tail}{}", continuation.text);
+                                        let combined = format!("{tail}{}", continuation.unscanned());
                                         let next_tail = tail_chars(&combined, *overlap_chars);
                                         if let Some(tail) = continuation_tails
                                             .iter_mut()
@@ -6995,9 +7145,14 @@ fn stream_response(
                                                 identity_is_ambiguous: continuation
                                                     .identity_is_ambiguous,
                                                 text: next_tail,
+                                                scanned_bytes: 0,
                                             });
                                         }
-                                        continuation.text.clear();
+                                        if continuation.is_argument_document() {
+                                            continuation.scanned_bytes = continuation.text.len();
+                                        } else {
+                                            continuation.text.clear();
+                                        }
                                     }
                                     supplemental_buf.clear();
                                     retire_scanned_stream_continuations(
@@ -7005,6 +7160,15 @@ fn stream_response(
                                         &mut continuation_tails,
                                         &mut closed_continuation_prefixes,
                                     );
+                                    // 已放行帧不再保留，尚未完成的参数仍占用同一个内容上限。
+                                    let retained = continuation_bufs.iter().enumerate()
+                                        .filter(|(index, continuation)| continuation.is_argument_document()
+                                            && !continuation.repeats_previous_source_value(
+                                                index.checked_sub(1).and_then(|previous| continuation_bufs.get(previous)),
+                                            ))
+                                        .map(|(_, continuation)| continuation.text.len())
+                                        .sum();
+                                    held_content.hold(retained, 0);
                                 }
                             }
                         }
@@ -7119,8 +7283,9 @@ fn stream_response(
                 if anthropic.is_none() && is_messages_family(protocol) {
                     anthropic = anthropic_stream_frame(&rest);
                 }
+                let mut completed = output_guardrail_active.then(Vec::new);
                 let (parts, usage, tier, labelled) =
-                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &rest, Some(&mut telemetry.anthropic_usage));
+                    frame_parts_and_tier_with_usage(protocol, telemetry.metering, &rest, Some(&mut telemetry.anthropic_usage), completed.as_mut());
                 if let Some(u) = labelled {
                     merge_usage(&mut telemetry.labelled_usage, u);
                 }
@@ -7198,7 +7363,7 @@ fn stream_response(
                             && !scan_budget_exhausted
                             && !fail_opened
                             && !live_scan_outgrown)
-                            .then(|| stream_guardrail_text(protocol, &rest, delta.clone()));
+                            .then(|| stream_guardrail_text_with_completions(protocol, &rest, delta.clone(), completed.unwrap_or_default()));
                         let unevaluable_output = guardrail_text.as_ref().is_some_and(|text| {
                     text.unevaluable
                         || stream_continuation_would_exceed_cap(
@@ -7325,11 +7490,28 @@ fn stream_response(
             }
             if output_guardrail_active && !fail_opened {
                 if !scan_budget_exhausted {
-                    let candidates = stream_guardrail_scan_text(
+                    let candidates = match completed_argument_scan_text(
                         &continuation_tails,
                         &continuation_bufs,
                         &supplemental_buf,
-                    );
+                        &closed_continuation_prefixes,
+                        true,
+                    ) {
+                        Ok(candidates) => candidates,
+                        Err(()) if policy.holds_back() || aisix_guardrails::Guardrail::refuses_unevaluable_output(&chain) => {
+                            pending.clear();
+                            pending_held.clear();
+                            telemetry.record_refusal(None, Some(crate::error::TAG_UNSCANNABLE_BODY));
+                            yield Ok(guardrail_error_frame(anthropic.unwrap_or(false), None, Some(crate::error::TAG_UNSCANNABLE_BODY)));
+                            telemetry.stream_reached_end = true;
+                            telemetry.emit();
+                            return;
+                        }
+                        Err(()) => {
+                            chain.record_unevaluable_output_bypass(crate::error::TAG_UNSCANNABLE_BODY);
+                            stream_guardrail_scan_text(&continuation_tails, &continuation_bufs, &supplemental_buf)
+                        }
+                    };
                     if (!candidates.is_empty() || sealed_guardrail_epochs.is_empty())
                         && !try_queue_stream_guardrail_epoch(
                             &mut sealed_guardrail_epochs,
@@ -7864,6 +8046,8 @@ impl RouteTelemetry {
             completion_tokens: usage.completion_tokens,
             cached_prompt_tokens: usage.cached_prompt_tokens,
             cache_write_tokens: usage.cache_write_tokens,
+            cache_write_30m_tokens: usage.cache_write_30m_tokens,
+            cache_write_12h_tokens: usage.cache_write_12h_tokens,
             cache_usage_reported: usage.cache_usage_reported,
             modality_tokens: usage.modality,
             cache_creation_ttl: usage.cache_creation_ttl,
@@ -11009,6 +11193,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 identity: "text".to_owned(),
                 identity_is_ambiguous: false,
                 text: "safe".to_owned(),
+                scanned_bytes: 0,
             })
             .collect::<Vec<_>>();
         let incoming = StreamGuardrailText {
@@ -11018,6 +11203,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 identity: "text".to_owned(),
                 identity_is_ambiguous: false,
                 text: "safe".to_owned(),
+                scanned_bytes: 0,
             }],
             supplemental: Vec::new(),
             unevaluable: false,
@@ -11038,6 +11224,7 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
                 identity: "content".to_owned(),
                 identity_is_ambiguous: false,
                 text: "safe".to_owned(),
+                scanned_bytes: 0,
             }],
             supplemental: (0..MAX_STREAM_GUARDRAIL_CHANNELS)
                 .map(|index| format!("metadata-{index}"))
@@ -13090,6 +13277,238 @@ data: {"type":"error","error":{"type":"server_error","code":null,"message":"nest
     }
 
     const OUTPUT_KEYWORD_BLOCK: &str = r#"{"name":"out-block","enabled":true,"hook_point":"output","kind":"keyword","patterns":[{"kind":"literal","value":"FORBIDDEN"}]}"#;
+
+    // 完成的工具调用必须先检查严格 JSON 解码后的参数；无规则时仍逐字节透传。
+    fn escaped_tool_stream(value: &str, padding: usize) -> String {
+        let fragments = [
+            format!("{{\"pad\":\"{}", "x".repeat(padding)),
+            format!("{}\",\"q\":\"\\u006", "y".repeat(padding)),
+            format!("{value}\"}}"),
+        ];
+        let decoded: serde_json::Value = serde_json::from_str(&fragments.concat()).unwrap();
+        assert_eq!(
+            decoded["q"],
+            if value == "2anned" {
+                "banned"
+            } else {
+                "allowed"
+            }
+        );
+        let mut wire = String::new();
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            let call = if index == 0 {
+                serde_json::json!({"index":0,"id":"call_1","type":"function","function":{"name":"run","arguments":fragment}})
+            } else {
+                serde_json::json!({"index":0,"function":{"arguments":fragment}})
+            };
+            wire.push_str(&format!("data: {}\n\n", serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[call]},"finish_reason":null}]})));
+        }
+        wire.push_str("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n");
+        wire
+    }
+
+    async fn guarded_tool_wire(
+        wire: String,
+        guardrail: Option<serde_json::Value>,
+    ) -> (String, aisix_obs::UsageEvent) {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(wm_method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(wire, "text/event-stream"))
+            .mount(&upstream)
+            .await;
+        let snap = AisixSnapshot::new();
+        snap.provider_keys
+            .insert(provider_key_entry("http://unused"));
+        snap.apikeys.insert(apikey_entry("sk-caller", Some(&["*"])));
+        snap.passthrough_routes
+            .insert(inject_route(&upstream.uri()));
+        if let Some(guardrail) = guardrail {
+            crate::seed_env_scoped_guardrail(
+                &snap,
+                ResourceEntry::new(
+                    "g-1",
+                    serde_json::from_value::<aisix_core::Guardrail>(guardrail).unwrap(),
+                    1,
+                ),
+            );
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let state = crate::ProxyState::new(SnapshotHandle::new(snap), Arc::new(Hub::new()), &cfg())
+            .without_cache()
+            .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let response = crate::build_router(state)
+            .oneshot(relay_request("/passthrough/openai/v1/chat/completions"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wire = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rx.try_recv().is_err());
+        (String::from_utf8(wire.to_vec()).unwrap(), event)
+    }
+
+    fn tool_window_guard(cap: usize, fail_open: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name":"tool-window", "kind":"custom", "hook_point":"output",
+            "script":"export function checkOutput(ctx) { return ctx.text.includes('banned') ? { action: 'block', reason_code: 'policy' } : { action: 'none' }; }",
+            "stream_processing_mode":"window", "window_size":16, "window_overlap_size":4,
+            "max_buffer_bytes":cap,
+            "on_buffer_exceeded": if fail_open {"fail_open"} else {"fail_closed"}
+        })
+    }
+
+    #[tokio::test]
+    async fn completed_escaped_tool_arguments_block_in_full_and_across_windows() {
+        for (guard, releases_windows) in [
+            (
+                serde_json::json!({"name":"tool-keyword","kind":"keyword","hook_point":"output","patterns":[{"kind":"literal","value":"banned"}]}),
+                false,
+            ),
+            (tool_window_guard(8192, false), true),
+        ] {
+            let (wire, event) =
+                guarded_tool_wire(escaped_tool_stream("2anned", 32), Some(guard)).await;
+            assert!(wire.contains("event: error\n"), "{wire}");
+            assert!(
+                !wire.contains("guardrail_unavailable"),
+                "a failed check is not the expected content verdict: {wire}"
+            );
+            assert!(
+                !wire.contains("\"finish_reason\":\"tool_calls\""),
+                "finish escaped its check: {wire}"
+            );
+            assert!(!wire.contains("[DONE]"), "{wire}");
+            assert!(event.guardrail_blocked);
+            assert_eq!(
+                wire.contains(&"x".repeat(32)),
+                releases_windows,
+                "Window must release its clean prefix before the later refusal: {wire}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn clean_escaped_tool_arguments_and_unguarded_wire_are_preserved() {
+        for (value, guard) in [
+            ("1llowed", Some(tool_window_guard(8192, false))),
+            ("2anned", None),
+        ] {
+            let original = escaped_tool_stream(value, 32);
+            let (wire, event) = guarded_tool_wire(original.clone(), guard).await;
+            assert_eq!(wire, original);
+            assert!(!event.guardrail_blocked);
+            assert_eq!(event.guardrail_bypassed_reason, "");
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_tool_arguments_use_the_existing_window_cap_policy() {
+        for fail_open in [false, true] {
+            let original = escaped_tool_stream("2anned", 32);
+            let (wire, event) =
+                guarded_tool_wire(original.clone(), Some(tool_window_guard(64, fail_open))).await;
+            assert_eq!(event.guardrail_blocked, !fail_open);
+            if fail_open {
+                assert_eq!(wire, original);
+                assert_eq!(event.guardrail_bypassed_reason, "output_buffer_exceeded");
+            } else {
+                assert!(wire.contains("guardrail_unavailable"), "{wire}");
+                assert!(!wire.contains("[DONE]"), "{wire}");
+            }
+        }
+    }
+
+    // 低于内容上限的同一参数不能因 first/last 两份来源证明误触发溢出策略。
+    async fn below_cap_tool_document(arguments: &str, block: bool) {
+        let decoded: serde_json::Value = serde_json::from_str(arguments).unwrap();
+        assert_eq!(decoded["q"], if block { "banned" } else { "allowed" });
+        assert_eq!(arguments.len(), if block { 52 } else { 53 });
+        let initial = serde_json::json!({
+            "id":"chatcmpl-cap", "object":"chat.completion.chunk", "created":1, "model":"peer",
+            "choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{
+                "index":0,"id":"call_cap","type":"function",
+                "function":{"name":"probe","arguments":arguments}
+            }]},"finish_reason":null}]
+        });
+        let finish = serde_json::json!({
+            "id":"chatcmpl-cap", "object":"chat.completion.chunk", "created":1, "model":"peer",
+            "choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]
+        });
+        let original = format!("data: {initial}\n\ndata: {finish}\n\ndata: [DONE]\n\n");
+        let (wire, event) =
+            guarded_tool_wire(original.clone(), Some(tool_window_guard(64, block))).await;
+        assert_eq!(
+            event.guardrail_bypassed_reason, "",
+            "no real overflow occurred"
+        );
+        assert_eq!(event.guardrail_blocked, block, "{wire}");
+        if block {
+            assert!(wire.contains("event: error\n"), "{wire}");
+            assert!(!wire.contains("guardrail_unavailable"), "{wire}");
+            assert!(!wire.contains("\"finish_reason\":\"tool_calls\""), "{wire}");
+            assert!(!wire.contains("[DONE]"), "{wire}");
+        } else {
+            assert_eq!(wire, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_53_byte_clean_tool_document_fits_a_64_byte_window_cap() {
+        below_cap_tool_document(
+            r#"{"padding":"abcdefghijklmnopqrst","q":"al\u006cowed"}"#,
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_52_byte_blocked_tool_document_does_not_fail_open_below_64_bytes() {
+        below_cap_tool_document(
+            r#"{"padding":"abcdefghijklmnopqrst","q":"\u0062anned"}"#,
+            true,
+        )
+        .await;
+    }
+
+    #[test]
+    fn argument_window_scan_does_not_repeat_the_released_prefix() {
+        let text = StreamContinuation {
+            key: "chat:0:tool:0:function:arguments:first".into(),
+            family: "chat:0:tool:0".into(),
+            identity: "function:arguments".into(),
+            identity_is_ambiguous: false,
+            text: "released-prefixnext-window".into(),
+            scanned_bytes: 15,
+        };
+        assert_eq!(
+            stream_guardrail_scan_text(&[], &[text], &[]),
+            ["next-window"]
+        );
+    }
+
+    #[test]
+    fn different_argument_proofs_are_not_deduplicated() {
+        let first = StreamContinuation {
+            key: "chat:0:tool:0:function:arguments:first".into(),
+            family: "chat:0:tool:0".into(),
+            identity: "function:arguments".into(),
+            identity_is_ambiguous: false,
+            text: r#"{"q":"first value"}"#.into(),
+            scanned_bytes: 0,
+        };
+        let mut last = first.clone();
+        last.key = "chat:0:tool:0:function:arguments:last".into();
+        assert!(last.repeats_previous_source_value(Some(&first)));
+        last.text = r#"{"q":"different value"}"#.into();
+        assert!(!last.repeats_previous_source_value(Some(&first)));
+        last.text = first.text.clone();
+        last.family = "chat:0:tool:1".into();
+        assert!(!last.repeats_previous_source_value(Some(&first)));
+    }
+
     const OUTPUT_CAP_FAIL_CLOSED: &str = r#"{"name":"out-cap","enabled":true,"hook_point":"output","kind":"azure_content_safety_text_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","stream_processing_mode":"buffer_full","max_buffer_bytes":4,"on_buffer_exceeded":"fail_closed"}"#;
     const OUTPUT_FAIL_OPEN: &str = r#"{"name":"out-open","enabled":true,"hook_point":"output","kind":"openai_moderation","endpoint":"http://127.0.0.1:1","api_key":"k","output_fail_open":true}"#;
 

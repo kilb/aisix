@@ -1981,6 +1981,7 @@ async fn a_tenants_view_of_a_key_shows_the_display_name_never_the_name() {
         fields,
         BTreeSet::from([
             "created_at",
+            "created_by",
             "disabled",
             "disabled_by_platform",
             "expires_at",
@@ -4529,7 +4530,10 @@ async fn mint_customer_keys_on_both_apis(
         if as_admin {
             assert_eq!(response.body["key"].get("created_by"), Some(&creator));
         } else {
-            assert!(response.body["key"].get("created_by").is_none());
+            assert_eq!(
+                response.body["key"].get("created_by"),
+                Some(&json!({"kind": "member", "id": owner.id, "display_name": null}))
+            );
         }
         let recorded_creator: Value = sqlx::query_scalar(
             "SELECT jsonb_build_object('kind', created_by_kind, 'id', created_by) \

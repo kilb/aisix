@@ -1653,6 +1653,7 @@ fn tier_named(name: &str) -> Option<ServiceTier> {
     let rates = TierRates {
         base: rates(&flat(Rate(0)))?,
         long_context: Vec::new(),
+        unpriced_above_input_tokens: None,
     };
     let probe = RateCard(BTreeMap::from([
         (ServiceTier::default_tier(), rates.clone()),
@@ -1851,6 +1852,7 @@ fn rates(prices: &BTreeMap<Dimension, Rate>) -> Option<Rates> {
         cache_read: get(Dimension::CacheRead),
         cache_write: get(Dimension::CacheWrite),
         cache_write_1h: get(Dimension::CacheWrite1h),
+        cache_write_12h: get(Dimension::CacheWrite12h),
         reasoning: get(Dimension::Reasoning),
         audio_input: get(Dimension::AudioInput),
         audio_output: get(Dimension::AudioOutput),
@@ -1963,6 +1965,7 @@ fn card(
                 TierRates {
                     base: at(None)?,
                     long_context,
+                    unpriced_above_input_tokens: None,
                 },
             ))
         })

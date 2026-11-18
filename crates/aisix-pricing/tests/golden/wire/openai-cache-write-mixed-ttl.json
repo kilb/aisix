@@ -1,0 +1,23 @@
+[
+  {
+    "cache_status": "disabled",
+    "cache_write_12h_tokens": 4000,
+    "cache_write_30m_tokens": 3000,
+    "cache_write_tokens": 7000,
+    "cached_prompt_tokens": 4000,
+    "completion_tokens": 100,
+    "cost_usd": 0.015349999999999999,
+    "event_id": "evt-openai-cache-write-mixed-ttl-1",
+    "guardrail_blocked": false,
+    "occurred_at": "2026-11-06T00:00:00.000Z",
+    "operation": "responses",
+    "prompt_tokens": 12000,
+    "provider_key_id": "pk-openai",
+    "requested_model_id": "model-openai-cache-write-mixed-ttl",
+    "status_code": 200,
+    "team_id": "tenant-golden",
+    "total_tokens": 12100,
+    "upstream_model": "gpt-5.6",
+    "upstream_provider": "openai"
+  }
+]

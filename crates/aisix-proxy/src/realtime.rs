@@ -322,20 +322,33 @@ async fn connect_failure(
 
 /// The session's `error` frame for a failed dial: an upstream's answer in the
 /// envelope an HTTP route would send, fixed text when there was no answer.
-fn connect_failure_frame(err: &ProxyError) -> String {
-    let error = match err {
-        ProxyError::Bridge(aisix_gateway::BridgeError::UpstreamStatus { .. }) => {
-            err.envelope().error
-        }
-        _ => {
-            crate::error::ErrorEnvelope::new(
-                "failed to connect to the upstream realtime endpoint",
-                "upstream_error",
-            )
-            .error
-        }
-    };
-    serde_json::json!({ "type": "error", "error": error }).to_string()
+fn connect_failure_frame(err: &ProxyError, platform: bool) -> String {
+    session_error_scope(platform, || {
+        let error =
+            if platform || matches!(err, ProxyError::Bridge(BridgeError::UpstreamStatus { .. })) {
+                err.envelope().error
+            } else {
+                crate::error::ErrorEnvelope::new(
+                    "failed to connect to the upstream realtime endpoint",
+                    "upstream_error",
+                )
+                .error
+            };
+        serde_json::json!({ "type": "error", "error": error }).to_string()
+    })
+}
+
+fn session_error_scope<T>(platform: bool, render: impl FnOnce() -> T) -> T {
+    if !platform {
+        return render();
+    }
+    // 只恢复错误渲染所需上下文，不接管会话自己的日志与计费生命周期。
+    let tap = aisix_gateway::response_tap::detached();
+    let attribution =
+        Arc::new(crate::attribution::RequestAttribution::default().in_platform_mode(true));
+    crate::attribution::sync_scope(&attribution, || {
+        aisix_gateway::response_tap::sync_scope(&tap, render)
+    })
 }
 
 /// The refused upgrade's body, up to the bound and the time limit of an HTTP
@@ -2082,7 +2095,10 @@ async fn run_session(
                 aisix_obs::ErrorSource::Upstream
             };
             let _ = client_tx
-                .send(AxMessage::Text(connect_failure_frame(&connect_err)))
+                .send(AxMessage::Text(connect_failure_frame(
+                    &connect_err,
+                    state.platform().is_some(),
+                )))
                 .await;
             let _ = client_tx
                 .send(AxMessage::Close(Some(CloseFrame {
@@ -2602,6 +2618,18 @@ async fn run_session(
                     }
                     meter.observed_boundary(frame.kind());
                     let observed = observe_usage(&mut journal, &mut usage, &frame).await;
+                    let rewritten_error =
+                        if state.platform().is_some() && frame.kind() == Kind::Error {
+                            frame.json().and_then(|event| {
+                                let error = session_refusal_error_value(event)?;
+                                session_error_scope(true, || {
+                                    crate::platform_errors::relayed_realtime_error(event, &error)
+                                })
+                                .map(|event| event.to_string())
+                            })
+                        } else {
+                            None
+                        };
                     drop(frame);
                     if let Err(error) = observed {
                         close_status = error.status().as_u16();
@@ -2622,6 +2650,7 @@ async fn run_session(
                         )
                         .await;
                     }
+                    let text = rewritten_error.unwrap_or(text);
                     let step = match held_output.as_mut().filter(|_| refused.is_none()) {
                         Some(held) => held.observe(text),
                         None => OutputStep::release(text),
@@ -2723,7 +2752,13 @@ async fn run_session(
                         Some(f) => UpstreamEnd::Close(f.code.into(), &f.reason),
                         None => UpstreamEnd::NoStatus,
                     };
-                    close_client_after_upstream(&mut client_tx, end, opening.refused()).await;
+                    close_client_after_upstream(
+                        &mut client_tx,
+                        end,
+                        opening.refused(),
+                        state.platform().is_some(),
+                    )
+                    .await;
                     break;
                 }
                 Some(Ok(_)) => {} // ping/pong/raw frames
@@ -2735,6 +2770,7 @@ async fn run_session(
                         &mut client_tx,
                         UpstreamEnd::Failed(&error),
                         opening.refused(),
+                        state.platform().is_some(),
                     )
                     .await;
                     if !opening.refused() {
@@ -2749,6 +2785,7 @@ async fn run_session(
                         &mut client_tx,
                         UpstreamEnd::Dropped,
                         opening.refused(),
+                        state.platform().is_some(),
                     )
                     .await;
                     break;
@@ -3053,10 +3090,14 @@ impl SessionOpening {
 /// HTTP errors use; anything else has none and renders as a 502.
 fn session_refusal_error(text: &str) -> Option<BridgeError> {
     let event = serde_json::from_str::<Value>(text).ok()?;
+    session_refusal_error_value(&event)
+}
+
+fn session_refusal_error_value(event: &Value) -> Option<BridgeError> {
     if event.get("type").and_then(Value::as_str) != Some("error") {
         return None;
     }
-    let mut error = crate::responses::responses_in_band_error(&event)?;
+    let mut error = crate::responses::responses_in_band_error(event)?;
     if let BridgeError::UpstreamInBand { status, parsed, .. } = &mut error {
         let view = parsed.as_deref();
         let code = view.and_then(|v| v.code.as_deref());
@@ -3298,6 +3339,7 @@ async fn close_client_after_upstream<S>(
     client_tx: &mut ClientSink<S>,
     end: UpstreamEnd<'_>,
     refused: bool,
+    platform: bool,
 ) where
     S: futures::Sink<AxMessage> + Unpin,
 {
@@ -3342,12 +3384,24 @@ async fn close_client_after_upstream<S>(
         ),
     };
     if let Some(message) = message.filter(|_| !refused) {
-        let event = serde_json::json!({
-            "type": "error",
-            "error": { "type": "server_error", "message": message }
+        let event = session_error_scope(platform, || {
+            if platform {
+                let error = ProxyError::Bridge(BridgeError::Transport(message));
+                serde_json::json!({"type": "error", "error": error.envelope().error})
+            } else {
+                serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "server_error", "message": message }
+                })
+            }
         });
         let _ = client_tx.send(AxMessage::Text(event.to_string())).await;
     }
+    let reason = if platform && code != 1000 {
+        "upstream error"
+    } else {
+        reason
+    };
     let mut cut = reason.len().min(CLOSE_REASON_MAX_BYTES);
     while !reason.is_char_boundary(cut) {
         cut -= 1;
@@ -4145,12 +4199,26 @@ mod tests {
         crate::ProxyState,
         tokio::sync::mpsc::Receiver<ObsUsageEvent>,
     ) {
+        serve_in_mode(snap, false).await
+    }
+
+    async fn serve_in_mode(
+        snap: AisixSnapshot,
+        platform: bool,
+    ) -> (
+        std::net::SocketAddr,
+        crate::ProxyState,
+        tokio::sync::mpsc::Receiver<ObsUsageEvent>,
+    ) {
         let (tx, rx) = tokio::sync::mpsc::channel::<ObsUsageEvent>(16);
         let hub = Arc::new(Hub::new());
         let handle = SnapshotHandle::new(snap);
-        let state = crate::ProxyState::new(handle, hub, &cfg())
+        let mut state = crate::ProxyState::new(handle, hub, &cfg())
             .without_cache()
             .with_usage_sink(UsageSink::new(tx));
+        if platform {
+            state = state.with_platform(crate::platform::PlatformSettings::from_secret("test"));
+        }
         let app = crate::build_router(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -4471,7 +4539,12 @@ mod tests {
     /// no longer use the model, and when its provider key's budget runs out.
     #[tokio::test]
     async fn a_session_ends_when_its_key_is_rotated_or_loses_the_model_or_the_budget() {
-        for (change, status) in [("rotate", 401), ("acl", 403), ("budget", 0)] {
+        for (change, status) in [
+            ("rotate", 401),
+            ("acl", 403),
+            ("endpoint", 403),
+            ("budget", 0),
+        ] {
             let up_addr = spawn_open_upstream().await;
             let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
             let (addr, state, mut rx) = serve(snap).await;
@@ -4492,13 +4565,16 @@ mod tests {
 
             let live = state.snapshot.load();
             match change {
-                "rotate" | "acl" => {
+                "rotate" | "acl" | "endpoint" => {
                     let key = live.apikeys.get_by_id("k-1").unwrap();
                     let mut changed = (*key.value).clone();
                     if change == "rotate" {
                         changed.key_hash = "0".repeat(64);
-                    } else {
+                    } else if change == "acl" {
                         changed.allowed_models = vec!["another-model".to_string()];
+                    } else {
+                        changed.allowed_endpoints =
+                            Some(vec![aisix_core::models::EndpointFamily::ChatCompletions]);
                     }
                     live.apikeys.insert(ResourceEntry::new("k-1", changed, 2));
                 }
@@ -5210,6 +5286,95 @@ mod tests {
             while rx.next().await.is_some() {}
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn platform_realtime_errors_keep_request_details_and_hide_shared_account_errors() {
+        for platform in [false, true] {
+            let request_error = serde_json::json!({
+                "type": "error", "event_id": "server-request-error",
+                "error": { "type": "invalid_request_error", "code": "invalid_value",
+                    "message": "Invalid value for audio.input.format", "param": "audio.input.format",
+                    "event_id": "client-request" }
+            });
+            let account_error = serde_json::json!({
+                "type": "error", "event_id": "server-account-error",
+                "error": { "type": "server_error", "code": null,
+                    "message": "The server had an error while processing your request at https://provider.internal.local/v1 with sk-up",
+                    "param": null, "event_id": "client-response" }
+            });
+            let up_addr = spawn_scripted_upstream(vec![
+                serde_json::json!({"type": "session.created", "session": {"id": "sess-1"}}),
+                request_error.clone(),
+                account_error.clone(),
+            ])
+            .await;
+            let snap = snapshot(&format!("http://{up_addr}/v1"), "openai", "openai");
+            let (addr, _state, _usage) = serve_in_mode(snap, platform).await;
+            let mut request = format!("ws://{addr}/v1/realtime?model=rt-model")
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer sk-caller".parse().unwrap());
+            let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            ws.send(TgMessage::Text(r#"{"type":"session.update"}"#.into()))
+                .await
+                .unwrap();
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                let message = tokio::time::timeout(Duration::from_secs(3), ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let TgMessage::Text(text) = message else {
+                    panic!("expected text event")
+                };
+                events.push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+            assert_eq!(events[0]["session"]["id"], "sess-1");
+            assert_eq!(events[1], request_error, "platform={platform}");
+            assert_eq!(events[2]["type"], "error");
+            assert_eq!(events[2]["event_id"], "server-account-error");
+            assert_eq!(events[2]["error"]["event_id"], "client-response");
+            if platform {
+                assert_eq!(events[2]["error"]["code"], "upstream_unavailable");
+                assert!(!events[2].to_string().contains("provider.internal.local"));
+            } else {
+                assert_eq!(events[2]["error"]["type"], account_error["error"]["type"]);
+                assert!(events[2]["error"]["code"].is_null());
+            }
+            assert!(!events[2].to_string().contains("sk-up"));
+            let _ = ws.close(None).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_realtime_connect_failures_use_the_shared_error_class() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused = listener.local_addr().unwrap();
+        drop(listener);
+        let snap = snapshot(&format!("http://{unused}/v1"), "openai", "openai");
+        let (addr, _state, _usage) = serve_in_mode(snap, true).await;
+        let mut request = format!("ws://{addr}/v1/realtime?model=rt-model")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer sk-caller".parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let TgMessage::Text(text) = message else {
+            panic!("expected error event")
+        };
+        let event: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["error"]["code"], "upstream_unavailable");
     }
 
     /// The frames a client receives for `frames` under `guardrail`, up to the

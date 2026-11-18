@@ -654,9 +654,17 @@ impl UpstreamIoObserver {
                 output.feed(bytes);
                 if exchange.timing.samples.http_send_started_ms.is_some()
                     && exchange.timing.samples.first_protocol_frame_ms.is_none()
-                    && output.has_sse_frame()
                 {
-                    exchange.timing.samples.first_protocol_frame_ms = exchange.timing.now();
+                    exchange.timing.samples.first_protocol_frame_ms = output
+                        .first_sse_frame_at()
+                        .and_then(|at| exchange.timing.offset_at(at));
+                }
+                if exchange.timing.samples.http_send_started_ms.is_some()
+                    && exchange.timing.samples.upstream_first_content_ms.is_none()
+                {
+                    exchange.timing.samples.upstream_first_content_ms = output
+                        .first_sse_content_at()
+                        .and_then(|at| exchange.timing.offset_at(at));
                 }
             }
         });

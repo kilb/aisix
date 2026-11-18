@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aisix_core::snapshot::SnapshotHandle;
 use aisix_core::usage_io::UpstreamTiming;
@@ -29,6 +29,7 @@ const PK: &str = "22222222-2222-4222-8222-222222222222";
 #[derive(Clone, Copy, Debug)]
 enum Family {
     Chat,
+    Completions,
     Messages,
     ResponsesNative,
     ResponsesChatBridge,
@@ -38,6 +39,7 @@ impl Family {
     fn route(self) -> &'static str {
         match self {
             Self::Chat => "/v1/chat/completions",
+            Self::Completions => "/v1/completions",
             Self::Messages => "/v1/messages",
             Self::ResponsesNative | Self::ResponsesChatBridge => "/v1/responses",
         }
@@ -60,6 +62,9 @@ impl Family {
 
     fn request(self, stream: bool) -> Value {
         match self {
+            Self::Completions => {
+                json!({"model":"clock-model","prompt":"hello","max_tokens":16,"stream":stream})
+            }
             Self::ResponsesNative | Self::ResponsesChatBridge => {
                 json!({"model":"clock-model","input":"hello","stream":stream})
             }
@@ -71,6 +76,20 @@ impl Family {
 
     fn streaming_parts(self) -> (String, String, String) {
         match self {
+            Self::Completions => (
+                sse(
+                    json!({"id":"cmpl-clock","object":"text_completion","model":"upstream-clock","choices":[{"index":0,"text":"","finish_reason":null}]}),
+                ),
+                sse(
+                    json!({"id":"cmpl-clock","object":"text_completion","model":"upstream-clock","choices":[{"index":0,"text":"clock-output","finish_reason":null}]}),
+                ),
+                format!(
+                    "{}data: [DONE]\n\n",
+                    sse(
+                        json!({"id":"cmpl-clock","object":"text_completion","model":"upstream-clock","choices":[{"index":0,"text":"","finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}})
+                    )
+                ),
+            ),
             Self::Chat | Self::ResponsesChatBridge => (
                 sse(
                     json!({"id":"chat-clock","object":"chat.completion.chunk","model":"upstream-clock","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
@@ -123,6 +142,9 @@ impl Family {
 
     fn buffered_reply(self) -> Value {
         match self {
+            Self::Completions => {
+                json!({"id":"cmpl-clock","object":"text_completion","model":"upstream-clock","choices":[{"index":0,"text":"clock-output","finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}})
+            }
             Self::Chat | Self::ResponsesChatBridge => {
                 json!({"id":"chat-clock","object":"chat.completion","model":"upstream-clock","choices":[{"index":0,"message":{"role":"assistant","content":"clock-output"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}})
             }
@@ -241,7 +263,33 @@ fn app(
     family: Family,
     retries: u32,
 ) -> TestResult<(axum::Router, mpsc::Receiver<UsageEvent>)> {
+    app_with_hold(base, family, retries, false)
+}
+
+fn app_with_hold(
+    base: &str,
+    family: Family,
+    retries: u32,
+    held: bool,
+) -> TestResult<(axum::Router, mpsc::Receiver<UsageEvent>)> {
     let snapshot = AisixSnapshot::new();
+    if held {
+        let guardrail = serde_json::from_value(json!({
+            "name":"clock-output-hold","kind":"keyword","hook_point":"output",
+            "patterns":[{"kind":"literal","value":"never-match-clock-output"}]
+        }))?;
+        snapshot
+            .guardrails
+            .insert(ResourceEntry::new("clock-hold", guardrail, 1));
+        let attachment = serde_json::from_value(json!({
+            "guardrail_id":"clock-hold","scope_type":"env","priority":100
+        }))?;
+        snapshot.guardrail_attachments.insert(ResourceEntry::new(
+            "clock-hold-attachment",
+            attachment,
+            1,
+        ));
+    }
     let provider = family.provider();
     let key: ProviderKey = serde_json::from_value(json!({
         "display_name":"clock component upstream","api_key":"component-only-upstream-key",
@@ -411,6 +459,95 @@ async fn token_route_families_publish_all_six_http_stages_from_the_attempt_origi
     Ok(())
 }
 
+struct GatewaySocket(tokio::task::JoinHandle<std::io::Result<()>>);
+
+impl Drop for GatewaySocket {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn socket_content_case(family: Family, held: bool) -> TestResult {
+    let (metadata, content, end) = family.streaming_parts();
+    let reply = Reply {
+        status: StatusCode::OK,
+        content_type: "text/event-stream",
+        header_delay: Duration::ZERO,
+        parts: vec![
+            (Duration::ZERO, Bytes::from(format!("{metadata}{content}"))),
+            (Duration::from_millis(400), Bytes::from(end)),
+        ],
+    };
+    let upstream = upstream(vec![reply]).await?;
+    let (router, mut events) = app_with_hold(&upstream.base, family, 0, held)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = GatewaySocket(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    }));
+    let started = Instant::now();
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(DEADLINE)
+        .build()?
+        .post(format!("http://{address}{}", family.route()))
+        .bearer_auth("clock-caller")
+        .header("anthropic-version", "2023-06-01")
+        .json(&family.request(true))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let returned = tokio::time::timeout(DEADLINE, response.bytes()).await??;
+    let completed = started.elapsed().as_millis() as u64;
+    assert!(String::from_utf8_lossy(&returned).contains("clock-output"));
+    let event = event(&mut events).await?;
+    let wire = serde_json::to_value(&event)?;
+    let raw = wire
+        .pointer("/upstream_timing/upstream_first_content_ms")
+        .and_then(Value::as_u64)
+        .ok_or("missing raw upstream content clock")?;
+    let delivered = wire
+        .pointer("/upstream_timing/first_content_ms")
+        .and_then(Value::as_u64)
+        .ok_or("missing delivered content clock")?;
+    assert!(delivered >= raw, "{family:?}: {wire}");
+    if held {
+        assert!(
+            delivered >= raw + 250,
+            "hold must remain distinct from upstream arrival: {wire}"
+        );
+    } else {
+        assert!(
+            delivered + 250 <= completed,
+            "live content must precede upstream EOS: {wire}"
+        );
+    }
+    assert!(events.try_recv().is_err(), "one stream emits one row");
+    Ok(())
+}
+
+// 真实上游及网关 socket：立刻到达的内容与故意等待 EOS 的输出检查必须分开记时。
+#[tokio::test]
+async fn raw_upstream_content_precedes_delayed_delivery_on_every_token_route() -> TestResult {
+    futures::future::try_join_all(
+        [
+            Family::Chat,
+            Family::Completions,
+            Family::Messages,
+            Family::ResponsesNative,
+            Family::ResponsesChatBridge,
+        ]
+        .into_iter()
+        .flat_map(|family| [false, true].map(move |held| socket_content_case(family, held))),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn buffered_case(family: Family) -> TestResult {
     let mut upstream = upstream(vec![Reply::buffered(family)]).await?;
     let (router, mut events) = app(&upstream.base, family, 0)?;
@@ -425,6 +562,7 @@ async fn buffered_case(family: Family) -> TestResult {
         "JSON has no streamed protocol frame"
     );
     assert_eq!(timing.first_canonical_chunk_ms, None);
+    assert_eq!(timing.upstream_first_content_ms, None);
     assert_eq!(timing.first_content_ms, None);
     let (path, body) = tokio::time::timeout(DEADLINE, upstream.requests.recv())
         .await?
@@ -488,6 +626,7 @@ async fn retry_usage_rows_keep_their_own_http_exchange_and_content_ownership() -
     assert!(failed_timing.first_response_byte_ms.is_some());
     assert_eq!(failed_timing.first_protocol_frame_ms, None);
     assert_eq!(failed_timing.first_canonical_chunk_ms, None);
+    assert_eq!(failed_timing.upstream_first_content_ms, None);
     assert_eq!(failed_timing.first_content_ms, None);
     let won_timing = won
         .upstream_timing
@@ -496,6 +635,9 @@ async fn retry_usage_rows_keep_their_own_http_exchange_and_content_ownership() -
     let won_frame = measured(won_timing.first_protocol_frame_ms, "retry frame")?;
     let won_chunk = measured(won_timing.first_canonical_chunk_ms, "retry canonical chunk")?;
     let won_content = measured(won_timing.first_content_ms, "retry content")?;
+    let won_raw = measured(won_timing.upstream_first_content_ms, "retry raw content")?;
+    assert!(won_raw >= won_frame);
+    assert!(won_content >= won_raw);
     assert!(won_chunk >= won_frame);
     assert!(won_content >= won_chunk + 45);
     assert!(

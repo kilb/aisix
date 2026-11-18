@@ -218,6 +218,12 @@ pub enum PricingError {
     /// upstream's own string, so it stays operator-side.
     #[error("the baseline has no rates for service tier {tier:?}")]
     MissingTierPrice { tier: String },
+    /// 该档位只有短段公布价，长段既不回退到标准档也不沿用短价。
+    #[error("service tier {tier:?} has no price above {above_input_tokens} input tokens")]
+    MissingLongContextPrice {
+        tier: String,
+        above_input_tokens: u64,
+    },
     /// The row bills a quantity the rates in use carry no rate for, even by
     /// fallback. It is refused rather than billed at nothing.
     #[error("the baseline has no rate for {dimension}")]
@@ -251,6 +257,7 @@ impl PricingError {
             PricingError::MissingRate { .. } => "missing_rate",
             PricingError::InvalidPrice { .. } => "invalid_price",
             PricingError::MissingTierPrice { .. } => "missing_tier_price",
+            PricingError::MissingLongContextPrice { .. } => "missing_long_context_price",
             PricingError::MissingDimensionPrice { .. } => "missing_dimension_price",
             PricingError::InconsistentUsage(_) => "inconsistent_usage",
             PricingError::UnpricedOperation(_) => "unpriced_operation",
@@ -441,6 +448,14 @@ pub fn price_event(
             },
         });
     };
+    if let Some(above) = baseline.card.0[&tier].unpriced_above_input_tokens {
+        if input_total > above {
+            return Err(PricingError::MissingLongContextPrice {
+                tier: tier.to_string(),
+                above_input_tokens: above,
+            });
+        }
+    }
     if let Some(requested) = &u.requested_service_tier {
         let unreported = !u.is_batch && served.is_none_or(str::is_empty);
         if unreported
@@ -2134,6 +2149,13 @@ mod tests {
                 "missing_tier_price",
             ),
             (
+                PricingError::MissingLongContextPrice {
+                    tier: "priority".into(),
+                    above_input_tokens: 272000,
+                },
+                "missing_long_context_price",
+            ),
+            (
                 PricingError::MissingDimensionPrice {
                     dimension: Dimension::WebSearch,
                 },
@@ -2347,8 +2369,8 @@ mod tests {
     /// `i64::MAX`, and ordinary lines never reach it.
     fn any_lines() -> impl Strategy<Value = Vec<ChargeLine>> {
         let largest = u64::try_from(MAX_QUANTITY).unwrap();
-        let ordinary = proptest::array::uniform11(proptest::option::of((quantity(), rate(0))));
-        let top = proptest::array::uniform11(
+        let ordinary = proptest::array::uniform12(proptest::option::of((quantity(), rate(0))));
+        let top = proptest::array::uniform12(
             (
                 largest - largest / 8..=largest,
                 Rate::MAX.0 - Rate::MAX.0 / 8..=Rate::MAX.0,
@@ -2413,12 +2435,15 @@ mod tests {
 
     /// One rate set: `values` in `Dimension::ALL` order, each optional rate
     /// present where `present` says. Web search is always present.
-    fn rates_json(values: [u64; 11], present: [bool; 11]) -> Value {
+    fn rates_json(values: [u64; 12], present: [bool; 12]) -> Value {
         let mut rates = serde_json::Map::new();
         for (i, d) in Dimension::ALL.into_iter().enumerate() {
             let required = matches!(
                 d,
-                Dimension::Input | Dimension::Output | Dimension::WebSearch
+                Dimension::Input
+                    | Dimension::Output
+                    | Dimension::WebSearch
+                    | Dimension::CacheWrite12h
             );
             if required || present[i] {
                 rates.insert(d.as_str().into(), Rate(values[i]).to_string().into());
@@ -2435,11 +2460,11 @@ mod tests {
         /// can lower a charge as a prompt grows past the threshold. Every
         /// rate is at least `min`.
         fn synthetic_card(min: u64)(
-            present in proptest::array::uniform11(any::<bool>()),
+            present in proptest::array::uniform12(any::<bool>()),
             above in proptest::option::of(1u64..=10_000_000),
             tiers in proptest::array::uniform3((
-                proptest::array::uniform11(rate(min)),
-                proptest::array::uniform11(0..=Rate::MAX.0),
+                proptest::array::uniform12(rate(min)),
+                proptest::array::uniform12(0..=Rate::MAX.0),
             )),
         ) -> Value {
             let mut card = serde_json::Map::new();
@@ -2506,6 +2531,15 @@ mod tests {
                 m.cache_creation_1h_tokens = inc(u.cache_creation_1h_tokens);
                 m.cache_creation_tokens += 1;
             }
+            Dimension::CacheWrite12h => {
+                m.prompt_tokens += 1;
+                m.cache_write_30m_tokens = Some(
+                    u.cache_write_30m_tokens
+                        .unwrap_or(u.cache_write_tokens.unwrap_or(0)),
+                );
+                m.cache_write_12h_tokens = inc(u.cache_write_12h_tokens);
+                m.cache_write_tokens = inc(u.cache_write_tokens);
+            }
             Dimension::Output => m.completion_tokens += 1,
             Dimension::Reasoning => {
                 m.reasoning_tokens += 1;
@@ -2564,7 +2598,7 @@ mod tests {
         #[test]
         fn adding_a_token_never_lowers_the_charge(
             u in consistent_usage(),
-            card in synthetic_card(0),
+            card in synthetic_card(0).boxed(),
             bps in 0u16..=10_000,
         ) {
             // The band starts at this row's prompt, so one more input-side
@@ -2591,7 +2625,7 @@ mod tests {
         #[test]
         fn a_bigger_discount_never_raises_the_charge(
             u in consistent_usage(),
-            card in synthetic_card(0),
+            card in synthetic_card(0).boxed(),
             (a, b) in (0u16..=10_000, 0u16..=10_000),
         ) {
             let at = |bps| price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap().charge;
@@ -2607,7 +2641,7 @@ mod tests {
             // Boxed: the union's value trees overflow a debug test thread's
             // stack otherwise.
             u in prop_oneof![consistent_usage().boxed(), one_unit().boxed()],
-            card in synthetic_card(1),
+            card in synthetic_card(1).boxed(),
             bps in 0u16..10_000,
         ) {
             let p = price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap();
@@ -2625,7 +2659,7 @@ mod tests {
         #[test]
         fn the_charge_is_the_ceiled_sum_of_its_lines(
             u in consistent_usage(),
-            card in synthetic_card(0),
+            card in synthetic_card(0).boxed(),
             bps in 0u16..=10_000,
         ) {
             let p = price_event(&book_with(&card, bps), &u, &payer(), RECEIVED).unwrap();
@@ -2648,8 +2682,8 @@ mod tests {
         // `book_with` asserts the book took every card; this reads one
         // directly, so a card the generator builds wrong fails here first.
         let card: RateCard = serde_json::from_value(json!({
-            "default": {"base": rates_json([1; 11], [true; 11]),
-                        "long_context": [{"above_input_tokens": 5, "rates": rates_json([2; 11], [true; 11])}]}
+            "default": {"base": rates_json([1; 12], [true; 12]),
+                        "long_context": [{"above_input_tokens": 5, "rates": rates_json([2; 12], [true; 12])}]}
         }))
         .unwrap();
         assert_eq!(card.validate(), Ok(()));

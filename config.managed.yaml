@@ -19,6 +19,30 @@
 #   AISIX_MANAGED__CP_KEY_PEM=...
 #   AISIX_MANAGED__CP_CA_PEM=...
 #
+# 托管租户网关必须完整使用控制面签发的 bundle，不能只复制上面的 mTLS 变量。
+# bundle 还携带以下平台设置；平台密钥使用签发值，不手写、不写入日志或提交到仓库：
+#   AISIX_PROXY__PLATFORM__ENABLED=true
+#   AISIX_PROXY__PLATFORM__ID_KEY_ENV=PLATFORM_ID_KEY
+#   PLATFORM_ID_KEY=...
+# 平台模式关闭仍是合法配置，但不适合承载共享上游账号的托管租户。
+# 启动会校验已启用平台模式的密钥；控制面不远程证明网关实际启用了平台模式，
+# 因此部署时需核对完整 bundle，重启时也保留这些变量。
+#
+# 计量升级顺序：新增 12 小时缓存写分量的网关只能连接已完成升级的控制面。
+# 先升级全部控制面，核对入口、进程、发行构建和就绪状态，确认旧进程已退出，
+# 再让新网关接收流量。旧控制面可能忽略新增分量，ENGINE_VERSION 不能保护旧价卡。
+# 回退网关时保留新控制面；新网关或其待上报用量仍存在时，不能退回旧控制面。
+# 已写入 engine 3 价格修订后也不能退回旧计价引擎，应保留新控制面继续修复。
+#
+# 控制面证书维护：当前实现在每次控制面启动时签发服务端叶证书，最长有效 397 天，
+# 且不超过 CA 的实际到期日；运行中的进程不会自动续签。运维需安排到期检查和
+# 提前维护，按实际 notAfter 留出余量，不能依赖发布频率碰巧覆盖续期。
+# 按现有部署流程逐个排流、重启控制面：先确认另一实例可用，重启后复核新证书、
+# 网关 mTLS 连接、心跳与配置 watch，再维护另一实例，不同时停止所有控制面。
+# CA 最长有效十年；到期前需另行计划 CA 更换及网关客户端 bundle 重新签发、分发。
+# 普通控制面重启不会延长 CA 或网关客户端证书的有效期。目前没有自动到期监控、
+# 定时续期或多 CA 热轮换，这些维护动作需由运维安排。
+#
 # `CP_BASE_URL` may omit the scheme — a bare `host:port` is read as
 # `https://host:port`, which is what a managed control plane serves.
 # Anything else fails the boot rather than being carried into the

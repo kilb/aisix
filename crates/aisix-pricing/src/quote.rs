@@ -60,6 +60,8 @@ pub struct LongContextQuote {
 pub struct TierQuote {
     pub base: Vec<PriceRate>,
     pub long_context: Vec<LongContextQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpriced_above_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -81,6 +83,8 @@ pub struct BaselineLongContextQuote {
 pub struct BaselineTierQuote {
     pub base: Vec<BaselinePriceRate>,
     pub long_context: Vec<BaselineLongContextQuote>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unpriced_above_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +152,7 @@ impl PriceBook {
                         tier.clone(),
                         BaselineTierQuote {
                             base: baseline_rates_quote(&rates.base),
+                            unpriced_above_input_tokens: rates.unpriced_above_input_tokens,
                             long_context: rates
                                 .long_context
                                 .iter()
@@ -192,6 +197,7 @@ impl PriceBook {
                     tier.clone(),
                     TierQuote {
                         base: rates_quote(&rates.base, rate.cny, discount_bps),
+                        unpriced_above_input_tokens: rates.unpriced_above_input_tokens,
                         long_context: rates
                             .long_context
                             .iter()

@@ -7,8 +7,10 @@ import {
   scrapeMetrics,
   SeedClient,
   spawnApp,
+  startMockControlPlane,
   waitConfigPropagation,
   type SpawnedApp,
+  type MockControlPlane,
 } from "../harness/index.js";
 
 // E2E: first-class /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720,
@@ -25,8 +27,7 @@ import {
 //      attribution: the gateway itself downloads the output JSONL from
 //      the provider (observable as a mock-side hit on
 //      `/v1/files/<output>/content`).
-//   4. Fine-tuning jobs route via the encoded `training_file` while the
-//      body's `model` (the provider BASE model) forwards verbatim.
+//   4. 用户取消了本网关的 fine-tuning 支持；该入口固定 404 且不调用上游。
 //
 // All calls go through the official OpenAI Node SDK (files/batches/
 // fineTuning namespaces) — the point of the surface is drop-in SDK
@@ -50,7 +51,7 @@ interface JobsUpstream {
 
 /** Minimal OpenAI jobs-surface mock: files upload/retrieve/content,
  * batches create/retrieve/cancel, fine_tuning create/cancel. */
-async function startJobsUpstream(): Promise<JobsUpstream> {
+async function startJobsUpstream(responseCacheWrites = false): Promise<JobsUpstream> {
   const received: JobsUpstream["received"] = [];
   const server: Server = createServer((req, res) => {
     res.on("error", () => {});
@@ -89,6 +90,16 @@ async function startJobsUpstream(): Promise<JobsUpstream> {
       if (req.method === "GET" && path === "/v1/files/file-e2e-out/content") {
         res.statusCode = 200;
         res.setHeader("content-type", "application/jsonl");
+        if (responseCacheWrites) {
+          return res.end([0, 1].map((i) => JSON.stringify({
+            id: `batch_req_${i}`, custom_id: `ttl-${i}`, response: { status_code: 200, body: {
+              id: `resp_ttl_${i}`, object: "response", status: "completed", model: "gpt-5.6",
+              usage: { input_tokens: 12000, output_tokens: 100, total_tokens: 12100,
+                input_tokens_details: { cached_tokens: 4000, cache_write_tokens: 7000,
+                  cache_write_tokens_details: { ttl_30m_tokens: 3000, ttl_12h_tokens: 4000 } } },
+            } }, error: null,
+          })).join("\n") + "\n");
+        }
         return res.end(
           [
             JSON.stringify({
@@ -125,7 +136,7 @@ async function startJobsUpstream(): Promise<JobsUpstream> {
           id: "batch_e2e_1",
           object: "batch",
           status: "validating",
-          endpoint: "/v1/chat/completions",
+          endpoint: responseCacheWrites ? "/v1/responses" : "/v1/chat/completions",
           input_file_id: JSON.parse(body).input_file_id,
         });
       }
@@ -134,7 +145,7 @@ async function startJobsUpstream(): Promise<JobsUpstream> {
           id: "batch_e2e_1",
           object: "batch",
           status: "completed",
-          endpoint: "/v1/chat/completions",
+          endpoint: responseCacheWrites ? "/v1/responses" : "/v1/chat/completions",
           input_file_id: "file-e2e-in",
           output_file_id: "file-e2e-out",
         });
@@ -326,39 +337,21 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
     ).toBe(true);
   });
 
-  test("fine-tuning: encoded training_file routes the job, provider base model forwards verbatim", async (ctx) => {
-    if (!etcdReachable || !app || !seed || !upstream) {
+  test("用户取消的 fine-tuning 入口精确返回 404 且不调用上游", async (ctx) => {
+    if (!etcdReachable || !app || !upstream) {
       ctx.skip();
       return;
     }
-
-    const file = await client.files.create(
-      {
-        file: await toFile(
-          Buffer.from('{"messages":[{"role":"user","content":"hi"}]}\n'),
-          "train.jsonl",
-        ),
-        purpose: "fine-tune",
-      },
-      { headers: { "x-aisix-model": "jobs-e2e-model" } },
-    );
-
-    const job = await client.fineTuning.jobs.create({
-      model: "gpt-4o-mini-2024-07-18",
-      training_file: file.id,
-    });
-    expect(job.id.startsWith("aisix-")).toBe(true);
-
-    const createReq = upstream.received.find(
-      (r) => r.method === "POST" && r.path === "/v1/fine_tuning/jobs",
-    );
-    expect(createReq).toBeDefined();
-    const sent = JSON.parse(createReq?.body ?? "{}");
-    expect(sent.training_file).toBe("file-e2e-in");
-    expect(sent.model).toBe("gpt-4o-mini-2024-07-18");
-
-    const cancelled = await client.fineTuning.jobs.cancel(job.id);
-    expect(cancelled.status).toBe("cancelled");
+    // 用户明确取消本网关的 fine-tuning 支持；提供方 peer 仍可应答，误恢复入口会变红。
+    const calls = () => upstream!.received.filter(
+      (request) => request.method === "POST" && request.path === "/v1/fine_tuning/jobs",
+    ).length;
+    const before = calls();
+    await expect(client.fineTuning.jobs.create({
+      model: "jobs-e2e-model",
+      training_file: "file-e2e-in",
+    }, { headers: { "x-aisix-model": "jobs-e2e-model" } })).rejects.toMatchObject({ status: 404 });
+    expect(calls()).toBe(before);
   });
 
   test("raw multipart `model` form field routes the upload (non-SDK path)", async (ctx) => {
@@ -510,5 +503,60 @@ describe("jobs e2e: /v1/files + /v1/batches + /v1/fine_tuning/jobs (#720)", () =
       method: "GET",
     });
     expect(resp.status).toBe(401);
+  });
+});
+
+
+describe("managed platform-off legacy batch cache-write lifetimes", () => {
+  let cp: MockControlPlane | undefined;
+  let app: SpawnedApp | undefined;
+  let upstream: JobsUpstream | undefined;
+  let etcdReachable = false;
+  const caller = "sk-legacy-batch-ttl";
+  const model = "legacy-batch-ttl";
+
+  beforeAll(async () => {
+    const etcd = new EtcdClient();
+    etcdReachable = await etcd.ping();
+    if (!etcdReachable) return;
+    cp = await startMockControlPlane();
+    upstream = await startJobsUpstream(true);
+    app = await spawnApp({ extra: { managed: cp.managed }, awaitProxyListener: false });
+    const seed = new SeedClient(etcd, `${app.etcdPrefix}/${cp.envId}`);
+    const key = await seed.createProviderKey({ display_name: "legacy-batch-ttl-pk", provider: "openai",
+      adapter: "openai", secret: "sk-upstream-legacy-batch-ttl", api_base: `${upstream.baseUrl}/v1` });
+    await seed.createModel({ display_name: model, provider: "openai", model_name: "gpt-5.6",
+      provider_key_id: key.id, cost: { input_per_1k: 0.001, output_per_1k: 0.002,
+        cached_input_per_1k: 0.0001, cache_write_per_1k: 0.00125, cache_write_12h_per_1k: 0.0025 } });
+    await seed.createApiKey({ key_hash: createHash("sha256").update(caller).digest("hex"), allowed_models: [model] });
+    await waitConfigPropagation(async () => {
+      try {
+        return (await fetch(`${app!.proxyUrl}/v1/models`, { headers: { authorization: `Bearer ${caller}` } })).status === 200;
+      } catch (error) {
+        const refused = error as { cause?: { code?: string } };
+        if (refused.cause?.code === "ECONNREFUSED") return false;
+        throw error;
+      }
+    });
+  }, 120_000);
+
+  afterAll(async () => { await app?.exit(); await upstream?.close(); await cp?.close(); });
+
+  test("upload, submit and collect a Responses batch preserve mixed TTL usage and spend", async (ctx) => {
+    if (!etcdReachable || !app || !upstream || !cp) return ctx.skip();
+    const client = new OpenAI({ apiKey: caller, baseURL: `${app.proxyUrl}/v1`, maxRetries: 0 });
+    const file = await client.files.create({ file: await toFile(Buffer.from(
+      JSON.stringify({ custom_id: "ttl-0", method: "POST", url: "/v1/responses", body: { model, input: "cache" } }) + "\n"),
+      "ttl.jsonl"), purpose: "batch" }, { headers: { "x-aisix-model": model } });
+    const batch = await client.batches.create({ input_file_id: file.id, endpoint: "/v1/responses", completion_window: "24h" });
+    expect((await client.batches.retrieve(batch.id)).status).toBe("completed");
+    const rows = (): Record<string, unknown>[] => cp!.telemetryBodies.flatMap((body) =>
+      (JSON.parse(body) as { events: Record<string, unknown>[] }).events).filter((row) => row.is_batch === true);
+    await expect.poll(() => rows().length, { timeout: 15_000 }).toBeGreaterThan(0);
+    const row = rows()[0];
+    expect(row).toMatchObject({ prompt_tokens: 24000, completion_tokens: 200, cached_prompt_tokens: 8000,
+      cache_write_tokens: 14000, cache_write_30m_tokens: 6000, cache_write_12h_tokens: 8000, total_tokens: 24200 });
+    expect(Math.round(Number(row.cost_usd) * 1_000_000)).toBe(30700);
+    expect(upstream.received.filter((request) => request.path === "/v1/files/file-e2e-out/content")).toHaveLength(1);
   });
 });

@@ -130,6 +130,8 @@ pub struct UpstreamHeaderContext<'a> {
     /// `sec-websocket-*` slots describe the connection the caller opened
     /// and one of them carries the caller's own gateway key.
     pub surface_blocked: &'a [&'a str],
+    /// 平台共享账号的工作区与用户归因头需要 operator 精确授权。
+    pub platform: bool,
 }
 
 impl<'a> UpstreamHeaderContext<'a> {
@@ -149,6 +151,11 @@ impl<'a> UpstreamHeaderContext<'a> {
 
     pub fn with_client_headers(mut self, headers: &'a HeaderMap) -> Self {
         self.client_headers = Some(headers);
+        self
+    }
+
+    pub fn with_platform(mut self, platform: bool) -> Self {
+        self.platform = platform;
         self
     }
 
@@ -284,6 +291,18 @@ impl ForwardedClientHeaders {
             ctx.surface_blocked,
         );
         entries.retain(|(_, value)| !aisix_core::is_caller_gateway_credential(client, value));
+        if ctx.platform {
+            // 工作区选择和用户归因属于共享账号；宽泛规则不代表允许客户选择它们。
+            entries.retain(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "anthropic-workspace-id" | "anthropic-user-profile-id"
+                ) || r
+                    .forward_client_headers
+                    .iter()
+                    .any(|pattern| pattern.eq_ignore_ascii_case(name.as_str()))
+            });
+        }
         Self { entries }
     }
 
@@ -402,6 +421,43 @@ mod tests {
         let ctx = UpstreamHeaderContext::from_overrides(Some(&r)).with_client_headers(&inbound);
         apply_request_headers(&mut headers, &ctx);
         assert_eq!(headers["x-user-jwt"], "eyJraw");
+    }
+
+    #[test]
+    fn platform_account_selectors_require_an_exact_forward_rule() {
+        for name in ["anthropic-workspace-id", "anthropic-user-profile-id"] {
+            for platform in [false, true] {
+                for pattern in ["*", "anthropic-*", name] {
+                    let r = overrides(&[], &[pattern]);
+                    let inbound = client(&[(name, "caller-selected"), ("x-client-tag", "tag")]);
+                    let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+                        .with_client_headers(&inbound)
+                        .with_platform(platform);
+                    let mut headers = HeaderMap::new();
+                    apply_request_headers(&mut headers, &ctx);
+                    assert_eq!(
+                        headers.get(name).is_some(),
+                        !platform || pattern == name,
+                        "platform={platform} pattern={pattern} name={name}"
+                    );
+                    assert_eq!(
+                        ForwardedClientHeaders::resolve(&ctx).claims(name),
+                        headers.contains_key(name)
+                    );
+                    if pattern == "*" {
+                        assert_eq!(headers["x-client-tag"], "tag");
+                    }
+                }
+            }
+            let r = overrides(&[(name, "operator-selected")], &["*"]);
+            let inbound = client(&[(name, "caller-selected")]);
+            let ctx = UpstreamHeaderContext::from_overrides(Some(&r))
+                .with_client_headers(&inbound)
+                .with_platform(true);
+            let mut headers = HeaderMap::new();
+            apply_request_headers(&mut headers, &ctx);
+            assert_eq!(headers[name], "operator-selected");
+        }
     }
 
     /// Whichever header the gateway read it from, and whichever slots the

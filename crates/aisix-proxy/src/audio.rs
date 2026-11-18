@@ -739,7 +739,7 @@ pub async fn speech(
                 monitor_hits,
                 captured_content,
                 attempt_started,
-                settle,
+                mut settle,
             } = success;
             // Same window the other model-dispatch endpoints publish.
             let rl_limits = auth.key().rate_limit.clone().unwrap_or_default();
@@ -789,13 +789,10 @@ pub async fn speech(
                         200,
                         attempt_started,
                     );
-                    if let Some(deferred) = &settle.deferred {
-                        deferred.finish(
-                            &state_c,
-                            terminal.status,
-                            terminal.error_class.is_empty() && terminal.status < 400,
-                        );
-                    }
+                    settle.deferred.finish(
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
+                    );
                     let usage = outcome.usage.clone().unwrap_or_default();
                     state_c.limiter.add_tokens_post_stream_all(
                         &settle.quota_keys,
@@ -2187,6 +2184,10 @@ async fn multipart_dispatch(
             // stream — not the attempts that failed before it (#655).
             let winner_c = routing_out.winner().cloned();
 
+            let mut deferred = AudioDeferredAttempt {
+                state: state.clone(),
+                handle: deferred,
+            };
             let read_timeout = crate::stream_timeout::ReadTimeoutSignal::default();
             let relayed = transcription_relay(
                 crate::stream_timeout::with_read_timeout_bytes_signalled(
@@ -2215,13 +2216,10 @@ async fn multipart_dispatch(
                         200,
                         attempt_started,
                     );
-                    if let Some(deferred) = &deferred {
-                        deferred.finish(
-                            &state_c,
-                            terminal.status,
-                            terminal.error_class.is_empty() && terminal.status < 400,
-                        );
-                    }
+                    deferred.finish(
+                        terminal.status,
+                        terminal.error_class.is_empty() && terminal.status < 400,
+                    );
                     let usage = outcome.usage.clone().unwrap_or_default();
                     let duration_seconds =
                         duration_cost_basis(outcome.duration_seconds, || probed_seconds);
@@ -2678,7 +2676,27 @@ struct SpeechSettle {
     quota_keys: Vec<String>,
     model_display_name: String,
     cooldown: Option<aisix_core::CooldownConfig>,
-    deferred: Option<crate::attempt::DeferredAttempt>,
+    deferred: AudioDeferredAttempt,
+}
+
+// 首次 poll 前销毁终态回调也要结算部署；UsageEvent 仍由原取消 guard 负责。
+struct AudioDeferredAttempt {
+    state: ProxyState,
+    handle: Option<crate::attempt::DeferredAttempt>,
+}
+
+impl AudioDeferredAttempt {
+    fn finish(&mut self, status: u16, success: bool) {
+        if let Some(handle) = self.handle.take() {
+            handle.finish(&self.state, status, success);
+        }
+    }
+}
+
+impl Drop for AudioDeferredAttempt {
+    fn drop(&mut self) {
+        self.finish(crate::CLIENT_CLOSED_REQUEST, false);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3037,7 +3055,10 @@ async fn speech_dispatch(
             quota_keys,
             model_display_name: target.model.display_name.clone(),
             cooldown: target.model.cooldown.clone(),
-            deferred,
+            deferred: AudioDeferredAttempt {
+                state: state.clone(),
+                handle: deferred,
+            },
         },
     })
 }
@@ -5686,6 +5707,118 @@ data: [DONE]\n\n";
         assert!(!wire.contains("9.9.9"), "{wire}");
     }
 
+    // 将终态 guard 延迟到首次 poll 会漏掉部署结算；提前按成功结算会错报成功。
+    async fn assert_unpolled_audio_body_settles_deployment(speech: bool) {
+        use super::compat_media_test_peer::{json_request, snapshot, Peer, ALIAS};
+
+        let (endpoint, upstream_model, content_type) = if speech {
+            ("/v1/audio/speech", "tts-1", "audio/mpeg")
+        } else {
+            (
+                "/v1/audio/transcriptions",
+                "gpt-4o-transcribe",
+                "text/event-stream",
+            )
+        };
+        let peer = Peer::start(content_type, Vec::new(), true).await;
+        let hub = Arc::new(Hub::new());
+        hub.register_specialized("openai", Arc::new(OpenAiBridge::new()));
+        let metrics = Arc::new(aisix_obs::Metrics::new(false));
+        let limiter = Arc::new(aisix_ratelimit::Limiter::local_with_clock(
+            aisix_ratelimit::TestClock::new(1000),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        // 生产构造器会把部署跟踪器接到与 Admin scrape 相同的 metrics 实例。
+        let state = crate::ProxyState::with_components(
+            SnapshotHandle::new(snapshot(&peer.base, upstream_model)),
+            hub,
+            limiter.clone(),
+            metrics.clone(),
+            None,
+            &cfg(),
+        )
+        .with_usage_sink(aisix_obs::UsageSink::new(tx));
+        let app = crate::build_router(state);
+        let request = if speech {
+            json_request(
+                endpoint,
+                serde_json::json!({"model": ALIAS, "input": "hello", "voice": "alloy"}),
+            )
+        } else {
+            let (content_type, body) = streaming_transcription_multipart(ALIAS);
+            Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header("authorization", "Bearer sk-caller")
+                .header("content-type", content_type)
+                .body(body)
+                .unwrap()
+        };
+        let response = tower::ServiceExt::oneshot(app, request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err(), "响应头不能提前结算流");
+        // 不转换成 data stream、不读任何 frame，直接丢弃真实路由返回的 body。
+        drop(response);
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status_code, 499);
+        assert_eq!(event.model_id, "media-model");
+        assert_eq!(event.error_class, "client_disconnected");
+        assert_eq!(
+            event.error_message,
+            "client closed the request before the response body was streamed"
+        );
+        assert!(rx.try_recv().is_err(), "未 poll 的流也只能结算一次");
+        let limits = aisix_core::RateLimit {
+            tpm: Some(10000),
+            concurrency: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            limiter.peek("media-key", &limits).await.unwrap().in_flight,
+            0
+        );
+
+        let scrape = metrics.render();
+        let count = |metric: &str| -> f64 {
+            scrape
+                .lines()
+                .filter(|line| {
+                    line.starts_with(&format!("{metric}{{"))
+                        && line.contains("model=\"media-alias\"")
+                })
+                .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+                .sum()
+        };
+        assert_eq!(
+            count("aisix_deployment_requests_total"),
+            1.0,
+            "{endpoint}: {scrape}"
+        );
+        assert_eq!(
+            count("aisix_deployment_failure_responses_total"),
+            1.0,
+            "{endpoint}: {scrape}"
+        );
+        assert_eq!(
+            count("aisix_deployment_success_responses_total"),
+            0.0,
+            "{endpoint}: {scrape}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpolled_speech_body_settles_deployment_once() {
+        assert_unpolled_audio_body_settles_deployment(true).await;
+    }
+
+    #[tokio::test]
+    async fn unpolled_transcription_body_settles_deployment_once() {
+        assert_unpolled_audio_body_settles_deployment(false).await;
+    }
     /// A streamed transcription relay writes ONE access-log line, at the
     /// relay's end rather than when the head went out, so each of the three
     /// endings reports its own outcome (AISIX-Cloud#1571).

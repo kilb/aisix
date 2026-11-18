@@ -550,6 +550,8 @@ fn terminal_usage(
         completion_tokens: stats.completion_tokens,
         cached_prompt_tokens: 0,
         cache_write_tokens: None,
+        cache_write_30m_tokens: None,
+        cache_write_12h_tokens: None,
         cache_usage_reported: Some(stats.cache_usage_reported().unwrap_or(false)),
         cache_creation_tokens: stats.cache_creation_tokens,
         cache_read_tokens: stats.cache_read_tokens,

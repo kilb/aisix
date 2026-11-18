@@ -1150,6 +1150,8 @@ fn terminal_usage(usage: &Value, status: Option<&str>) -> Option<TerminalUsage> 
         cached_prompt_tokens: cached.unwrap_or(0),
         cache_usage_reported: Some(cached.is_some()),
         cache_write_tokens: None,
+        cache_write_30m_tokens: None,
+        cache_write_12h_tokens: None,
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
         cache_creation_5m_tokens: None,

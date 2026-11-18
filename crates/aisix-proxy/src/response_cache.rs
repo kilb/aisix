@@ -465,6 +465,34 @@ mod tests {
     use super::*;
     use aisix_gateway::{ChatMessage, UsageStats};
 
+    #[test]
+    fn cache_hit_costs_zero_with_nonzero_tokens_and_model_price() {
+        use aisix_core::resource::ResourceEntry;
+
+        let snap = AisixSnapshot::new();
+        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+            "display_name": "priced",
+            "provider": "openai",
+            "model_name": "gpt-4o",
+            "provider_key_id": "pk-1",
+            "cost": { "input_per_1k": 2.5, "output_per_1k": 10.0 },
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-cache-cost", model, 1));
+        let input = aisix_core::InputTokens::uncached_only(1_000);
+
+        // 同样的非零用量未命中应付 2.5 + 5.0 美元，命中则没有上游花费。
+        assert_eq!(
+            CacheTelemetry::of(CacheStatus::Miss).cost_usd(&snap, "m-cache-cost", input, 500),
+            7.5,
+        );
+        assert_eq!(
+            CacheTelemetry::of(CacheStatus::Hit).cost_usd(&snap, "m-cache-cost", input, 500),
+            0.0,
+        );
+    }
+
     fn answer(finish_reason: FinishReason) -> ChatResponse {
         ChatResponse {
             native_envelope: None,

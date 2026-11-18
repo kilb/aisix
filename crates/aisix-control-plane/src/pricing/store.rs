@@ -288,7 +288,7 @@ pub async fn unpriced_details(
 ) -> Result<(Vec<UnpricedDetail>, bool), DbError> {
     let mut rows: Vec<UnpricedDetail> = sqlx::query_as(&format!(
         "SELECT COALESCE(pc.error_code, 'unknown') AS code, pc.requested_model_id, \
-           CASE WHEN pc.error_code = 'missing_tier_price' THEN {PRICING_TIER} END AS service_tier, \
+           CASE WHEN pc.error_code IN ('missing_tier_price', 'missing_long_context_price') THEN {PRICING_TIER} END AS service_tier, \
            CASE WHEN pc.error_code = 'missing_rate' THEN pc.group_id END AS group_id, \
            count(*)::bigint AS count, max(pc.occurred_at) AS latest_at, \
            max(NULLIF(ue.event->>'requested_model', '')) AS sent_model \

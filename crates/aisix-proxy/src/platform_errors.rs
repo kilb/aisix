@@ -419,6 +419,11 @@ fn classify_upstream(
     message: &str,
     wire: UpstreamWire,
 ) -> PlatformErrorClass {
+    if caller_selected_bedrock_model_error(status, view, message, wire) {
+        return PlatformErrorClass::InvalidRequest {
+            param: Some("model".into()),
+        };
+    }
     let names = |tokens: &[&str]| {
         view.is_some_and(|v| {
             [v.code.as_deref(), v.kind.as_deref()]
@@ -485,6 +490,25 @@ fn classify_upstream(
     }
 }
 
+fn caller_selected_bedrock_model_error(
+    status: Option<u16>,
+    view: Option<&UpstreamErrorView>,
+    message: &str,
+    wire: UpstreamWire,
+) -> bool {
+    // 官方 ValidationException 400：客户端捕获段选错模型时，仍使用固定网关错误包。
+    // https://repost.aws/knowledge-center/bedrock-invokemodel-api-error
+    status == Some(400)
+        && wire == UpstreamWire::Bedrock
+        && view.is_some_and(|v| v.kind.as_deref() == Some("ValidationException"))
+        && crate::attribution::caller_selected_upstream_model()
+        && {
+            let text = message.to_ascii_lowercase();
+            text.contains("with on-demand throughput isn")
+                || text.contains("the provided model identifier is invalid")
+        }
+}
+
 /// The statuses of an upstream's answer to a request error, which platform
 /// mode relays from an upstream of the caller's own protocol: a bad request,
 /// a request too large and an unprocessable one.
@@ -522,22 +546,27 @@ pub(crate) fn relayed_status(err: &BridgeError) -> Option<u16> {
     if !active() {
         return None;
     }
-    let (status, wire, parsed) = match err {
+    let (status, wire, parsed, message) = match err {
         BridgeError::UpstreamStatus {
             status,
             wire,
             parsed,
+            message,
             ..
-        } => (Some(*status), *wire, parsed),
+        } => (Some(*status), *wire, parsed, message),
         BridgeError::UpstreamInBand {
             status,
             wire,
             parsed,
+            message,
             ..
-        } => (*status, *wire, parsed),
+        } => (*status, *wire, parsed, message),
         _ => return None,
     };
     if parsed.is_none() {
+        return None;
+    }
+    if caller_selected_bedrock_model_error(status, parsed.as_deref(), message, wire) {
         return None;
     }
     let class = classify_bridge(err);
@@ -696,6 +725,24 @@ pub(crate) fn relayed_anthropic_error(event: Option<&Value>) -> Option<String> {
         classify_bridge(&e)
     });
     Some(anthropic_frame(&class))
+}
+
+/// 普通实时会话沿用同协议请求错误与共享账号错误分类，保留官方关联标识。
+pub(crate) fn relayed_realtime_error(event: &Value, error: &BridgeError) -> Option<Value> {
+    if !active() {
+        return None;
+    }
+    if relayed_status(error).is_some() {
+        return scrubbed_error(event, "/error");
+    }
+    let mut rewritten = event.clone();
+    let mut body = serde_json::to_value(classify_bridge(error).envelope().error).ok()?;
+    // 官方错误事件的 event_id 指向失败的客户端命令，分类后仍需保留关联。
+    if let Some(event_id) = event.pointer("/error/event_id") {
+        body["event_id"] = event_id.clone();
+    }
+    rewritten["error"] = body;
+    Some(rewritten)
 }
 
 /// `event` with every string of the error object at `pointer` through the
@@ -924,6 +971,91 @@ mod tests {
     use crate::error::tests::render_platform;
     use crate::error::ProxyError;
     use aisix_gateway::{BridgeError, UpstreamErrorView, UpstreamWire};
+
+    #[test]
+    fn bedrock_model_errors_blame_only_a_caller_selected_wildcard_model() {
+        for message in [
+            "The provided model identifier is invalid.",
+            "Invocation of model ID anthropic.typo with on-demand throughput isn't supported. Retry your request with the ID or ARN of an inference profile.",
+        ] {
+            for (pattern, template, caller_selected) in [
+                ("bedrock/*", None, true),
+                ("bedrock/*", Some("anthropic.*"), true),
+                ("bedrock/*", Some("anthropic.operator-choice"), false),
+                ("bedrock/anthropic.typo", Some("anthropic.operator-choice"), false),
+            ] {
+                for translated in [false, true] {
+                    in_platform_mode(|| {
+                        let snapshot = aisix_core::AisixSnapshot::new();
+                        let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
+                            "display_name": pattern, "provider": "bedrock", "model_name": template,
+                            "provider_key_id": "pk-one"
+                        })).unwrap();
+                        snapshot.models.insert(aisix_core::ResourceEntry::new("m-one", model, 1));
+                        let resolved = crate::model_resolve::resolve_model(&snapshot, "bedrock/anthropic.typo").unwrap();
+                        crate::attribution::note_target(&resolved.value, "pk-one");
+                        crate::attribution::note_translated_dispatch(translated);
+                        let error = BridgeError::UpstreamStatus {
+                            status: 400, message: message.into(),
+                            parsed: Some(Box::new(UpstreamErrorView {
+                                kind: Some("ValidationException".into()), message: Some(message.into()),
+                                ..Default::default()
+                            })), wire: UpstreamWire::Bedrock, retry_after: None, diagnostic: None,
+                        };
+                        // 热更新不能改写已发请求的来源，固定模板与捕获模板互换后仍按原选择归责。
+                        let updated: aisix_core::Model = serde_json::from_value(serde_json::json!({
+                            "display_name": "bedrock/*", "provider": "bedrock",
+                            "model_name": if caller_selected { "anthropic.fixed" } else { "anthropic.*" },
+                            "provider_key_id": "pk-one"
+                        })).unwrap();
+                        snapshot.models.insert(aisix_core::ResourceEntry::new("m-one", updated, 2));
+                        let proxy = ProxyError::Bridge(error);
+                        let ProxyError::Bridge(error) = &proxy else { unreachable!() };
+                        let envelope = serde_json::to_value(proxy.envelope()).unwrap();
+                        assert_eq!(classify_bridge(error).status().as_u16(), if caller_selected {400} else {503},
+                            "pattern={pattern} template={template:?} translated={translated}: {envelope}");
+                        assert_eq!(envelope["error"]["code"], if caller_selected {"invalid_request"} else {"upstream_unavailable"});
+                        assert_eq!(relayed_status(error), None, "AWS errors retain the closed gateway envelope");
+                        assert!(!envelope.to_string().contains(message));
+                        assert!(openai_stream_payload(error).unwrap().contains(if caller_selected {"invalid_request"} else {"upstream_unavailable"}));
+                    });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_counter_preserves_caller_model_origin_only_without_an_operator_mapping() {
+        for caller_selected in [false, true] {
+            for from_source in [false, true] {
+                in_platform_mode(|| {
+                    crate::attribution::note_requested_model_with_caller_selection(
+                        "requested",
+                        "model",
+                        caller_selected,
+                    );
+                    let key: aisix_core::ProviderKey = serde_json::from_value(serde_json::json!({
+                        "display_name": "counter", "provider": "bedrock", "adapter": "bedrock", "secret": "test"
+                    })).unwrap();
+                    crate::attribution::note_count_target(
+                        &crate::token_counting::ResolvedCounter {
+                            key: std::sync::Arc::new(aisix_core::ResourceEntry::new(
+                                "counter-key",
+                                key,
+                                1,
+                            )),
+                            model_name: "selected-counter-model".into(),
+                            model_name_from_source: from_source,
+                        },
+                    );
+                    assert_eq!(
+                        crate::attribution::caller_selected_upstream_model(),
+                        caller_selected && from_source
+                    );
+                });
+            }
+        }
+    }
 
     fn upstream_status(status: u16, message: &str) -> ProxyError {
         ProxyError::Bridge(BridgeError::upstream_status(status, message))

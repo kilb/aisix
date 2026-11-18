@@ -116,6 +116,10 @@ pub struct ModelCost {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub cache_write_1h_per_1k: Option<f64>,
+    /// 十二小时缓存写入单价；未配置时沿用既有写入估算回退。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cache_write_12h_per_1k: Option<f64>,
 }
 
 /// The three input-token buckets pricing needs, guaranteed DISJOINT.
@@ -162,6 +166,8 @@ pub struct InputTokens {
     /// a rate of its own. A part, never a fourth bucket: [`Self::total`] does
     /// not add it again.
     pub cache_write_1h: u64,
+    /// 十二小时写入是 cache_write 的子集，不再加入总量。
+    pub cache_write_12h: u64,
 }
 
 impl InputTokens {
@@ -178,6 +184,14 @@ impl InputTokens {
     pub fn with_one_hour_writes(self, n: u64) -> Self {
         Self {
             cache_write_1h: n.min(self.cache_write),
+            ..self
+        }
+    }
+
+    /// 标记上游报告的十二小时写入，不能超过尚未分配的写入数。
+    pub fn with_twelve_hour_writes(self, n: u64) -> Self {
+        Self {
+            cache_write_12h: n.min(self.cache_write.saturating_sub(self.cache_write_1h)),
             ..self
         }
     }
@@ -233,6 +247,7 @@ pub fn input_tokens_for_pricing(
         cache_read: cached_prompt_tokens.saturating_add(cache_read_tokens),
         cache_write: cache_creation_tokens.saturating_add(cache_write_subset),
         cache_write_1h: 0,
+        cache_write_12h: 0,
     }
 }
 
@@ -260,6 +275,21 @@ pub fn one_hour_cache_writes(
             if u64::from(five_m) + u64::from(one_h) == cache_creation_tokens =>
         {
             Some(u64::from(one_h))
+        }
+        _ => None,
+    }
+}
+
+/// 只读取完整且与写入总量相等的上游生命周期拆分；缺报不猜测请求 TTL。
+pub fn twelve_hour_cache_writes(
+    total: u64,
+    thirty_m: Option<u32>,
+    twelve_h: Option<u32>,
+) -> Option<u64> {
+    match (thirty_m, twelve_h) {
+        (None, None) => Some(0),
+        (Some(thirty_m), Some(twelve_h)) if u64::from(thirty_m) + u64::from(twelve_h) == total => {
+            Some(u64::from(twelve_h))
         }
         _ => None,
     }
@@ -298,10 +328,18 @@ impl ModelCost {
             Some(rate) => (rate, input.cache_write_1h.min(input.cache_write)),
             None => (write_rate, 0),
         };
+        let (write_rate_12h, write_12h) = match self.cache_write_12h_per_1k {
+            Some(rate) => (
+                rate,
+                input.cache_write_12h.min(input.cache_write - write_1h),
+            ),
+            None => (write_rate, 0),
+        };
         (self.input_per_1k * (input.uncached as f64)
             + cached_rate * (input.cache_read as f64)
-            + write_rate * ((input.cache_write - write_1h) as f64)
+            + write_rate * ((input.cache_write - write_1h - write_12h) as f64)
             + write_rate_1h * (write_1h as f64)
+            + write_rate_12h * (write_12h as f64)
             + self.output_per_1k * (output_tokens as f64))
             / 1000.0
     }
@@ -988,6 +1026,7 @@ mod tests {
             cached_input_per_1k: Some(0.1),
             cache_write_per_1k: Some(1.25),
             cache_write_1h_per_1k: None,
+            cache_write_12h_per_1k: None,
         }
     }
 
@@ -1002,6 +1041,7 @@ mod tests {
             cached_input_per_1k: None,
             cache_write_per_1k: None,
             cache_write_1h_per_1k: None,
+            cache_write_12h_per_1k: None,
         };
         // 1000 fresh + 1000 read + 1000 write, all at the input rate.
         let with_cache = c.calculate_with_cache(
@@ -1010,6 +1050,7 @@ mod tests {
                 cache_read: 1000,
                 cache_write: 1000,
                 cache_write_1h: 0,
+                cache_write_12h: 0,
             },
             0,
         );
@@ -1029,6 +1070,7 @@ mod tests {
                 cache_read: 2000,
                 cache_write: 4000,
                 cache_write_1h: 0,
+                cache_write_12h: 0,
             },
             1000,
         );
@@ -1053,6 +1095,7 @@ mod tests {
             cache_read: 800,
             cache_write: 0,
             cache_write_1h: 0,
+            cache_write_12h: 0,
         };
         assert_eq!(input.uncached, 200);
         assert_eq!(input.cache_read, 800);
@@ -1078,6 +1121,7 @@ mod tests {
             cache_read: 999,
             cache_write: 0,
             cache_write_1h: 0,
+            cache_write_12h: 0,
         };
         let got = cost().calculate_with_cache(input, 0);
         // 999 tokens at the cached rate (0.1 / 1k) — not zero, and not the
@@ -1101,6 +1145,7 @@ mod tests {
                 cache_read: 1000,
                 cache_write: 0,
                 cache_write_1h: 0,
+                cache_write_12h: 0,
             },
             0,
         );
@@ -1110,6 +1155,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 1000,
                 cache_write_1h: 0,
+                cache_write_12h: 0,
             },
             0,
         );
@@ -1119,6 +1165,7 @@ mod tests {
                 cache_read: 0,
                 cache_write: 0,
                 cache_write_1h: 0,
+                cache_write_12h: 0,
             },
             0,
         );
@@ -1197,6 +1244,7 @@ mod tests {
             cached_input_per_1k: Some(1.0),
             cache_write_per_1k: Some(12.5),
             cache_write_1h_per_1k: None,
+            cache_write_12h_per_1k: None,
         };
         // 200*10 + 100*1 + 700*12.5 = 10850, divided by 1000.
         assert!((cost.calculate_with_cache(got, 0) - 10.85).abs() < 1e-9);
@@ -1234,6 +1282,7 @@ mod tests {
             cached_input_per_1k: None,
             cache_write_per_1k: Some(1.25),
             cache_write_1h_per_1k: Some(2.0),
+            cache_write_12h_per_1k: None,
         }
     }
 
@@ -1264,6 +1313,7 @@ mod tests {
     fn a_cost_block_without_a_one_hour_rate_prices_as_before() {
         let cost = ModelCost {
             cache_write_1h_per_1k: None,
+            cache_write_12h_per_1k: None,
             ..one_hour_cost()
         };
         let got = cost.calculate_with_cache(one_hour_input(), 0);
@@ -1282,6 +1332,7 @@ mod tests {
         let cost = ModelCost {
             cache_write_per_1k: None,
             cache_write_1h_per_1k: None,
+            cache_write_12h_per_1k: None,
             ..one_hour_cost()
         };
         let got = cost.calculate_with_cache(one_hour_input(), 0);
@@ -1991,4 +2042,55 @@ mod tests {
     // the `Provider` enum it pinned no longer exists post-#302
     // Phase A. Vendor identity is now a free-form string on
     // `ProviderKey.provider` / `Model.provider`.
+}
+
+#[cfg(test)]
+mod cache_write_split_12h_tests {
+    #[test]
+    fn cache_write_split_12h_cost_field_round_trips() {
+        let value = serde_json::json!({"input_per_1k":0.001, "output_per_1k":0.002, "cache_write_12h_per_1k":0.0025});
+        let cost: super::ModelCost = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(cost)
+                .unwrap()
+                .get("cache_write_12h_per_1k"),
+            value.get("cache_write_12h_per_1k")
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_write_split_12h_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn cache_write_split_12h_accepts_only_complete_matching_counts() {
+        assert_eq!(
+            twelve_hour_cache_writes(7000, Some(3000), Some(4000)),
+            Some(4000)
+        );
+        assert_eq!(twelve_hour_cache_writes(7000, None, None), Some(0));
+        assert_eq!(twelve_hour_cache_writes(0, Some(0), Some(0)), Some(0));
+        assert_eq!(twelve_hour_cache_writes(7000, None, Some(4000)), None);
+        assert_eq!(twelve_hour_cache_writes(7000, Some(3000), None), None);
+        assert_eq!(twelve_hour_cache_writes(7000, Some(3000), Some(3999)), None);
+        assert_eq!(
+            twelve_hour_cache_writes(u64::from(u32::MAX) * 2, Some(u32::MAX), Some(u32::MAX)),
+            Some(u64::from(u32::MAX))
+        );
+    }
+
+    #[test]
+    fn cache_write_split_12h_is_a_subset_with_its_own_rate() {
+        let cost: ModelCost = serde_json::from_value(serde_json::json!({"input_per_1k":0.001,"output_per_1k":0.002,"cached_input_per_1k":0.0001,"cache_write_per_1k":0.00125,"cache_write_12h_per_1k":0.0025})).unwrap();
+        let input = input_tokens_for_pricing(12000, 4000, 7000, 0, 0).with_twelve_hour_writes(4000);
+        assert_eq!(input.total(), 12000);
+        assert_eq!(input.uncached, 1000);
+        assert!((cost.calculate_with_cache(input, 100) - 0.01535).abs() < 1e-12);
+        let old: ModelCost = serde_json::from_value(serde_json::json!({"input_per_1k":0.001,"output_per_1k":0.002,"cached_input_per_1k":0.0001,"cache_write_per_1k":0.00125})).unwrap();
+        assert_eq!(
+            old.calculate_with_cache(input, 100),
+            old.calculate_with_cache(input_tokens_for_pricing(12000, 4000, 7000, 0, 0), 100)
+        );
+    }
 }

@@ -178,3 +178,11 @@ test("a list cut short leaves no call out of a row: each reason's unlisted calls
   // The fixture above lists every kind: no unlisted row.
   assert.deepEqual(statusView(status).unlisted, []);
 });
+
+
+test("长上下文缺价保留具体档位和修复入口", () => {
+  const detail = { code: "missing_long_context_price", model: { id: "m", name: "model", deleted: false }, service_tier: "priority", group: null };
+  assert.equal(reasonLabel(detail.code), "缺少长上下文价");
+  assert.match(remedy(detail), /未公布长上下文价格/);
+  assert.equal(chargesFilterFor(detail, { since: "2026-11-18T00:00:00Z", until: "2026-11-19T00:00:00Z" }).pricing_tier, "priority");
+});

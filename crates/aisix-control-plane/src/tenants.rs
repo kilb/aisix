@@ -1867,9 +1867,12 @@ fn audit_entry<'a>(
 #[derive(Deserialize)]
 pub struct ListQuery {
     status: Option<String>,
+    limit: Option<i64>,
+    before: Option<Uuid>,
 }
 
-/// `GET /admin/tenants[?status=]` → `{items: [Tenant]}`, oldest first.
+/// `GET /admin/tenants[?status=&limit=&before=]`，保持创建时间与编号升序。
+/// 显式分页每页最多 200 条；无分页参数保留旧客户端的完整列表。
 pub async fn list(
     auth: OperatorAuth,
     State(state): State<AppState>,
@@ -1877,20 +1880,54 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let bad_status = || ApiError::validation(vec![detail("status", "未知的租户状态")]);
-    let Query(q) = query.map_err(|_| bad_status())?;
+    let Query(q) =
+        query.map_err(|_| ApiError::validation(vec![detail("query", "查询参数不合法")]))?;
+    if q.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+        return Err(ApiError::validation(vec![detail(
+            "limit",
+            "每页数量须为 1 到 200",
+        )]));
+    }
+    let limit = q.limit.or_else(|| q.before.map(|_| 100));
     let status = match q.status.as_deref() {
         None => None,
         Some(raw) => Some(TenantStatus::parse(raw).ok_or_else(bad_status)?),
     };
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
-    let raw: Vec<RawTenant> = sqlx::query_as(&format!(
+    let after: Option<DateTime<Utc>> = if let Some(before) = q.before {
+        Some(sqlx::query_scalar(
+            "SELECT created_at FROM tenants WHERE id = $1 AND ($2::text IS NULL OR status = $2)",
+        )
+        .bind(before)
+        .bind(status.map(TenantStatus::as_str))
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::from)?
+        .ok_or_else(|| ApiError::validation(vec![detail("before", "游标不属于当前租户列表")]))?)
+    } else {
+        None
+    };
+    let mut raw: Vec<RawTenant> = sqlx::query_as(&format!(
         "SELECT {COLUMNS} FROM tenants WHERE ($1::text IS NULL OR status = $1) \
-         ORDER BY created_at, id"
+         AND ($2::timestamptz IS NULL OR (created_at, id) > ($2, $3::uuid)) \
+         ORDER BY created_at, id LIMIT $4"
     ))
     .bind(status.map(TenantStatus::as_str))
+    .bind(after)
+    .bind(q.before)
+    .bind(limit.map(|limit| limit + 1))
     .fetch_all(&mut *conn)
     .await
     .map_err(DbError::from)?;
+    let more = limit.is_some_and(|limit| raw.len() > limit as usize);
+    if let Some(limit) = limit {
+        raw.truncate(limit as usize);
+    }
+    let next_before = if more {
+        raw.last().map(|row| row.0)
+    } else {
+        None
+    };
     let tenants = raw
         .into_iter()
         .map(TenantRow::from_raw)
@@ -1902,7 +1939,7 @@ pub async fn list(
         tenants,
     )
     .await?;
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 
 /// `GET /admin/tenants/{id}` → `Tenant` and `ETag: "<version>"`.

@@ -1,19 +1,20 @@
 {
-  "version": "2026-11-11",
+  "version": "2026-11-18",
   "entries": [
     {
       "key": "openai/gpt-6-astra",
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. Rechecked on 2026-11-18: cache_write_12h records the published 12h write column. Official Responses usage reports disjoint ttl_30m_tokens and ttl_12h_tokens in input_tokens_details.cache_write_tokens_details; the gateway preserves both. Unsplit legacy rows retain the short-write reading; a reported 12h quantity with no explicit 12h price is unpriced, never billed at the short-write rate. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
             "input": "10",
             "output": "50",
             "cache_read": "1",
-            "cache_write": "12.5"
+            "cache_write": "12.5",
+            "cache_write_12h": "25"
           },
           "long_context": [
             {
@@ -22,7 +23,8 @@
                 "input": "20",
                 "output": "75",
                 "cache_read": "2",
-                "cache_write": "25"
+                "cache_write": "25",
+                "cache_write_12h": "50"
               }
             }
           ]
@@ -32,7 +34,8 @@
             "input": "5",
             "output": "25",
             "cache_read": "0.5",
-            "cache_write": "6.25"
+            "cache_write": "6.25",
+            "cache_write_12h": "12.5"
           },
           "long_context": [
             {
@@ -41,7 +44,8 @@
                 "input": "10",
                 "output": "37.5",
                 "cache_read": "1",
-                "cache_write": "12.5"
+                "cache_write": "12.5",
+                "cache_write_12h": "25"
               }
             }
           ]
@@ -51,7 +55,8 @@
             "input": "5",
             "output": "25",
             "cache_read": "0.5",
-            "cache_write": "6.25"
+            "cache_write": "6.25",
+            "cache_write_12h": "12.5"
           },
           "long_context": [
             {
@@ -60,7 +65,8 @@
                 "input": "10",
                 "output": "37.5",
                 "cache_read": "1",
-                "cache_write": "12.5"
+                "cache_write": "12.5",
+                "cache_write_12h": "25"
               }
             }
           ]
@@ -70,7 +76,8 @@
             "input": "20",
             "output": "100",
             "cache_read": "2",
-            "cache_write": "25"
+            "cache_write": "25",
+            "cache_write_12h": "50"
           },
           "long_context": [
             {
@@ -79,7 +86,8 @@
                 "input": "40",
                 "output": "150",
                 "cache_read": "4",
-                "cache_write": "50"
+                "cache_write": "50",
+                "cache_write_12h": "100"
               }
             }
           ]
@@ -89,7 +97,8 @@
             "input": "20",
             "output": "100",
             "cache_read": "2",
-            "cache_write": "25"
+            "cache_write": "25",
+            "cache_write_12h": "50"
           },
           "long_context": [
             {
@@ -98,7 +107,8 @@
                 "input": "40",
                 "output": "150",
                 "cache_read": "4",
-                "cache_write": "50"
+                "cache_write": "50",
+                "cache_write_12h": "100"
               }
             }
           ]
@@ -108,7 +118,8 @@
             "input": "60",
             "output": "300",
             "cache_read": "6",
-            "cache_write": "75"
+            "cache_write": "75",
+            "cache_write_12h": "150"
           },
           "long_context": [
             {
@@ -117,7 +128,8 @@
                 "input": "120",
                 "output": "450",
                 "cache_read": "12",
-                "cache_write": "150"
+                "cache_write": "150",
+                "cache_write_12h": "300"
               }
             }
           ]
@@ -129,14 +141,15 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. Rechecked on 2026-11-18: cache_write_12h records the published 12h write column. Official Responses usage reports disjoint ttl_30m_tokens and ttl_12h_tokens in input_tokens_details.cache_write_tokens_details; the gateway preserves both. Unsplit legacy rows retain the short-write reading; a reported 12h quantity with no explicit 12h price is unpriced, never billed at the short-write rate. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. The ultrafast tier is the page's Ultrafast tab, which lists only gpt-6-astra and gpt-6.1-sol. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
             "input": "2",
             "output": "10",
             "cache_read": "0.1",
-            "cache_write": "2.5"
+            "cache_write": "2.5",
+            "cache_write_12h": "5"
           },
           "long_context": [
             {
@@ -145,7 +158,8 @@
                 "input": "4",
                 "output": "15",
                 "cache_read": "0.2",
-                "cache_write": "5"
+                "cache_write": "5",
+                "cache_write_12h": "10"
               }
             }
           ]
@@ -155,7 +169,8 @@
             "input": "1",
             "output": "5",
             "cache_read": "0.05",
-            "cache_write": "1.25"
+            "cache_write": "1.25",
+            "cache_write_12h": "2.5"
           },
           "long_context": [
             {
@@ -164,7 +179,8 @@
                 "input": "2",
                 "output": "7.5",
                 "cache_read": "0.1",
-                "cache_write": "2.5"
+                "cache_write": "2.5",
+                "cache_write_12h": "5"
               }
             }
           ]
@@ -174,7 +190,8 @@
             "input": "1",
             "output": "5",
             "cache_read": "0.05",
-            "cache_write": "1.25"
+            "cache_write": "1.25",
+            "cache_write_12h": "2.5"
           },
           "long_context": [
             {
@@ -183,7 +200,8 @@
                 "input": "2",
                 "output": "7.5",
                 "cache_read": "0.1",
-                "cache_write": "2.5"
+                "cache_write": "2.5",
+                "cache_write_12h": "5"
               }
             }
           ]
@@ -193,7 +211,8 @@
             "input": "4",
             "output": "20",
             "cache_read": "0.2",
-            "cache_write": "5"
+            "cache_write": "5",
+            "cache_write_12h": "10"
           },
           "long_context": [
             {
@@ -202,7 +221,8 @@
                 "input": "8",
                 "output": "30",
                 "cache_read": "0.4",
-                "cache_write": "10"
+                "cache_write": "10",
+                "cache_write_12h": "20"
               }
             }
           ]
@@ -212,7 +232,8 @@
             "input": "4",
             "output": "20",
             "cache_read": "0.2",
-            "cache_write": "5"
+            "cache_write": "5",
+            "cache_write_12h": "10"
           },
           "long_context": [
             {
@@ -221,7 +242,8 @@
                 "input": "8",
                 "output": "30",
                 "cache_read": "0.4",
-                "cache_write": "10"
+                "cache_write": "10",
+                "cache_write_12h": "20"
               }
             }
           ]
@@ -231,7 +253,8 @@
             "input": "12",
             "output": "60",
             "cache_read": "0.6",
-            "cache_write": "15"
+            "cache_write": "15",
+            "cache_write_12h": "30"
           },
           "long_context": [
             {
@@ -240,7 +263,8 @@
                 "input": "24",
                 "output": "90",
                 "cache_read": "1.2",
-                "cache_write": "30"
+                "cache_write": "30",
+                "cache_write_12h": "60"
               }
             }
           ]
@@ -252,14 +276,15 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. Rechecked on 2026-11-18: cache_write_12h records the published 12h write column. Official Responses usage reports disjoint ttl_30m_tokens and ttl_12h_tokens in input_tokens_details.cache_write_tokens_details; the gateway preserves both. Unsplit legacy rows retain the short-write reading; a reported 12h quantity with no explicit 12h price is unpriced, never billed at the short-write rate. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
             "input": "1",
             "output": "5",
             "cache_read": "0.05",
-            "cache_write": "1.25"
+            "cache_write": "1.25",
+            "cache_write_12h": "2.5"
           },
           "long_context": [
             {
@@ -268,7 +293,8 @@
                 "input": "2",
                 "output": "7.5",
                 "cache_read": "0.1",
-                "cache_write": "2.5"
+                "cache_write": "2.5",
+                "cache_write_12h": "5"
               }
             }
           ]
@@ -278,7 +304,8 @@
             "input": "0.5",
             "output": "2.5",
             "cache_read": "0.025",
-            "cache_write": "0.625"
+            "cache_write": "0.625",
+            "cache_write_12h": "1.25"
           },
           "long_context": [
             {
@@ -287,7 +314,8 @@
                 "input": "1",
                 "output": "3.75",
                 "cache_read": "0.05",
-                "cache_write": "1.25"
+                "cache_write": "1.25",
+                "cache_write_12h": "2.5"
               }
             }
           ]
@@ -297,7 +325,8 @@
             "input": "0.5",
             "output": "2.5",
             "cache_read": "0.025",
-            "cache_write": "0.625"
+            "cache_write": "0.625",
+            "cache_write_12h": "1.25"
           },
           "long_context": [
             {
@@ -306,7 +335,8 @@
                 "input": "1",
                 "output": "3.75",
                 "cache_read": "0.05",
-                "cache_write": "1.25"
+                "cache_write": "1.25",
+                "cache_write_12h": "2.5"
               }
             }
           ]
@@ -316,7 +346,8 @@
             "input": "2",
             "output": "10",
             "cache_read": "0.1",
-            "cache_write": "2.5"
+            "cache_write": "2.5",
+            "cache_write_12h": "5"
           },
           "long_context": [
             {
@@ -325,7 +356,8 @@
                 "input": "4",
                 "output": "15",
                 "cache_read": "0.2",
-                "cache_write": "5"
+                "cache_write": "5",
+                "cache_write_12h": "10"
               }
             }
           ]
@@ -335,7 +367,8 @@
             "input": "2",
             "output": "10",
             "cache_read": "0.1",
-            "cache_write": "2.5"
+            "cache_write": "2.5",
+            "cache_write_12h": "5"
           },
           "long_context": [
             {
@@ -344,7 +377,8 @@
                 "input": "4",
                 "output": "15",
                 "cache_read": "0.2",
-                "cache_write": "5"
+                "cache_write": "5",
+                "cache_write_12h": "10"
               }
             }
           ]
@@ -356,14 +390,15 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. The usage the gateway records carries one cache-write counter with no retention, so a 12h write bills at the 30m rate (ruling P2-R5); the 12h write rates are not recorded. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. ",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. cache_write is the page's 30m write column. Rechecked on 2026-11-18: cache_write_12h records the published 12h write column. Official Responses usage reports disjoint ttl_30m_tokens and ttl_12h_tokens in input_tokens_details.cache_write_tokens_details; the gateway preserves both. Unsplit legacy rows retain the short-write reading; a reported 12h quantity with no explicit 12h price is unpriced, never billed at the short-write rate. Flex is the page's Flex sub-table of the Batch tab, equal to Batch. The fast tier repeats priority: the Fast mode guide says 'For GPT-5.6 and earlier models, the response returns `priority` whether the request specifies `priority` or `fast`' and states no returned value for later models, so a GPT-6 response may report either name. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
             "input": "0.1",
             "output": "0.5",
             "cache_read": "0.01",
-            "cache_write": "0.125"
+            "cache_write": "0.125",
+            "cache_write_12h": "0.25"
           },
           "long_context": [
             {
@@ -372,7 +407,8 @@
                 "input": "0.2",
                 "output": "0.75",
                 "cache_read": "0.02",
-                "cache_write": "0.25"
+                "cache_write": "0.25",
+                "cache_write_12h": "0.5"
               }
             }
           ]
@@ -382,7 +418,8 @@
             "input": "0.05",
             "output": "0.25",
             "cache_read": "0.005",
-            "cache_write": "0.0625"
+            "cache_write": "0.0625",
+            "cache_write_12h": "0.125"
           },
           "long_context": [
             {
@@ -391,7 +428,8 @@
                 "input": "0.1",
                 "output": "0.375",
                 "cache_read": "0.01",
-                "cache_write": "0.125"
+                "cache_write": "0.125",
+                "cache_write_12h": "0.25"
               }
             }
           ]
@@ -401,7 +439,8 @@
             "input": "0.05",
             "output": "0.25",
             "cache_read": "0.005",
-            "cache_write": "0.0625"
+            "cache_write": "0.0625",
+            "cache_write_12h": "0.125"
           },
           "long_context": [
             {
@@ -410,7 +449,8 @@
                 "input": "0.1",
                 "output": "0.375",
                 "cache_read": "0.01",
-                "cache_write": "0.125"
+                "cache_write": "0.125",
+                "cache_write_12h": "0.25"
               }
             }
           ]
@@ -420,7 +460,8 @@
             "input": "0.2",
             "output": "1",
             "cache_read": "0.02",
-            "cache_write": "0.25"
+            "cache_write": "0.25",
+            "cache_write_12h": "0.5"
           },
           "long_context": [
             {
@@ -429,7 +470,8 @@
                 "input": "0.4",
                 "output": "1.5",
                 "cache_read": "0.04",
-                "cache_write": "0.5"
+                "cache_write": "0.5",
+                "cache_write_12h": "1"
               }
             }
           ]
@@ -439,7 +481,8 @@
             "input": "0.2",
             "output": "1",
             "cache_read": "0.02",
-            "cache_write": "0.25"
+            "cache_write": "0.25",
+            "cache_write_12h": "0.5"
           },
           "long_context": [
             {
@@ -448,7 +491,8 @@
                 "input": "0.4",
                 "output": "1.5",
                 "cache_read": "0.04",
-                "cache_write": "0.5"
+                "cache_write": "0.5",
+                "cache_write_12h": "1"
               }
             }
           ]
@@ -460,7 +504,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. The page shows write columns for this model as '-', so there is no cache_write. Batch cached input 0.13 is as published (half of 0.25 is 0.125). The Fast (priority) tab lists a short-context row only (5 / 0.5 / 30) and no long-context row, which the rate model's band rule cannot hold beside the default tier's band, so priority is omitted.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. The page shows write columns for this model as '-', so there is no cache_write. Batch cached input 0.13 is as published (half of 0.25 is 0.125). Rechecked on 2026-11-18: the Fast (priority) tab lists short-context input / cached input / output at 5 / 0.5 / 30 and no long-context price. Both priority and fast carry those base rates with unpriced_above_input_tokens=272000; larger prompts are unpriced rather than charged at the short-context rate. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
@@ -512,6 +556,22 @@
               }
             }
           ]
+        },
+        "priority": {
+          "base": {
+            "input": "5",
+            "output": "30",
+            "cache_read": "0.5"
+          },
+          "unpriced_above_input_tokens": 272000
+        },
+        "fast": {
+          "base": {
+            "input": "5",
+            "output": "30",
+            "cache_read": "0.5"
+          },
+          "unpriced_above_input_tokens": 272000
         }
       }
     },
@@ -520,7 +580,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. No write columns and no long-context split on the page.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. No write columns and no long-context split on the page. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
@@ -557,7 +617,7 @@
       "aliases": [],
       "source_url": "https://developers.openai.com/api/docs/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. No write columns and no long-context split; the Fast (priority) tab does not list this model.",
+      "notes": "Source read on 2026-11-06 at https://platform.openai.com/docs/pricing, which redirects (301) to the source_url. Long context is read as above 272000 input tokens: the page says '>272K' and does not define K, nor say whether cached tokens count. Priority is the tier the page renamed Fast mode on 2026-07-30. No write columns and no long-context split; the Fast (priority) tab does not list this model. Rechecked on 2026-11-18: the source_url applies a 10% uplift to eligible regional-processing (data-residency) endpoints for models released on or after 2026-03-05; this model is in https://developers.openai.com/api/docs/guides/data-residency's eligible-model list. The card records global rates without that uplift because usage rows carry no regional-processing pricing dimension. Web search costs $10 per 1,000 calls plus search-content tokens at the model rate; this card has no per-call rate. The Responses path already records explicit tool_usage.web_search.num_requests as web_search_requests, without inferring usage from tool declarations or output actions. A positive reported count without a selected web_search rate yields missing_dimension_price.",
       "card": {
         "default": {
           "base": {
@@ -632,7 +692,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-10",
-      "notes": "Source read on 2026-11-10 at the source_url. Default rates are the page's model table: $8 input, $40 output, $10 for a 5m cache write, $16 for a 1h cache write, and $0.20 for cache hits and refreshes (the page's 0.025x of input, footnoted for Fable 5.2). web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches, priced apart from tokens and differing by no tier. Batch input and output are the page's Batch processing table ($4 and $20 per MTok, the 50 percent discount); batch cache rates are derived as the batch input price times the page's own multipliers (0.025x read, 1.25x write, 2x 1h write), the same derivation claude-fable-5-1 records. The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page's Fast mode pricing table publishes $16 input and $80 output for Claude Fable 5.2, and says the prompt caching multipliers apply on top, so its cache rates are derived (read 16 x 0.025, write 16 x 1.25, 1h write 16 x 2). Fast mode is not available with the Batch API and applies across the full context window.",
+      "notes": "Source read on 2026-11-10 at the source_url. Default rates are the page's model table: $8 input, $40 output, $10 for a 5m cache write, $16 for a 1h cache write, and $0.20 for cache hits and refreshes (the page's 0.025x of input, footnoted for Fable 5.2). web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches, priced apart from tokens and differing by no tier. Batch input and output are the page's Batch processing table ($4 and $20 per MTok, the 50 percent discount); batch cache rates are derived as the batch input price times the page's own multipliers (0.025x read, 1.25x write, 2x 1h write), the same derivation claude-fable-5-1 records. The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page's Fast mode pricing table publishes $16 input and $80 output for Claude Fable 5.2, and says the prompt caching multipliers apply on top, so its cache rates are derived (read 16 x 0.025, write 16 x 1.25, 1h write 16 x 2). Fast mode is not available with the Batch API and applies across the full context window. Rechecked on 2026-11-18 at the source_url: Claude 4.6 and later, including this model, charge 1.1x for US-only inference (inference_geo: us) across input, output, cache writes and cache reads; default global routing uses standard rates. The card omits this first-party multiplier because usage rows carry no inference-geography pricing dimension; partner-operated regional pricing is independent.",
       "card": {
         "default": {
           "base": {
@@ -671,7 +731,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Rechecked on 2026-11-18 at the source_url: Claude 4.6 and later, including this model, charge 1.1x for US-only inference (inference_geo: us) across input, output, cache writes and cache reads; default global routing uses standard rates. The card omits this first-party multiplier because usage rows carry no inference-geography pricing dimension; partner-operated regional pricing is independent.",
       "card": {
         "default": {
           "base": {
@@ -700,7 +760,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page publishes 8 input and 40 output, and says the cache multipliers apply on top, so its cache rates are derived (read 8 x 0.05, write 8 x 1.25, 1h write 8 x 2). Fast mode is not available with the Batch API and applies across the full context window. ",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). The fast tier is fast mode (the gateway records usage.speed 'fast' as the service tier): the page publishes 8 input and 40 output, and says the cache multipliers apply on top, so its cache rates are derived (read 8 x 0.05, write 8 x 1.25, 1h write 8 x 2). Fast mode is not available with the Batch API and applies across the full context window. Rechecked on 2026-11-18 at the source_url: Claude 4.6 and later, including this model, charge 1.1x for US-only inference (inference_geo: us) across input, output, cache writes and cache reads; default global routing uses standard rates. The card omits this first-party multiplier because usage rows carry no inference-geography pricing dimension; partner-operated regional pricing is independent.",
       "card": {
         "default": {
           "base": {
@@ -739,7 +799,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). ",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Rechecked on 2026-11-18 at the source_url: Claude 4.6 and later, including this model, charge 1.1x for US-only inference (inference_geo: us) across input, output, cache writes and cache reads; default global routing uses standard rates. The card omits this first-party multiplier because usage rows carry no inference-geography pricing dimension; partner-operated regional pricing is independent.",
       "card": {
         "default": {
           "base": {
@@ -768,7 +828,7 @@
       "aliases": [],
       "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Long context is a prompt over 100,000 tokens. The page: 'A request's prompt length counts all of its input tokens, including cache reads and cache writes.'",
+      "notes": "Source read on 2026-11-06 at the source_url. web_search 10000 is the page's '$10 USD per 1,000 searches' per 1M searches; the page prices search apart from tokens and states no per-tier difference, so every tier and band carries it. Batch cache rates are derived, not published: the page lists batch input and output only and states that the cache multipliers stack with the Batch API discount, so each is the batch input price times the model's multiplier (write 1.25x, 1h write 2x, read 0.1x; 0.05x on Opus 5.5 and Sonnet 5.5, 0.025x on Fable 5.1). Long context is a prompt over 100,000 tokens. The page: 'A request's prompt length counts all of its input tokens, including cache reads and cache writes.' Rechecked on 2026-11-18 at the source_url: Claude 4.6 and later, including this model, charge 1.1x for US-only inference (inference_geo: us) across input, output, cache writes and cache reads; default global routing uses standard rates. The card omits this first-party multiplier because usage rows carry no inference-geography pricing dimension; partner-operated regional pricing is independent. The 1.1x also applies to the higher token rates for prompts over 100,000 tokens.",
       "card": {
         "default": {
           "base": {
@@ -1213,7 +1273,7 @@
       ],
       "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. The list price recorded is the standard (off-peak) price, which applies at all times except the peak windows. Peak windows are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday, excluding Chinese public holidays; off-peak is half of peak. Peak prices: input 0.3, cache hit 0.006, output 1.2. Search and fetch ($0.75 per 1,000 requests) are not recorded. The page: the two legacy names are 'billed at the Flash price'.",
+      "notes": "Source read on 2026-11-06 at the source_url. The list price recorded is the standard (off-peak) price, which applies at all times except the peak windows. Peak windows are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday, excluding Chinese public holidays; off-peak is half of peak. Peak prices: input 0.3, cache hit 0.006, output 1.2. Rechecked on 2026-11-18 at the source_url: standalone Search API and Fetch API calls cost $0.75 per 1,000 successful requests and are outside this token card. Starting 2026-11-18 04:00 UTC (12:00 Beijing time), model-triggered server-side search and web fetch have no separate charge; only model tokens are billed. The page: the two legacy names are 'billed at the Flash price'.",
       "card": {
         "default": {
           "base": {
@@ -1229,7 +1289,7 @@
       "aliases": [],
       "source_url": "https://api-docs.deepseek.com/quick_start/pricing/",
       "as_of": "2026-11-06",
-      "notes": "Source read on 2026-11-06 at the source_url. The list price recorded is the standard (off-peak) price, which applies at all times except the peak windows. Peak windows are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday, excluding Chinese public holidays; off-peak is half of peak. Peak prices: input 1.32, cache hit 0.044, output 3.96. Search and fetch ($0.75 per 1,000 requests) are not recorded. ",
+      "notes": "Source read on 2026-11-06 at the source_url. The list price recorded is the standard (off-peak) price, which applies at all times except the peak windows. Peak windows are 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday, excluding Chinese public holidays; off-peak is half of peak. Peak prices: input 1.32, cache hit 0.044, output 3.96. Rechecked on 2026-11-18 at the source_url: standalone Search API and Fetch API calls cost $0.75 per 1,000 successful requests and are outside this token card. Starting 2026-11-18 04:00 UTC (12:00 Beijing time), model-triggered server-side search and web fetch have no separate charge; only model tokens are billed. ",
       "card": {
         "default": {
           "base": {

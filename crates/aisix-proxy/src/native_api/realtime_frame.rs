@@ -21,6 +21,7 @@ pub(crate) enum Kind {
     TranscriptionCompleted,
     ResponseCreate,
     ResponseDone,
+    Error,
     Other,
 }
 
@@ -41,6 +42,7 @@ impl Kind {
             "conversation.item.input_audio_transcription.completed" => Self::TranscriptionCompleted,
             "response.create" => Self::ResponseCreate,
             "response.done" => Self::ResponseDone,
+            "error" => Self::Error,
             _ => Self::Other,
         }
     }

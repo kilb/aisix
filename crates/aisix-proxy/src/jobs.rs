@@ -4722,6 +4722,12 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
         completion: u64,
         cached: u64,
         cache_write: Option<u64>,
+        // 分量只累加实际上报值；有缺口时是已知部分，不声称整片完整。
+        cache_write_30m: Option<u64>,
+        cache_write_12h: Option<u64>,
+        cache_write_split_incomplete: bool,
+        // 估值只使用逐行验证过的 12h 子集，不能让互补半报互相补全。
+        priced_cache_write_12h: u64,
         cache_missing: bool,
         reasoning: u64,
         modality: aisix_gateway::ModalityTokens,
@@ -4780,6 +4786,31 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
                     .unwrap_or(0)
                     .saturating_add(u64::from(write)),
             );
+        }
+        let split_reported =
+            stats.cache_write_30m_tokens.is_some() || stats.cache_write_12h_tokens.is_some();
+        let twelve_hour = stats.cache_write_tokens.and_then(|total| {
+            aisix_core::twelve_hour_cache_writes(
+                u64::from(total),
+                stats.cache_write_30m_tokens,
+                stats.cache_write_12h_tokens,
+            )
+        });
+        agg.cache_write_split_incomplete |= if split_reported {
+            twelve_hour.is_none()
+        } else {
+            stats.cache_write_tokens != Some(0)
+        };
+        agg.priced_cache_write_12h = agg
+            .priced_cache_write_12h
+            .saturating_add(twelve_hour.unwrap_or(0));
+        for (sum, reported) in [
+            (&mut agg.cache_write_30m, stats.cache_write_30m_tokens),
+            (&mut agg.cache_write_12h, stats.cache_write_12h_tokens),
+        ] {
+            if let Some(tokens) = reported {
+                *sum = Some(sum.unwrap_or(0).saturating_add(u64::from(tokens)));
+            }
         }
         agg.reasoning = agg
             .reasoning
@@ -4867,14 +4898,14 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     let slice_cost_usd = |agg: &Agg| {
         cost.map(|c| {
             c.calculate_with_cache(
-                // OpenAI-shaped lines: no cache creation, so no write-lifetime split.
                 crate::usage_attr::input_tokens_for_pricing(
                     agg.prompt,
                     agg.cached,
                     agg.cache_write.unwrap_or(0),
                     0,
                     0,
-                ),
+                )
+                .with_twelve_hour_writes(agg.priced_cache_write_12h),
                 agg.completion,
             )
         })
@@ -4882,6 +4913,20 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
     };
     for (idx, (provider_model, agg)) in per_model.iter().enumerate() {
         let request_id = batch_attribution_request_id(raw_batch_id, idx, multi);
+        let split_reported = agg.cache_write_30m.is_some() || agg.cache_write_12h.is_some();
+        // 旧事件的总计数仍受 u32 wire 限制；拆分不能截断成看似精确的值。
+        // 任一定价计数超出 wire 容量，正式计费必须拒绝，估值仍使用上面的 u64。
+        let exceeds_wire = [
+            agg.prompt,
+            agg.completion,
+            agg.cached,
+            agg.cache_write.unwrap_or(0),
+            agg.cache_write_30m.unwrap_or(0),
+            agg.cache_write_12h.unwrap_or(0),
+            agg.reasoning,
+        ]
+        .into_iter()
+        .any(|n| n > u64::from(u32::MAX));
         let mut event = UsageEvent {
             // NO-GUARDRAIL-CHAIN: a retroactive billing row for work the
             // provider did inside a batch. There is no request here, so no
@@ -4908,6 +4953,11 @@ async fn attribute_batch_usage(job: &BatchAttribution) -> Result<(), String> {
             total_tokens: agg.total.recorded(),
             cached_prompt_tokens: agg.cached.min(u32::MAX as u64) as u32,
             cache_write_tokens: agg.cache_write.map(|n| n.min(u32::MAX as u64) as u32),
+            cache_write_30m_tokens: agg.cache_write_30m.and_then(|n| u32::try_from(n).ok()),
+            cache_write_12h_tokens: agg.cache_write_12h.and_then(|n| u32::try_from(n).ok()),
+            cache_write_split_incomplete: (split_reported
+                && (agg.cache_write_split_incomplete || exceeds_wire))
+                .then_some(true),
             cache_usage_reported: Some(!agg.cache_missing),
             reasoning_tokens: agg.reasoning.min(u32::MAX as u64) as u32,
             modality_tokens: agg.modality,

@@ -155,21 +155,28 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
   }
   const open = rows?.find((m) => m.id === selected) ?? null;
   if (open) {
+    const state = pricing?.states.get(open.id);
     return (
-      <PublicModelDetail
-        model={open}
-        baselinePrices={prices?.get(open.id) ?? null}
-        writeGate={writeGate}
-        canEdit={canEdit}
-        onBack={() => select(null)}
-        onChanged={async () => { await load(); }}
-        loadError={error}
-        routingEditor={renderRouting?.(open, load, () => select(null), (model) => {
-          // 写入响应先于重读应用，旧的并发读取不能回退刚保存的目标与设置。
-          latest.current++;
-          setRows((previous) => previous?.map((row) => row.id === model.id ? model : row) ?? previous);
-        })}
-      />
+      <>
+        {state && state.kind !== "priced" && <div className="note warn" role="status" aria-label="模型定价提示">
+          <strong>未定价：{unpricedReason(state)}</strong>。请设置基准价与分组换算率，生成 CNY 售价；未补齐前，已产生的用量会保留为未定价记录，需要重新计价才能补记费用。
+          <Button type="button" onClick={() => onGoto("pricing", "baselines")}>前往价格设置</Button>
+        </div>}
+        <PublicModelDetail
+          model={open}
+          baselinePrices={prices?.get(open.id) ?? null}
+          writeGate={writeGate}
+          canEdit={canEdit}
+          onBack={() => select(null)}
+          onChanged={async () => { await load(); }}
+          loadError={error}
+          routingEditor={renderRouting?.(open, load, () => select(null), (model) => {
+            // 写入响应先于重读应用，旧的并发读取不能回退刚保存的目标与设置。
+            latest.current++;
+            setRows((previous) => previous?.map((row) => row.id === model.id ? model : row) ?? previous);
+          })}
+        />
+      </>
     );
   }
 
@@ -285,7 +292,7 @@ export function PublicModels({ canEdit, onGoto, initialSection, sectionVisit, re
         </dl>
         <p className="text-caption text-fg-3">{rows && live ? `全部 ${rows.length.toLocaleString("zh-CN")} 个 · 已停用 ${(rows.length - live.length).toLocaleString("zh-CN")} 个。` : "统计来自完整公共模型列表。"}无可用账号时请求会以 503 失败，进入模型详情可核对路由与账号映射。</p>
       </section>
-      <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="设置租户调用的模型名称。创建后，在路由中添加服务账号。" busy={creating || writeGate.busy}>
+      <FormDialog open={createOpen} onOpenChange={setCreateOpen} title="新建公共模型" description="设置租户调用的模型名称。创建后添加服务账号，并设置基准价与分组换算率以生成 CNY 售价；可以稍后定价，未补齐前用量会保留为未定价记录。" busy={creating || writeGate.busy}>
               <form ref={form} aria-label="新建公共模型" onSubmit={(e) => void create(e)}>
                 <FormGrid>
                   <Field label="名称" error={nameRefusal}>

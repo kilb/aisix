@@ -670,6 +670,8 @@ fn terminal_usage(
         cached_prompt_tokens: stats.cached_prompt_tokens,
         cache_usage_reported: Some(stats.cache_usage_reported().unwrap_or(false)),
         cache_write_tokens: stats.cache_write_tokens,
+        cache_write_30m_tokens: stats.cache_write_30m_tokens,
+        cache_write_12h_tokens: stats.cache_write_12h_tokens,
         cache_creation_tokens: stats.cache_creation_tokens,
         cache_read_tokens: stats.cache_read_tokens,
         cache_creation_5m_tokens: stats.cache_creation_ttl.cache_creation_5m_tokens,

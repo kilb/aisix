@@ -95,6 +95,7 @@ struct GatewayPrice {
     cache_read: Option<u64>,
     cache_write: Option<u64>,
     cache_write_1h: Option<u64>,
+    cache_write_12h: Option<u64>,
 }
 
 impl GatewayPrice {
@@ -107,6 +108,7 @@ impl GatewayPrice {
             cached_input_per_1k: self.cache_read.map(per_1k),
             cache_write_per_1k: self.cache_write.map(per_1k),
             cache_write_1h_per_1k: self.cache_write_1h.map(per_1k),
+            cache_write_12h_per_1k: self.cache_write_12h.map(per_1k),
         }
     }
 
@@ -118,6 +120,7 @@ impl GatewayPrice {
             cache_read: self.cache_read.map(Rate),
             cache_write: self.cache_write.map(Rate),
             cache_write_1h: self.cache_write_1h.map(Rate),
+            cache_write_12h: self.cache_write_12h.map(Rate),
             reasoning: None,
             audio_input: None,
             audio_output: None,
@@ -135,6 +138,8 @@ struct GatewayUsage {
     prompt: u32,
     cached: u32,
     write_subset: Option<u32>,
+    write_30m: Option<u32>,
+    write_12h: Option<u32>,
     cache_read: u32,
     creation: u32,
     ttl: CacheCreationTtl,
@@ -166,7 +171,15 @@ fn gateway_spend(g: &GatewayUsage, p: &GatewayPrice) -> u64 {
         u64::from(g.cache_read),
         u64::from(g.creation),
     )
-    .with_one_hour_writes(one_hour.unwrap_or(0));
+    .with_one_hour_writes(one_hour.unwrap_or(0))
+    .with_twelve_hour_writes(
+        aisix_core::twelve_hour_cache_writes(
+            u64::from(g.write_subset.unwrap_or(0)),
+            g.write_30m,
+            g.write_12h,
+        )
+        .unwrap_or(0),
+    );
     spend_micro_usd(
         p.model_cost()
             .calculate_with_cache(input, u64::from(g.completion_folded)),
@@ -197,6 +210,8 @@ fn usage_event(g: &GatewayUsage, cache_status: &str) -> UsageEvent {
         total_tokens: g.upstream_total,
         cached_prompt_tokens: g.cached,
         cache_write_tokens: g.write_subset,
+        cache_write_30m_tokens: g.write_30m,
+        cache_write_12h_tokens: g.write_12h,
         cache_read_tokens: g.cache_read,
         cache_creation_tokens: g.creation,
         cache_creation_ttl: g.ttl,
@@ -216,6 +231,7 @@ fn book(rates: Rates) -> PriceBook {
             TierRates {
                 base: rates,
                 long_context: vec![],
+                unpriced_above_input_tokens: None,
             },
         )]
         .into(),
@@ -401,7 +417,7 @@ prop_compose! {
         cache_write in option::of(0..=MAX_RATE),
         cache_write_1h in option::of(0..=MAX_RATE),
     ) -> GatewayPrice {
-        GatewayPrice { input, output, cache_read, cache_write, cache_write_1h }
+        GatewayPrice { input, output, cache_read, cache_write, cache_write_1h, cache_write_12h: None }
     }
 }
 
@@ -432,6 +448,7 @@ const LIST: GatewayPrice = GatewayPrice {
     cache_read: Some(100_000),
     cache_write: Some(1_250_000),
     cache_write_1h: None,
+    cache_write_12h: None,
 };
 
 /// 500 fresh + 300 read × 0.1 + 200 written × 1.25 + 500 out × 2
@@ -587,4 +604,25 @@ fn reasoning_that_meets_the_additive_identity_is_billed_beside() {
     );
     assert_eq!(charge(&priced), 200);
     assert_eq!(gateway_spend(&g, &LIST), 140);
+}
+
+#[test]
+fn mixed_twelve_hour_writes_are_priced_alike_without_inflating_the_prompt() {
+    let list = GatewayPrice {
+        cache_write_12h: Some(2_500_000),
+        ..LIST
+    };
+    let g = GatewayUsage {
+        prompt: 12_000,
+        cached: 4_000,
+        write_subset: Some(7_000),
+        write_30m: Some(3_000),
+        write_12h: Some(4_000),
+        ..GatewayUsage::default()
+    };
+    assert_eq!(gateway_spend(&g, &list), 15_150);
+    assert_eq!(
+        charge(&engine_price(&book_for(&list), &usage_event(&g, "miss")).unwrap()),
+        15_150
+    );
 }

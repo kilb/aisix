@@ -1,5 +1,5 @@
 import { useRecordTable } from "../../lib/recordTable";
-import { RecordTools, RecordPager } from "../../components/RecordTools";
+import { RecordPager } from "../../components/RecordTools";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TabProps } from "../../App";
 import { charges, tenants as tenantsApi, type AdminKey, type Charge, type ChargeFilter, type Tenant } from "../../lib/api";
@@ -26,6 +26,7 @@ import { UsageIoAuditDetails, UsageTokenEstimate } from "../../components/UsageI
 import { UsageRecordFilters } from "../../components/UsageRecordFilters";
 import { usageRecordFilterValues } from "../../lib/usageRecordFilters";
 import "./Charges.css";
+import "../../components/CallRecordSearch.css";
 import { Select } from "../../ui/Select";
 
 const STATUSES: [string, string][] = [
@@ -158,7 +159,7 @@ export function Charges(_props: TabProps) {
           <Button className="charge-icon-button" aria-label="刷新" title="刷新" type="button" icon="refresh" onClick={() => void loadFirst(filter)}></Button>
         }
       />
-      <div className="call-record-layout" data-loading={resultsLoading}>
+      <div className="call-record-layout charge-call-layout" data-loading={resultsLoading}>
         <section className="charge-filter-controls call-filter-card sticky-filters" aria-label="调用记录筛选">
         <UsageRecordFilters scope="admin" value={usageRecordFilterValues(query)} onChange={patch => update(patch)} advancedChildren={<ChargeScopeFilters key={JSON.stringify([filter.from, filter.to, filter.member_id, filter.provider_key_id, filter.request_id, filter.model_id])} filter={filter} onChange={set} />}>
           <label><span>状态</span>
@@ -184,6 +185,9 @@ export function Charges(_props: TabProps) {
             <label><span>事件</span><input value={eventDraft} onChange={event => setEventDraft(event.target.value)} placeholder="事件编号" /></label>
             <Button type="submit" size="sm">查找</Button>
           </form>
+          <label className="call-record-search"><span>搜索已加载调用</span>
+            <input type="search" autoComplete="off" value={table.query} onChange={event => table.setQuery(event.target.value)} placeholder="在已加载记录中搜索" />
+          </label>
         </UsageRecordFilters>
         {(filter.from || filter.to || filter.member_id || filter.provider_key_id || filter.request_id || filter.exclude_status) && <p className="charge-scope-summary" role="status">当前已应用范围条件：{[filter.exclude_status === "nothing_to_bill" ? "隐藏无需计费" : null, filter.from ? "开始 " + fmtBeijing(filter.from) : null, filter.to ? "结束 " + fmtBeijing(filter.to) + "（不含）" : null, filter.member_id ? "成员 " + filter.member_id : null, filter.provider_key_id ? "上游账号 " + filter.provider_key_id : null, filter.request_id ? "请求 " + filter.request_id : null].filter(Boolean).join("；")}</p>}
         {linked.length > 0 && (
@@ -210,7 +214,7 @@ export function Charges(_props: TabProps) {
         {rows !== null && rows.length === 0 && <EmptyState text="没有符合条件的计费记录。" />}
         {rows !== null && rows.length > 0 && (
           <>
-            <RecordTools table={table} label="计费明细" loaded></RecordTools>
+            {table.filteredCount === 0 && <p className="hint" role="status">没有匹配的已加载记录；可继续读取更早记录。</p>}
             <DataTable label="计费明细" className="charge-records" tableClassName="charge-records-table">
               <colgroup><col className="charge-col-time" /><col className="charge-col-type" /><col className="charge-col-identity" /><col className="charge-col-status" /><col className="charge-col-money" /><col className="charge-col-service" /><col className="charge-col-performance" /><col className="charge-col-tokens" /><col className="charge-col-action" /></colgroup>
               <thead>

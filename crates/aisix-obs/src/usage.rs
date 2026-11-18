@@ -261,6 +261,14 @@ pub struct UsageEvent {
     /// Raw OpenAI cache-write count; it is not additive to prompt tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u32>,
+    /// 上游写入总量的生命周期子集；明确零保留，缺失省略，不增加总用量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_30m_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_12h_tokens: Option<u32>,
+    /// 网关聚合不能证明完整拆分时置 true；不是上游 token 计数，正式计费必须拒价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_split_incomplete: Option<bool>,
 
     /// Reasoning tokens as the upstream reported them. A subset of
     /// `completion_tokens` for OpenAI-shape upstreams; Gemini may report

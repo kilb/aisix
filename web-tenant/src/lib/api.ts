@@ -260,6 +260,8 @@ export interface TenantKey {
   prefix: string;
   /** The member the key belongs to; null for a key of the organisation as a whole. */
   owner: { id: string; display_name: string | null } | null;
+  /** 创建者独立于归属；平台创建者不返回操作员身份。 */
+  created_by?: { kind: string; id: string | null; display_name: string | null };
   /** The models selected from the grants; null follows every grant. */
   model_ids: string[] | null;
   /** The group the key routes to, fixed when it was created; null for a key an older release left without one. */
@@ -429,6 +431,7 @@ export interface PricedModel {
   cache_read_per_million?: string;
   cache_write_per_million?: string;
   cache_write_1h_per_million?: string;
+  cache_write_12h_per_million?: string;
 }
 
 /**

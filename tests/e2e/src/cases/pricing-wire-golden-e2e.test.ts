@@ -72,6 +72,7 @@ const COST = {
   cached_input_per_1k: 0.0001,
   cache_write_per_1k: 0.00125,
   cache_write_1h_per_1k: 0.002,
+  cache_write_12h_per_1k: 0.0025,
 };
 
 type Provider = "openai" | "anthropic" | "google" | "bedrock";
@@ -81,6 +82,7 @@ const NATIVE = {
   "openai-chat": { provider: "openai", upstreamModel: "gpt-5-mini" },
   "openai-responses": { provider: "openai", upstreamModel: "gpt-5" },
   "openai-cache-write": { provider: "openai", upstreamModel: "gpt-5.1" },
+  "openai-cache-write-mixed-ttl": { provider: "openai", upstreamModel: "gpt-5.6" },
   "openai-embeddings": { provider: "openai", upstreamModel: "text-embedding-3-small" },
   "anthropic-messages": { provider: "anthropic", upstreamModel: "claude-sonnet-4-5-20250929" },
   "anthropic-count-tokens": { provider: "anthropic", upstreamModel: "claude-haiku-4-5-20251001" },
@@ -147,6 +149,18 @@ const FAMILIES: Family[] = [
     native: "openai-cache-write",
     path: "/v1/chat/completions",
     body: chat("openai-cache-write"),
+  },
+  {
+    name: "openai-cache-write-mixed-ttl",
+    native: "openai-cache-write-mixed-ttl",
+    path: "/v1/responses",
+    body: responses("openai-cache-write-mixed-ttl"),
+  },
+  {
+    name: "openai-cache-write-mixed-ttl-stream",
+    native: "openai-cache-write-mixed-ttl",
+    path: "/v1/responses",
+    body: responses("openai-cache-write-mixed-ttl", true),
   },
   {
     name: "anthropic-messages",
@@ -221,6 +235,8 @@ const BILLABLE_KEYS = [
   "completion_tokens",
   "cached_prompt_tokens",
   "cache_write_tokens",
+  "cache_write_30m_tokens",
+  "cache_write_12h_tokens",
   "reasoning_tokens",
   "total_tokens",
   "cache_creation_tokens",
@@ -307,6 +323,19 @@ function openAiChatStream(model: unknown): string {
     .join("");
 }
 
+// 官方文档中的混合生命周期样本，两个拆分之和等于写入总量。
+const OPENAI_MIXED_TTL_USAGE = {
+  input_tokens: 12000,
+  input_tokens_details: {
+    cached_tokens: 4000,
+    cache_write_tokens: 7000,
+    cache_write_tokens_details: { ttl_30m_tokens: 3000, ttl_12h_tokens: 4000 },
+  },
+  output_tokens: 100,
+  output_tokens_details: { reasoning_tokens: 0 },
+  total_tokens: 12100,
+};
+
 function openAiResponse(model: unknown, status: "in_progress" | "completed"): Record<string, unknown> {
   return {
     id: "resp_golden",
@@ -328,7 +357,7 @@ function openAiResponse(model: unknown, status: "in_progress" | "completed"): Re
         : [],
     usage:
       status === "completed"
-        ? {
+        ? model === NATIVE["openai-cache-write-mixed-ttl"].upstreamModel ? OPENAI_MIXED_TTL_USAGE : {
             input_tokens: 2000,
             input_tokens_details: { cached_tokens: 1500 },
             output_tokens: 300,
@@ -697,6 +726,19 @@ describe("pricing goldens: the usage rows a real gateway sends, one per provider
       total_tokens: 1100,
       service_tier: "default",
     });
+    for (const family of ["openai-cache-write-mixed-ttl", "openai-cache-write-mixed-ttl-stream"]) {
+      expectUsage(family, {
+        prompt_tokens: 12000,
+        cached_prompt_tokens: 4000,
+        cache_write_tokens: 7000,
+        cache_write_30m_tokens: 3000,
+        cache_write_12h_tokens: 4000,
+        completion_tokens: 100,
+        total_tokens: 12100,
+      });
+      // 金额按正式 micro-USD 整数合同精确比较，避免 f64 的二进制末位差异。
+      expect(Math.round(Number(row(family).cost_usd) * 1_000_000), family).toBe(15350);
+    }
     expectUsage("anthropic-messages", {
       prompt_tokens: 37,
       cache_read_tokens: 9,
@@ -762,6 +804,7 @@ describe("pricing goldens: the usage rows a real gateway sends, one per provider
     for (const [other, native] of [
       ["openai-chat-stream", "openai-chat"],
       ["openai-responses-stream", "openai-responses"],
+      ["openai-cache-write-mixed-ttl-stream", "openai-cache-write-mixed-ttl"],
       ["anthropic-messages-stream", "anthropic-messages"],
       ["openai-via-messages", "openai-chat"],
       ["anthropic-via-chat", "anthropic-messages"],

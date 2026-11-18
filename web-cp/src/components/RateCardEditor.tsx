@@ -21,6 +21,7 @@ const RATES: { dimension: string; label: string; group: string }[] = [
   { dimension: "cache_read", group: "缓存", label: "缓存读" },
   { dimension: "cache_write", group: "缓存", label: "缓存写" },
   { dimension: "cache_write_1h", group: "缓存", label: "1 小时缓存写" },
+  { dimension: "cache_write_12h", group: "缓存", label: "12 小时缓存写" },
   { dimension: "reasoning", group: "文本与推理", label: "推理" },
   { dimension: "web_search", group: "联网", label: "联网搜索（每千次）" },
 ];
@@ -143,6 +144,7 @@ export function RateCardEditor({
     const at = `/card/${segment(tier)}`;
     placed.add(at);
     placed.add(`${at}/long_context`);
+    placed.add(`${at}/unpriced_above_input_tokens`);
     for (const r of RATES) placed.add(`${at}/base/${r.dimension}`);
     bandsOf(card[tier]).forEach((_, n) => {
       placed.add(`${at}/long_context/${n}/above_input_tokens`);
@@ -346,6 +348,15 @@ export function RateCardEditor({
                     setTier(tier, { ...t, base: withRate(t.base ?? {}, dimension, rate) }),
                   )}
                 </div>
+                {tier !== "default" && <div className="mt-4"><Field label="超过此输入量时无公布价格（tokens）" hint="仅公布短上下文价格时填写；须等于标准档首个长上下文门槛，并移除本档长上下文价格。留空表示未设置。" error={at(`${path}/unpriced_above_input_tokens`)}>
+                  {(aria) => <input {...aria} inputMode="numeric" autoComplete="off" value={String(t.unpriced_above_input_tokens ?? "")} onChange={(e) => {
+                    const typed = e.target.value.trim();
+                    const next = { ...t };
+                    if (typed === "") delete next.unpriced_above_input_tokens;
+                    else next.unpriced_above_input_tokens = /^\d+$/.test(typed) && Number.isSafeInteger(Number(typed)) ? Number(typed) : typed;
+                    setTier(tier, next);
+                  }} />}
+                </Field></div>}
                 {bandsProblem && (
                   <div className="note crit" role="alert">
                     {bandsProblem}

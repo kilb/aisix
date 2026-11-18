@@ -7,12 +7,13 @@ use serde_json::{json, Value};
 use support::world::{deliver, price, seed_key, seed_model, tokens_680, usage, world};
 use uuid::Uuid;
 
-const TIMING_FIELDS: [&str; 6] = [
+const TIMING_FIELDS: [&str; 7] = [
     "http_send_started_ms",
     "response_headers_ms",
     "first_response_byte_ms",
     "first_protocol_frame_ms",
     "first_canonical_chunk_ms",
+    "upstream_first_content_ms",
     "first_content_ms",
 ];
 
@@ -36,7 +37,8 @@ async fn measured_zero_partial_and_unknown_offsets_survive_intake_and_scoped_cal
     let viewer = w.cp.admin_login_seeded(OperatorRole::Viewer).await;
     let full = json!({
         "http_send_started_ms":13,"response_headers_ms":17,"first_response_byte_ms":19,
-        "first_protocol_frame_ms":23,"first_canonical_chunk_ms":29,"first_content_ms":31
+        "first_protocol_frame_ms":23,"first_canonical_chunk_ms":29,
+        "upstream_first_content_ms":25,"first_content_ms":31
     });
     let cases = [
         ("timing-full", Some(full)),
@@ -44,7 +46,8 @@ async fn measured_zero_partial_and_unknown_offsets_survive_intake_and_scoped_cal
             "timing-zero",
             Some(json!({
                 "http_send_started_ms":0,"response_headers_ms":0,"first_response_byte_ms":0,
-                "first_protocol_frame_ms":0,"first_canonical_chunk_ms":0,"first_content_ms":0
+                "first_protocol_frame_ms":0,"first_canonical_chunk_ms":0,
+                "upstream_first_content_ms":0,"first_content_ms":0
             })),
         ),
         (
@@ -226,7 +229,7 @@ async fn invalid_timing_never_refuses_charges_and_unknown_keys_do_not_reach_tena
         assert_eq!(response.status, 200, "{response:?}");
         assert!(
             !response.body.to_string().contains("timing-private-fixture"),
-            "可选时间线只投影六个公开时间点"
+            "可选时间线只投影公开时间点"
         );
         for (id, _) in &cases {
             let row = item(&response.body, id);
@@ -276,13 +279,14 @@ async fn the_public_dp_usage_event_wire_reaches_both_call_views_with_optional_of
             first_response_byte_ms: Some(5),
             first_protocol_frame_ms: None,
             first_canonical_chunk_ms: Some(8),
+            upstream_first_content_ms: Some(6),
             first_content_ms: Some(11),
         }),
         ..Default::default()
     };
     let expected = json!({
         "http_send_started_ms":0,"response_headers_ms":3,"first_response_byte_ms":5,
-        "first_canonical_chunk_ms":8,"first_content_ms":11
+        "first_canonical_chunk_ms":8,"upstream_first_content_ms":6,"first_content_ms":11
     });
     let wire = serde_json::to_value(event).expect("正式 UsageEvent 序列化");
     assert_eq!(wire.get("upstream_timing"), Some(&expected));

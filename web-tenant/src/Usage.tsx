@@ -35,6 +35,7 @@ import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRec
 import { formatCount } from "./lib/chartFormat";
 import { CallLogDrawer } from "./CallLogDrawer";
 import "./UsageAnalytics.css";
+import "./components/CallRecordSearch.css";
 
 function failure(e: unknown): string {
   return e instanceof ApiError ? messageFor(e) : String(e);
@@ -46,7 +47,7 @@ const DIMENSION_LABEL: Record<string, string> = {
   output: "输出",
   cache_read: "缓存读",
   cache_write: "缓存写",
-  cache_write_1h: "1 小时缓存写",
+  cache_write_1h: "1 小时缓存写", cache_write_12h: "12 小时缓存写",
   reasoning: "推理",
   audio_input: "音频输入",
   audio_output: "音频输出",
@@ -739,9 +740,9 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         <Field label="请求 ID">
           <input autoComplete="off" value={typed} onChange={(e) => { setTyped(e.target.value); setRequestEditing(true); }} />
         </Field>
-        <Field label="搜索已加载调用">
+        <label className="call-record-search"><span>搜索已加载调用</span>
           <input type="search" value={searchQuery} onChange={event => update({ q: event.target.value })} placeholder="模型、密钥、成员或请求 ID" />
-        </Field>
+        </label>
       </UsageRecordFilters>
       <Section ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} title="调用记录" number={8} className="usage-calls-section call-table-card">
       {query.get("member_id") && <p className="hint" role="status">已按成员 {query.get("member_id")} 筛选。</p>}

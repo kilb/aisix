@@ -7,7 +7,7 @@ import "./Members.css";
 
 const QUANTITY_LABEL: Record<string, string> = {
   input: "输入", output: "输出", cache_read: "缓存读", cache_write: "缓存写",
-  cache_write_1h: "1 小时缓存写", reasoning: "推理", audio_input: "音频输入",
+  cache_write_1h: "1 小时缓存写", cache_write_12h: "12 小时缓存写", reasoning: "推理", audio_input: "音频输入",
   audio_output: "音频输出", image_input: "图片输入", image_output: "图片输出", web_search: "联网搜索",
 };
 

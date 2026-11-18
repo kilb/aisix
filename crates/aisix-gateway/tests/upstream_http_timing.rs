@@ -126,6 +126,7 @@ async fn independent_http_phases_follow_real_delivery_and_keep_the_first_sample(
     assert_eq!(at_headers.first_response_byte_ms, None);
     assert_eq!(at_headers.first_protocol_frame_ms, None);
     assert_eq!(at_headers.first_canonical_chunk_ms, None);
+    assert_eq!(at_headers.upstream_first_content_ms, None);
     assert_eq!(at_headers.first_content_ms, None);
 
     tokio::time::sleep(GAP).await;
@@ -138,6 +139,7 @@ async fn independent_http_phases_follow_real_delivery_and_keep_the_first_sample(
         partial.first_protocol_frame_ms, None,
         "an incomplete frame is not a frame"
     );
+    assert_eq!(partial.upstream_first_content_ms, None);
 
     tokio::time::sleep(GAP).await;
     server.body.send(REST.to_vec())?;
@@ -145,6 +147,11 @@ async fn independent_http_phases_follow_real_delivery_and_keep_the_first_sample(
     let framed = snapshot(&observer)?;
     let frame = measured(framed.first_protocol_frame_ms, "protocol frame")?;
     assert!(frame >= byte + 50);
+    let raw_content = serde_json::to_value(framed)?
+        .get("upstream_first_content_ms")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or("missing raw upstream content clock")?;
+    assert!(raw_content >= u64::from(frame));
     assert_eq!(framed.first_canonical_chunk_ms, None);
     assert_eq!(framed.first_content_ms, None);
 
@@ -196,6 +203,184 @@ async fn unterminated_protocol_frame_keeps_raw_frame_unknown() -> TestResult {
     assert_eq!(timing.first_content_ms, None);
     drop(server.body);
     server.task.await??;
+    Ok(())
+}
+
+// 元数据、空内容、错误、未闭合或坏 JSON 不能伪造上游首内容；已生成正文可在多种帧载体出现。
+#[tokio::test]
+async fn raw_content_requires_a_complete_valid_nonempty_generated_event() -> TestResult {
+    let cases = [
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"role":"assistant","content":""}}]}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"reasoning_content":"x"}}]}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"function_call":{"arguments":"{}"}}}]}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Completions,
+            r#"{"choices":[{"text":"x"}]}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Messages,
+            r#"{"type":"message_start","message":{"content":[]}}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Messages,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","input":{}}}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Messages,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Messages,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"x"}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Messages,
+            r#"{"type":"error","error":{"message":"not content"}}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.created","response":{"output":[]}}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.output_text.delta","delta":"x"}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.output_text.done","text":"x"}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.content_part.added","part":{"type":"output_text","text":"x"}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","arguments":"{}"}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"x"}]}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.code_interpreter_call_code.delta","delta":"x"}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.code_interpreter_call_code.done","code":"x"}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.mcp_call_arguments.done","arguments":"{}"}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"x"}]}]}}"#,
+            true,
+            true,
+        ),
+        (
+            Protocol::Responses,
+            r#"{"type":"error","delta":"not content"}"#,
+            true,
+            false,
+        ),
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"content":"x"}}]}"#,
+            false,
+            false,
+        ),
+        (
+            Protocol::Chat,
+            r#"{"choices":[{"delta":{"content":"x"}}]} trailing"#,
+            true,
+            false,
+        ),
+    ];
+    futures::future::try_join_all(cases.into_iter().map(
+        |(protocol, json, complete, expected)| async move {
+            let body = format!("data: {json}{}", if complete { "\n\n" } else { "" });
+            let server = server(Some(headers(body.len())), Duration::ZERO).await?;
+            let tap = tap();
+            tap.begin_attempt(Instant::now());
+            let response = response_tap::scope(Arc::clone(&tap), async {
+                let response = upstream_io::send(client()?.get(&server.url), protocol).await?;
+                TestResult::Ok(response)
+            })
+            .await?;
+            let observer = timing(&tap)?;
+            server.body.send(body.clone().into_bytes())?;
+            assert_eq!(response.bytes().await?.as_ref(), body.as_bytes());
+            let wire = serde_json::to_value(snapshot(&observer)?)?;
+            assert_eq!(
+                wire.get("upstream_first_content_ms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
+                expected,
+                "{protocol:?}: {body}: {wire}"
+            );
+            assert!(
+                wire.get("first_content_ms").is_none(),
+                "upstream consumption must not invent downstream delivery"
+            );
+            drop(server.body);
+            server.task.await??;
+            TestResult::Ok(())
+        },
+    ))
+    .await?;
     Ok(())
 }
 
@@ -343,6 +528,7 @@ fn measured_zero_survives_json_while_unknown_stages_remain_optional() -> TestRes
         first_response_byte_ms: None,
         first_protocol_frame_ms: None,
         first_canonical_chunk_ms: None,
+        upstream_first_content_ms: None,
         first_content_ms: None,
     };
     let wire = serde_json::to_value(timing)?;

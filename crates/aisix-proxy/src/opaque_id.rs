@@ -782,7 +782,20 @@ pub(crate) const RESPONSE_BODY: &[Retain<'static>] = &[
     },
     Retain {
         path: &["usage", "input_tokens_details"],
-        keep: |k| matches!(k, "cached_tokens" | "cache_write_tokens"),
+        keep: |k| {
+            matches!(
+                k,
+                "cached_tokens" | "cache_write_tokens" | "cache_write_tokens_details"
+            )
+        },
+    },
+    Retain {
+        path: &[
+            "usage",
+            "input_tokens_details",
+            "cache_write_tokens_details",
+        ],
+        keep: |k| matches!(k, "ttl_30m_tokens" | "ttl_12h_tokens"),
     },
     Retain {
         path: &["usage", "output_tokens_details"],
@@ -1654,5 +1667,20 @@ pub(crate) mod tests {
         let mut sent = body(&ci, &sh);
         unseal_responses_input(&platform, "team:team-a", &mut sent);
         assert_eq!(sent["input"][1]["container_id"], ci.as_str());
+    }
+}
+
+#[cfg(test)]
+mod cache_write_split_12h_platform_tests {
+    use super::*;
+
+    #[test]
+    fn cache_write_split_12h_platform_keeps_documented_lifetime_counts() {
+        let mut body = serde_json::json!({"usage":{"input_tokens":12000,"input_tokens_details":{"cached_tokens":4000,"cache_write_tokens":7000,"cache_write_tokens_details":{"ttl_30m_tokens":3000,"ttl_12h_tokens":4000,"private_slot":"hidden"}}}});
+        retain_value(&mut body, RESPONSE_BODY);
+        assert_eq!(
+            body["usage"]["input_tokens_details"]["cache_write_tokens_details"],
+            serde_json::json!({"ttl_30m_tokens":3000,"ttl_12h_tokens":4000})
+        );
     }
 }

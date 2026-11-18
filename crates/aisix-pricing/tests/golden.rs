@@ -42,6 +42,8 @@ const EXPECTED: &[(&str, &str, i64)] = &[
     ("openai-responses", "charged", 1250), // 500 + 150 + 600
     ("openai-responses-stream", "charged", 1250),
     ("openai-cache-write", "charged", 980), // 500 + 300×0.1 + 200×1.25 + 100×2
+    ("openai-cache-write-mixed-ttl", "charged", 15350), // 1000 + 4000×0.1 + 3000×1.25 + 4000×2.5 + 100×2
+    ("openai-cache-write-mixed-ttl-stream", "charged", 15350),
     ("anthropic-messages", "charged", 20150), // 37 + 0.9 + 1.25 + 6 + 104 + 2×10000 = 20149.15, rounded up
     ("anthropic-messages-stream", "charged", 20150),
     ("anthropic-via-chat", "charged", 20150),
@@ -58,10 +60,12 @@ const EXPECTED: &[(&str, &str, i64)] = &[
 /// The families whose rows the gateway's `Model.cost` prices exactly as the
 /// engine does. Every other family is billed at a tier or a web search that
 /// `Model.cost` cannot express.
-const PRICED_ALIKE: [&str; 11] = [
+const PRICED_ALIKE: [&str; 13] = [
     "openai-responses",
     "openai-responses-stream",
     "openai-cache-write",
+    "openai-cache-write-mixed-ttl",
+    "openai-cache-write-mixed-ttl-stream",
     "gemini-chat",
     "gemini-cached",
     "gemini-no-total",
@@ -74,11 +78,12 @@ const PRICED_ALIKE: [&str; 11] = [
 
 /// The dimensions `Model.cost` has a rate for: input, cache read, cache
 /// write, the one-hour cache write, and output, which also prices reasoning.
-const MODEL_COST_DIMENSIONS: [Dimension; 6] = [
+const MODEL_COST_DIMENSIONS: [Dimension; 7] = [
     Dimension::Input,
     Dimension::CacheRead,
     Dimension::CacheWrite,
     Dimension::CacheWrite1h,
+    Dimension::CacheWrite12h,
     Dimension::Output,
     Dimension::Reasoning,
 ];

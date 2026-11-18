@@ -120,7 +120,7 @@ test("组织直接创建新账号并真实登录，重复邮箱不改变原密�
   }
 });
 
-test("完整组织价格含十一维、档位、长上下文和优惠，复制完整调用名", async ({ page, context }) => {
+test("完整组织价格含十二维、档位、长上下文和优惠，复制完整调用名", async ({ page, context }) => {
   const world = await seedRealWorld(stack);
   const model = await fullPriceModel(stack, world);
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
@@ -168,7 +168,7 @@ test("完整组织价格含十一维、档位、长上下文和优惠，复制�
     expect(card.long_context).toHaveLength(1);
     expect(card.long_context[0].above_input_tokens).toBe(200000);
     for (const [expected, rates] of [[base, card.base], [band, card.long_context[0].rates]] as const) {
-      expect(rates).toHaveLength(11);
+      expect(rates).toHaveLength(12);
       for (const rate of rates) {
         expect(rate.unit).toBe(rate.dimension === "web_search" ? "request" : "token");
         exactDiscount(rate.price_cny_per_million, expected[rate.dimension as keyof typeof expected]);

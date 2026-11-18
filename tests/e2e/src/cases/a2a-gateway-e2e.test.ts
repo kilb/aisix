@@ -34,6 +34,8 @@ import {
 
 const KEY_ALLOWED = "sk-a2a-e2e-allowed";
 const KEY_NO_AGENTS = "sk-a2a-e2e-no-agents";
+const KEY_CHAT_ONLY = "sk-a2a-e2e-chat-only";
+const KEY_A2A = "sk-a2a-e2e-explicit-a2a";
 
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 
@@ -152,16 +154,27 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
       key_hash: sha256(KEY_NO_AGENTS),
       allowed_models: [],
     });
+    await seed.createApiKey({
+      key_hash: sha256(KEY_CHAT_ONLY),
+      allowed_models: [],
+      allowed_agents: ["*"],
+      allowed_endpoints: ["chat_completions"],
+    });
+    await seed.createApiKey({
+      key_hash: sha256(KEY_A2A),
+      allowed_models: [],
+      allowed_agents: ["*"],
+      allowed_endpoints: ["a2a"],
+    });
+    const gateToken = `sk-a2a-e2e-gate-${randomUUID()}`;
+    await seed.createApiKey({ key_hash: sha256(gateToken), allowed_models: [] });
 
-    // The gate proves only that the seeded rows reached the DP snapshot, and
-    // deliberately asserts none of the behaviour under test: a 404 would mean
-    // the agent row has not landed, a 401 that the key row has not. Anything
-    // else — including a 403 or a 502 — means both are present, and any defect
-    // in discovery, the version header, the card rewrite or the ACL then fails
-    // its own test by name instead of surfacing as a 60s propagation timeout.
+    // 最后写入的密钥可用，证明此前资源已全部到达快照；不调用受测 A2A 路径。
     await waitConfigPropagation(async () => {
-      const probe = await call("/a2a/invoices", KEY_ALLOWED, messageSend("gate"));
-      return probe.status !== 404 && probe.status !== 401;
+      const probe = await fetch(`${app!.proxyUrl}/v1/models`, {
+        headers: { authorization: `Bearer ${gateToken}` },
+      });
+      return probe.status === 200;
     });
   }, 60_000);
 
@@ -362,6 +375,25 @@ describe("a2a gateway e2e: /a2a/{agent}", () => {
     expect(events.map((e) => e.result.seq)).toEqual([1, 2, 3]);
     expect(events.every((e) => e.id === "stream-ml")).toBe(true);
     expect(events[2].result.status.state).toBe("completed");
+  });
+
+  test("refuses endpoint-restricted A2A calls and cards before reaching the agent", async (ctx) => {
+    if (!etcdReachable || !app || !rootHosted) return ctx.skip();
+    rootHosted.requests.length = 0;
+
+    const denied = await call("/a2a/invoices", KEY_CHAT_ONLY, messageSend("family-denied"));
+    const deniedCard = await fetchCard("invoices", KEY_CHAT_ONLY);
+    expect(denied.status).toBe(403);
+    expect(deniedCard.status).toBe(403);
+    expect(rootHosted.requests).toHaveLength(0);
+
+    const allowedCard = await fetchCard("invoices", KEY_A2A);
+    const allowed = await call("/a2a/invoices", KEY_A2A, messageSend("family-allowed"));
+    expect(allowedCard.status).toBe(200);
+    expect(allowedCard.json?.name).toBeTruthy();
+    expect(allowed.status).toBe(200);
+    expect(allowed.json?.result?.sawMethod).toBe("message/send");
+    expect(rootHosted.requests.some((request) => request.httpMethod === "POST")).toBe(true);
   });
 
   test("gates on the per-agent ACL and on agent existence", async (ctx) => {

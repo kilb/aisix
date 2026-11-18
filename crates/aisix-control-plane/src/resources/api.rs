@@ -7,7 +7,8 @@
 //! managed_resource`). Replace and delete need `If-Match: "<version>"`.
 
 use aisix_core::models::schema::{resource_root_schema, RESOURCES};
-use axum::extract::{Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -168,15 +169,62 @@ pub async fn schema(
     Ok(Json(resource_root_schema(&resource, true)))
 }
 
-/// `GET /admin/resources/{kind}` → `{items: [ResourceView]}`, the live rows.
+#[derive(Deserialize)]
+pub struct ListQuery {
+    limit: Option<i64>,
+    before: Option<Uuid>,
+}
+
+/// 活跃资源保持名称与编号升序；显式分页每页最多 200 条。
+/// 不带分页参数的调用方仍可读取完整列表。
 pub async fn list(
     auth: OperatorAuth,
     State(state): State<AppState>,
     Path(kind): Path<String>,
+    query: Result<Query<ListQuery>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(OperatorRole::Viewer)?;
     let kind = kind_of(&kind)?;
+    let invalid = |path: &str, message: &str| {
+        ApiError::validation(vec![Detail {
+            path: path.to_string(),
+            message: message.to_string(),
+        }])
+    };
+    let Query(q) = query.map_err(|_| invalid("query", "查询参数不合法"))?;
+    if q.limit.is_some_and(|limit| !(1..=200).contains(&limit)) {
+        return Err(invalid("limit", "每页数量须为 1 到 200"));
+    }
+    let limit = q.limit.or_else(|| q.before.map(|_| 100));
     let mut conn = state.db.pool().acquire().await.map_err(DbError::from)?;
+    let before = if let Some(id) = q.before {
+        let identity: Option<String> = sqlx::query_scalar(
+            "SELECT identity FROM gw_resources WHERE kind = $1 AND id = $2 AND NOT deleted",
+        )
+        .bind(kind.segment())
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(DbError::from)?
+        .ok_or_else(|| invalid("before", "游标不属于当前资源列表"))?;
+        Some((identity, id))
+    } else {
+        None
+    };
+    let mut rows = if let Some(limit) = limit {
+        store::list_page(&mut conn, kind, before, limit + 1).await?
+    } else {
+        store::list(&mut conn, kind).await?
+    };
+    let more = limit.is_some_and(|limit| rows.len() > limit as usize);
+    if let Some(limit) = limit {
+        rows.truncate(limit as usize);
+    }
+    let next_before = if more {
+        rows.last().map(|row| row.id)
+    } else {
+        None
+    };
     let fleet = Fleet::load_with_version(
         &mut conn,
         &state.env,
@@ -184,12 +232,11 @@ pub async fn list(
         &state.cfg.cp_version,
     )
     .await?;
-    let items: Vec<ResourceView> = store::list(&mut conn, kind)
-        .await?
+    let items: Vec<ResourceView> = rows
         .into_iter()
         .map(|row| ResourceView::of(row, &fleet))
         .collect();
-    Ok(Json(json!({ "items": items })))
+    Ok(Json(json!({ "items": items, "next_before": next_before })))
 }
 
 /// `GET /admin/resources/{kind}/{id}` → `ResourceView` and `ETag: "<version>"`.

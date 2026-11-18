@@ -148,6 +148,8 @@ pub struct BridgeContext {
     /// downloads for the request counts against together with
     /// `proxy.request_body_limit_bytes`. `0` on caller-less calls.
     pub inbound_body_bytes: usize,
+    /// 平台模式只影响共享账号选择头的转发，不改变上游请求体。
+    pub platform: bool,
 }
 
 /// Print the context without its credentials.
@@ -197,11 +199,17 @@ impl BridgeContext {
             model_id: String::new(),
             provider_key_id: String::new(),
             inbound_body_bytes: 0,
+            platform: false,
         }
     }
 
     pub fn with_inbound_body_bytes(mut self, bytes: usize) -> Self {
         self.inbound_body_bytes = bytes;
+        self
+    }
+
+    pub fn with_platform(mut self, platform: bool) -> Self {
+        self.platform = platform;
         self
     }
 
@@ -277,6 +285,7 @@ impl BridgeContext {
             // A Bridge speaks HTTP to its upstream and owns no header
             // name the shared lists do not already cover.
             surface_blocked: &[],
+            platform: self.platform,
         }
     }
 }

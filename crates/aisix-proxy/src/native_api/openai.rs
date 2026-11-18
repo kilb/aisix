@@ -1923,6 +1923,8 @@ fn answered_usage(
             usage.prompt_tokens,
             usage.cached_prompt_tokens,
             usage.cache_write_tokens,
+            usage.cache_write_30m_tokens,
+            usage.cache_write_12h_tokens,
             usage.cache_read_tokens,
             usage.cache_creation_tokens,
             usage.cache_creation_ttl,

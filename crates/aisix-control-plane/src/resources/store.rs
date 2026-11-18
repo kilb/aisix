@@ -384,3 +384,65 @@ pub async fn list(conn: &mut PgConnection, kind: Kind) -> Result<Vec<ResourceRow
         )
         .collect())
 }
+
+/// 管理 API 的有界读取；空名称仍沿用原列表的 NULLS LAST 排序。
+pub async fn list_page(
+    conn: &mut PgConnection,
+    kind: Kind,
+    before: Option<(Option<String>, Uuid)>,
+    limit: i64,
+) -> Result<Vec<ResourceRow>, DbError> {
+    type ListedRow = (
+        Uuid,
+        Value,
+        i64,
+        Option<String>,
+        bool,
+        Option<i64>,
+        Option<i64>,
+        DateTime<Utc>,
+    );
+    let (identity, id) = before.map_or((None, None), |(identity, id)| (identity, Some(id)));
+    let raw: Vec<ListedRow> = sqlx::query_as(&format!(
+        "SELECT id, {COLUMNS} FROM gw_resources WHERE kind = $1 AND NOT deleted \
+             AND ($2::uuid IS NULL \
+               OR ($3::text IS NOT NULL AND (identity, id) > ($3, $2)) \
+               OR (identity IS NULL AND ($3::text IS NOT NULL OR id > $2))) \
+             ORDER BY identity, id LIMIT $4"
+    ))
+    .bind(kind.segment())
+    .bind(id)
+    .bind(identity)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
+    Ok(raw
+        .into_iter()
+        .map(
+            |(
+                id,
+                doc,
+                version,
+                managed_by,
+                deleted,
+                projected_version,
+                kine_revision,
+                updated_at,
+            )| {
+                row(
+                    kind,
+                    id,
+                    (
+                        doc,
+                        version,
+                        managed_by,
+                        deleted,
+                        projected_version,
+                        kine_revision,
+                        updated_at,
+                    ),
+                )
+            },
+        )
+        .collect())
+}
