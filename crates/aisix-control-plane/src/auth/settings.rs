@@ -38,8 +38,8 @@ pub(crate) enum SecretScope {
     Flags,
     Turnstile,
     EmailAndTurnstile,
-    Github,
-    Google,
+    Github { turnstile: bool },
+    Google { turnstile: bool },
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -164,7 +164,10 @@ impl Stored {
         let turnstile_needed = turnstile.enabled
             && matches!(
                 scope,
-                SecretScope::Turnstile | SecretScope::EmailAndTurnstile
+                SecretScope::Turnstile
+                    | SecretScope::EmailAndTurnstile
+                    | SecretScope::Github { turnstile: true }
+                    | SecretScope::Google { turnstile: true }
             );
         let email_endpoint = if email_needed {
             open(true, self.email_endpoint_sealed, EMAIL_ENDPOINT)?.unwrap_or(email.endpoint)
@@ -193,8 +196,16 @@ impl Stored {
                 secret_key: open(turnstile_needed, turnstile.secret_key, TURNSTILE_SECRET)?,
             },
             passkey,
-            github: oauth(github, GITHUB_SECRET, scope == SecretScope::Github)?,
-            google: oauth(google, GOOGLE_SECRET, scope == SecretScope::Google)?,
+            github: oauth(
+                github,
+                GITHUB_SECRET,
+                matches!(scope, SecretScope::Github { .. }),
+            )?,
+            google: oauth(
+                google,
+                GOOGLE_SECRET,
+                matches!(scope, SecretScope::Google { .. }),
+            )?,
         })
     }
 }

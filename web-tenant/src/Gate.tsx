@@ -107,7 +107,17 @@ export function Gate({
       const session = await request();
       if (session) onIn(session);
     } catch (e) {
-      setErr(e instanceof ApiError ? describe(e) : browserAuthenticationError(e));
+      if (e instanceof ApiError) {
+        const turnstileRefused = e.details.some(({ path }) => path === "/turnstile_token");
+        const emailCodeRefused = e.details.some(({ path }) => path === "/email_code");
+        const settingsChanged = e.code === "auth_settings_changed" || e.code === "authentication_settings_changed"
+          || (turnstileRefused && !siteKey) || (emailCodeRefused && !options?.email_verification)
+          || (e.code === "not_found" && activity !== "submit");
+        if (invite === null && (settingsChanged || turnstileRefused || emailCodeRefused)) retry();
+        setErr(settingsChanged ? "认证设置已更新，请按当前页面提示重新提交。" : describe(e));
+      } else {
+        setErr(browserAuthenticationError(e));
+      }
     } finally {
       setPending(null);
     }

@@ -48,7 +48,7 @@ export function ResetMemberPassword({ memberId, onClose, onSaved, onInactive }: 
       <Field label="新密码" error={passwordError} hint={`至少 ${MIN_PASSWORD_CHARS} 个字符`}>{(aria) => <input type="password" autoComplete="new-password" required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} {...aria} />}</Field>
       <Field label="再次输入新密码" error={confirmationError}>{(aria) => <input type="password" autoComplete="new-password" required value={confirmation} onChange={(event) => setConfirmation(event.target.value)} disabled={busy} {...aria} />}</Field>
       {error && <div className="note crit" role="alert">{error}</div>}
-      <div className="flex flex-wrap justify-end gap-2"><TwoStep label="重置密码" busy={busy} warning="确认后，该成员的旧密码和现有登录会话立即失效。" onConfirm={() => void reset()} /></div>
+      <div className="flex flex-wrap justify-end gap-2"><TwoStep label="重置密码" busy={busy} warning="确认后，该成员的旧密码、现有会话、通行密钥和第三方账号绑定立即失效。" onConfirm={() => void reset()} /></div>
     </form>
   </FormDialog>;
 }

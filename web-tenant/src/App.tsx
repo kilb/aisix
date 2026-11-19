@@ -45,7 +45,7 @@ function signedIn(s: Session): SignedIn | null {
   return s.authed && s.member && s.tenant ? { member: s.member, tenant: s.tenant } : null;
 }
 
-export function App({ inviteToken, oauthResult = null }: { inviteToken: string | null; oauthResult?: "success" | "linked" | "error" | null }) {
+export function App({ inviteToken, oauthResult = null }: { inviteToken: string | null; oauthResult?: "success" | "linked" | "error" | "restart" | null }) {
   // null until the session is read: defaulting to signed-out would flash
   // the gate on every reload, and most reloads are signed in.
   const [apiContract, setApiContract] = useState<number | null>(null);
@@ -54,7 +54,11 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   /** Why the gate is showing again, when a session ended under the member. */
-  const [notice, setNotice] = useState<string | null>(oauthResult === "error" ? "第三方授权未完成。请重试，或使用口令登录。" : null);
+  const [notice, setNotice] = useState<string | null>(
+    oauthResult === "restart" ? "登录验证设置已更新，请重新发起登录。"
+      : oauthResult === "error" ? "第三方授权未完成。请重试，或使用口令登录。"
+      : null,
+  );
   const [accountNotice, setAccountNotice] = useState(oauthResult === "linked" ? "第三方账号已绑定。" : null);
   const [tab, setTab] = useState<TabId>("org");
   /** The group a `#prices?group=<id>` link named, read when that page opens. */

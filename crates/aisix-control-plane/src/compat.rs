@@ -103,9 +103,13 @@ const DEFAULT_RESPONSES_COUNTER_SINCE: Since = Since::ThisRelease;
 // 首个已发布并验证支持客户接口隔离的网关源码；控制面独立热修复仍识别其真实标记。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA: &str = "08ff931722b737d40a8942a9e55de94afc9b51d5";
 
+// 已部署的托管网关已验证支持现有管理能力，控制面可独立发布。
+const PUBLISHED_MANAGED_GATEWAY_DEV_SHA: &str = "c4a9031b01b9275230bb6145d1a6370c7fd273ea";
+
 // 仅列入已核对源码、部署产物及回归证据的能力基线；两组能力独立判断。
 const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
     CUSTOMER_ENDPOINT_EXPANSION_DEV_SHA,
+    PUBLISHED_MANAGED_GATEWAY_DEV_SHA,
     "d887d328e6a033caf26ac7d6bbcae86efef1d5b2",
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
@@ -113,6 +117,7 @@ const CUSTOMER_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
     "641ccf95bc96569e565d23845c9c3f612c662703",
 ];
 const NATIVE_ENDPOINT_EXPANSION_DEV_SHAS: &[&str] = &[
+    PUBLISHED_MANAGED_GATEWAY_DEV_SHA,
     "d887d328e6a033caf26ac7d6bbcae86efef1d5b2",
     "4b06ddcb7d4d3918faeb9a02f12c0ed7f4f19bbc",
     "c39f54354e1bd6616b2599ff685cdc3289cede78",
@@ -367,28 +372,40 @@ fn supports_token_counting_since(version: &str, cp_version: &str, since: &Since)
     }) {
         return true;
     }
-    supports_since_exact_dev(version, cp_version, since)
+    supports_since_proven_dev(version, cp_version, since)
 }
 
 pub(crate) fn supports_default_responses_counter(version: &str, cp_version: &str) -> bool {
-    supports_since_exact_dev(version, cp_version, &DEFAULT_RESPONSES_COUNTER_SINCE)
+    supports_since_proven_dev(version, cp_version, &DEFAULT_RESPONSES_COUNTER_SINCE)
 }
 
 pub(crate) fn supports_account_disable(version: &str, cp_version: &str) -> bool {
-    supports_since_exact_dev(version, cp_version, &ACCOUNT_DISABLE_SINCE)
+    supports_since_proven_dev(version, cp_version, &ACCOUNT_DISABLE_SINCE)
 }
 
-fn supports_since_exact_dev(version: &str, cp_version: &str, since: &Since) -> bool {
-    matches_proven_build(&GatewayVersion::parse(version), cp_version, since)
+fn supports_since_proven_dev(version: &str, cp_version: &str, since: &Since) -> bool {
+    matches_proven_build(
+        &GatewayVersion::parse(version),
+        cp_version,
+        since,
+        &[PUBLISHED_MANAGED_GATEWAY_DEV_SHA],
+    )
 }
 
-fn matches_proven_build(gateway: &GatewayVersion, cp_version: &str, since: &Since) -> bool {
+fn matches_proven_build(
+    gateway: &GatewayVersion,
+    cp_version: &str,
+    since: &Since,
+    verified_dev_shas: &[&str],
+) -> bool {
     match gateway {
         GatewayVersion::Release(version) => minimum(since, cp_version)
             .is_some_and(|minimum| !version.cmp_precedence(&minimum).is_lt()),
-        GatewayVersion::Dev(Some(sha)) => {
-            matches!(GatewayVersion::parse(cp_version), GatewayVersion::Dev(Some(cp_sha)) if &cp_sha == sha)
-        }
+        GatewayVersion::Dev(Some(sha)) => matches!(
+            GatewayVersion::parse(cp_version),
+            GatewayVersion::Dev(Some(cp_sha)) if &cp_sha == sha
+                || verified_dev_shas.iter().any(|known| sha == *known || sha == &known[..7])
+        ),
         _ => false,
     }
 }
@@ -689,7 +706,12 @@ fn judge_price_floor(
     let mut below = 0;
     let mut unrecognized = 0;
     for gateway in fleet {
-        if matches_proven_build(gateway, cp_version, &floor.since) {
+        if matches_proven_build(
+            gateway,
+            cp_version,
+            &floor.since,
+            &[PUBLISHED_MANAGED_GATEWAY_DEV_SHA],
+        ) {
             continue;
         }
         if matches!(gateway, GatewayVersion::Release(_)) && required.is_some() {
@@ -713,7 +735,7 @@ fn judge_price_floor(
 /// `doc` of `kind` sets, judged by a control plane reporting `cp_version`:
 /// a set field fails when its minimum is known and a release gateway is
 /// older, or a gateway's version cannot be read.
-/// 十二小时费率还要求开发网关能证实与控制面来自同一构建。
+/// 十二小时费率还要求开发网关使用可验证的构建。
 pub fn check(
     kind: Kind,
     doc: &Value,
@@ -1742,6 +1764,45 @@ mod tests {
             "dev+sha-f05f494",
         ] {
             assert!(!supports_native_endpoint_expansion(version, CP));
+        }
+    }
+
+    #[test]
+    fn published_c4a9031_fleet_keeps_its_capabilities_across_control_plane_only_releases() {
+        const CONTROL_PLANE: &str = "dev+sha-a11ce11";
+        let price = json!({"cost":{"cache_write_12h_per_1k":2.5}});
+        let gates: [fn(&str, &str) -> bool; 5] = [
+            supports_customer_endpoint_expansion,
+            supports_native_endpoint_expansion,
+            supports_token_counting,
+            supports_default_responses_counter,
+            supports_account_disable,
+        ];
+
+        for gateway in [
+            "dev+sha-c4a9031",
+            "dev+sha-c4a9031b01b9275230bb6145d1a6370c7fd273ea",
+        ] {
+            for gate in gates {
+                assert!(gate(gateway, CONTROL_PLANE), "{gateway}");
+                assert!(!gate(gateway, "dev"), "{gateway}: unstamped control plane");
+            }
+            let fleet = [GatewayVersion::parse(gateway)];
+            assert!(check(Kind::Models, &price, &fleet, CONTROL_PLANE).is_ok());
+            assert!(check(Kind::Models, &price, &fleet, "dev").is_err());
+        }
+
+        for gateway in [
+            "dev",
+            "dev+sha-c4a9031b",
+            "dev+sha-c4a9031b01b9275230bb6145d1a6370c7fd273eb",
+            "dev+sha-0987654",
+        ] {
+            for gate in gates {
+                assert!(!gate(gateway, CONTROL_PLANE), "{gateway}");
+            }
+            let fleet = [GatewayVersion::parse(gateway)];
+            assert!(check(Kind::Models, &price, &fleet, CONTROL_PLANE).is_err());
         }
     }
 

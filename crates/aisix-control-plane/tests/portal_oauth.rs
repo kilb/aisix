@@ -186,3 +186,80 @@ async fn an_oauth_link_is_private_and_requires_password_to_remove() {
     let current = cp.get_with_cookie("/api/auth/oauth", holder.cookie()).await;
     assert_eq!(current.body, json!({"github":false,"google":false}));
 }
+
+#[tokio::test]
+async fn an_oauth_login_started_before_enabling_turnstile_must_restart() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let admin = cp.admin_login_seeded(OperatorRole::Admin).await;
+    let mut settings = json!({
+        "version": 0,
+        "portal_origin": "https://localhost",
+        "email": {"enabled":false,"endpoint":"","from":""},
+        "turnstile": {"enabled":false,"site_key":""},
+        "passkey": {"enabled":false},
+        "github": {"enabled":true,"client_id":"test-client","client_secret":"test-secret"},
+        "google": {"enabled":false,"client_id":""}
+    });
+    let configured = cp
+        .send(
+            "PUT",
+            SETTINGS,
+            Some(admin.cookie()),
+            Some(settings.clone()),
+        )
+        .await;
+    assert_eq!(configured.status, 200, "settings: {configured:?}");
+
+    let started = cp
+        .send("POST", START, None, Some(json!({"mode":"login"})))
+        .await;
+    assert_eq!(started.status, 200, "start: {started:?}");
+    let url = Url::parse(started.body["url"].as_str().expect("授权 URL")).unwrap();
+    let state = url
+        .query_pairs()
+        .find(|(name, _)| name == "state")
+        .unwrap()
+        .1;
+    let cookie = started.set_cookie.as_deref().expect("浏览器 Cookie");
+    let cookie_pair = cookie.split(';').next().unwrap();
+
+    settings["version"] = json!(1);
+    settings["turnstile"] = json!({
+        "enabled":true,
+        "site_key":"1x00000000000000000000AA",
+        "secret_key":"1x0000000000000000000000000000000AA"
+    });
+    let enabled = cp
+        .send("PUT", SETTINGS, Some(admin.cookie()), Some(settings))
+        .await;
+    assert_eq!(enabled.status, 200, "enable Turnstile: {enabled:?}");
+
+    // 合法服务商取消回调足以钉住设置变更的提示，不用凭据兑换或模拟上游。
+    let callback = cp.url(&format!(
+        "/api/auth/oauth/github/callback?error=access_denied&state={state}"
+    ));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .get(callback)
+        .header(COOKIE, cookie_pair)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()[LOCATION], "/?auth=restart");
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap())
+        .collect();
+    assert_eq!(cookies.len(), 1);
+    assert!(cookies[0].starts_with("__Host-aisix_oauth_github=;"));
+    assert!(cookies[0].contains("Max-Age=0"));
+}

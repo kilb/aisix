@@ -912,10 +912,10 @@ pub async fn change_password(
             "/new_password",
         )]));
     }
-    let verified = match verify_member_password(&state, auth.id, &req.current_password).await {
-        Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Ok(cooling_down()),
-        checked => checked?,
-    };
+    if state.portal.logins.in_cooldown(&auth.email) {
+        return Ok(cooling_down());
+    }
+    let verified = verify_member_password(&state, auth.id, &req.current_password).await?;
     let hash = state.passwords.hash(&req.new_password).await?;
     let current = carried_token(&headers);
     state
@@ -979,7 +979,7 @@ pub struct ResetPassword {
 }
 
 /// 管理员重置同组织其他成员的密码；本人仍通过旧密码验证的改密接口。
-/// 更新成员行后再撤销全部会话，沿用登录的行锁校验，避免旧密码登录竞态。
+/// 更新成员行后撤销会话及关联登录凭据。按旧密码及会话校验的关联流程也同时失效。
 pub async fn reset_password(
     auth: MemberAuth,
     State(state): State<AppState>,
@@ -1015,6 +1015,16 @@ pub async fn reset_password(
                     .await
                     .map_err(DbError::from)?;
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
+                sqlx::query("DELETE FROM member_oauth_identities WHERE member_id = $1")
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                sqlx::query("DELETE FROM portal_passkeys WHERE member_id = $1")
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
                 audit::record(
                     conn,
                     member_entry(
@@ -1678,16 +1688,6 @@ pub async fn remove(
                     .await
                     .map_err(DbError::from)?;
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
-                sqlx::query("DELETE FROM member_oauth_identities WHERE member_id = $1")
-                    .bind(id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(DbError::from)?;
-                sqlx::query("DELETE FROM portal_passkeys WHERE member_id = $1")
-                    .bind(id)
-                    .execute(&mut *conn)
-                    .await
-                    .map_err(DbError::from)?;
                 let revoked = revoke_issued_invites(&mut *conn, auth.tenant_id, id, true).await?;
                 // Before their `users` document goes: a key document names
                 // its user. A pending tenant's member has none yet.

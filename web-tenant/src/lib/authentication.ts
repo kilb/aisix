@@ -45,6 +45,7 @@ export function useAuthenticationOptions(enabled = true) {
     available: options !== null && options !== PASSWORD_ONLY,
     retry: () => {
       setFailed(false);
+      setOptions(null);
       setAttempt((value) => value + 1);
     },
   };

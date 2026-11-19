@@ -26,3 +26,17 @@ CREATE TABLE portal_passkey_challenges (
 );
 
 CREATE INDEX portal_passkey_challenges_expiry ON portal_passkey_challenges (expires_at);
+
+-- 旧控制面滚动发布或回滚后仍可软删除成员，数据库统一释放凭据归属。
+CREATE FUNCTION portal_auth_on_member_removal() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM member_oauth_identities WHERE member_id = NEW.id;
+    DELETE FROM portal_passkeys WHERE member_id = NEW.id;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER portal_auth_on_member_removal
+AFTER UPDATE OF removed_at ON members
+FOR EACH ROW WHEN (OLD.removed_at IS NULL AND NEW.removed_at IS NOT NULL)
+EXECUTE FUNCTION portal_auth_on_member_removal();

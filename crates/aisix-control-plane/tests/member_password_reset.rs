@@ -95,6 +95,52 @@ async fn a_manager_reset_ends_every_target_session_and_keeps_the_actor_session()
 }
 
 #[tokio::test]
+async fn a_manager_reset_clears_only_the_targets_alternate_credentials() {
+    let Some(cp) = TestCp::start().await else {
+        return;
+    };
+    let tenant = cp.seed_tenant(TenantStatus::Active).await;
+    let owner = cp.seed_member(tenant, MemberRole::Owner).await;
+    let actor = cp.member_login_as(&owner).await;
+    let target = cp.seed_member(tenant, MemberRole::Member).await;
+    for member in [owner.id, target.id] {
+        sqlx::query(
+            "INSERT INTO member_oauth_identities (member_id, provider, subject) \
+             VALUES ($1, 'github', $2), ($1, 'google', $2)",
+        )
+        .bind(member)
+        .bind(member.to_string())
+        .execute(cp.db().pool())
+        .await
+        .expect("seed linked accounts");
+        sqlx::query(
+            "INSERT INTO portal_passkeys (id, member_id, rp_id, credential_id, public_credential, name) \
+             VALUES ($1, $2, 'portal.example.test', $3, '{}'::jsonb, 'key')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(member)
+        .bind(member.as_bytes().as_slice())
+        .execute(cp.db().pool())
+        .await
+        .expect("seed a passkey");
+    }
+
+    let response = reset(&cp, &actor, target.id, NEW_PASSWORD).await;
+    assert_eq!(response.status, 204, "{response:?}");
+    for (member, expected) in [(owner.id, (2_i64, 1_i64)), (target.id, (0, 0))] {
+        let actual: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM member_oauth_identities WHERE member_id = $1), \
+                    (SELECT count(*) FROM portal_passkeys WHERE member_id = $1)",
+        )
+        .bind(member)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read remaining credentials");
+        assert_eq!(actual, expected, "credentials for {member}");
+    }
+}
+
+#[tokio::test]
 async fn reset_permissions_do_not_cross_tenants_owners_or_the_self_service_boundary() {
     let Some(cp) = TestCp::start().await else {
         return;

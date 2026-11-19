@@ -384,6 +384,27 @@ fn same_email(checked: &AuthSettings, current: &AuthSettings) -> bool {
                 && checked.email.api_key == current.email.api_key))
 }
 
+/// 用于跨多个 HTTP 请求的认证流程，短期状态只存加钥摘要。
+pub(crate) fn turnstile_policy_digest(state: &AppState, config: &AuthSettings) -> [u8; 32] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &state.cfg.master_key.0);
+    let mut context = hmac::Context::with_key(&key);
+    context.update(b"portal-turnstile-policy:v1");
+    context.update(&[u8::from(config.turnstile.enabled)]);
+    if config.turnstile.enabled {
+        for value in [
+            config.portal_origin.as_str(),
+            config.turnstile.site_key.as_str(),
+            config.turnstile.secret_key.as_deref().unwrap_or_default(),
+        ] {
+            context.update(&(value.len() as u64).to_be_bytes());
+            context.update(value.as_bytes());
+        }
+    }
+    let mut digest = [0; 32];
+    digest.copy_from_slice(context.sign().as_ref());
+    digest
+}
+
 fn same_turnstile(checked: &AuthSettings, current: &AuthSettings) -> bool {
     checked.turnstile.enabled == current.turnstile.enabled
         && (!current.turnstile.enabled

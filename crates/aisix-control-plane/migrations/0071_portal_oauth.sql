@@ -20,6 +20,9 @@ CREATE TABLE portal_oauth_flows (
   session_sha256 bytea,
   link_member_id uuid REFERENCES members(id) ON DELETE CASCADE,
   reauth_sha256 bytea,
+  turnstile_policy_sha256 bytea,
+  CHECK ((link_member_id IS NULL) = (turnstile_policy_sha256 IS NOT NULL)),
+  CHECK (turnstile_policy_sha256 IS NULL OR octet_length(turnstile_policy_sha256) = 32),
   CHECK ((link_member_id IS NULL) = (reauth_sha256 IS NULL)),
   CHECK (link_member_id IS NULL OR session_sha256 IS NOT NULL)
 );

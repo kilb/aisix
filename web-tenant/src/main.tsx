@@ -30,10 +30,10 @@ function takeInviteToken(): string | null {
 
 const inviteToken = takeInviteToken();
 
-function takeOAuthResult(): "success" | "linked" | "error" | null {
+function takeOAuthResult(): "success" | "linked" | "error" | "restart" | null {
   const url = new URL(window.location.href);
   const result = url.searchParams.get("auth");
-  if (result !== "success" && result !== "linked" && result !== "error") return null;
+  if (result !== "success" && result !== "linked" && result !== "error" && result !== "restart") return null;
   url.searchParams.delete("auth");
   if (result === "linked" || result === "error") url.hash = "account";
   window.history.replaceState(null, "", url);

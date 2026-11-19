@@ -63,6 +63,20 @@ test("待审核组织的成员可注册 Passkey、登录并移除它", async ({ 
   const credentialId = Buffer.from(credentials[0]!.credentialId, "base64").toString("base64url");
   await page.getByRole("button", { name: "登出", exact: true }).click();
 
+  const allowCredentials = async (email: string) => {
+    const response = await page.request.post(new URL("/api/auth/passkeys/login/start", origin).href, { data: { email } });
+    expect(response.status()).toBe(200);
+    const { options } = await response.json();
+    return options.publicKey.allowCredentials.map(({ id }: { id: string }) => id) as string[];
+  };
+  const enrolled = await allowCredentials(email);
+  expect(enrolled).toContain(credentialId);
+  expect(enrolled.length).toBeGreaterThan(1);
+  const unknown = await allowCredentials("unknown@example.net");
+  expect(unknown).toHaveLength(enrolled.length);
+  expect(unknown).not.toContain(credentialId);
+  expect(await allowCredentials("unknown@example.net")).toEqual(unknown);
+
   await page.getByLabel("邮箱", { exact: true }).fill(email);
   await page.getByRole("button", { name: "使用 Passkey 登录", exact: true }).click();
   await expect(page.getByText(/组织正在等待平台审核/)).toBeVisible();
@@ -90,9 +104,24 @@ test("待审核组织的成员可注册 Passkey、登录并移除它", async ({ 
   await expect(page.getByRole("button", { name: "账号设置", exact: true })).toHaveCount(0);
 });
 
-test("浏览器使用 Turnstile 官方测试密钥注册组织", async ({ page }) => {
+test("注册页看到新的 Turnstile 要求后保留已填内容并可重新提交", async ({ page }) => {
   const origin = new URL(stack.previewUrl);
   origin.hostname = "localhost";
+  await togglePasskey(origin.origin, false);
+  await page.setViewportSize({ width: 390, height: 850 });
+  await page.goto(origin.href);
+  await page.getByRole("tab", { name: "注册组织", exact: true }).click();
+  const orgName = page.getByLabel("组织名称", { exact: true });
+  const email = page.getByLabel("邮箱", { exact: true });
+  const password = page.getByLabel("口令", { exact: true });
+  const displayName = page.getByLabel("显示名", { exact: true });
+  const submit = page.getByRole("button", { name: "注册组织", exact: true });
+  await orgName.fill("Turnstile 验收组织");
+  await email.fill("turnstile-browser@portal-auth.test");
+  await password.fill("portal-auth-browser-test-password");
+  await displayName.fill("等待配置更新");
+  await expect(submit).toBeEnabled();
+
   const { version } = await stack.admin.get("/admin/settings/authentication");
   // 官方测试密钥走真实的 Cloudflare 小组件和 Siteverify。
   await stack.admin.put("/admin/settings/authentication", {
@@ -107,14 +136,19 @@ test("浏览器使用 Turnstile 官方测试密钥注册组织", async ({ page }
     github: { enabled: false, client_id: "" },
     google: { enabled: false, client_id: "" },
   });
-  await page.setViewportSize({ width: 390, height: 850 });
-  await page.goto(origin.href);
-  await page.getByRole("tab", { name: "注册组织", exact: true }).click();
-  await page.getByLabel("组织名称", { exact: true }).fill("Turnstile 验收组织");
-  await page.getByLabel("邮箱", { exact: true }).fill("turnstile-browser@portal-auth.test");
-  await page.getByLabel("口令", { exact: true }).fill("portal-auth-browser-test-password");
+  const refused = page.waitForResponse((response) => response.url().endsWith("/api/signup"));
+  const refreshed = page.waitForResponse((response) => response.url().endsWith("/api/auth/options"), { timeout: 10_000 });
+  await submit.click();
+  expect((await refused).status()).toBe(422);
+  expect((await (await refreshed).json()).turnstile_site_key).toBe("1x00000000000000000000AA");
+  await expect(page.getByRole("alert")).toContainText("认证设置已更新");
+  await expect(orgName).toHaveValue("Turnstile 验收组织");
+  await expect(email).toHaveValue("turnstile-browser@portal-auth.test");
+  await expect(password).toHaveValue("portal-auth-browser-test-password");
+  await expect(displayName).toHaveValue("等待配置更新");
+
   const signup = page.waitForResponse((response) => response.url().endsWith("/api/signup"), { timeout: 25_000 });
-  await page.getByRole("button", { name: "注册组织", exact: true }).click();
+  await submit.click();
   const response = await signup;
   expect(response.status()).toBe(201);
   expect(response.request().postDataJSON().turnstile_token).toEqual(expect.any(String));

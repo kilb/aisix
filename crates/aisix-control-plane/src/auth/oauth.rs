@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use super::session::{self, MEMBER_SESSION_TTL, PORTAL_COOKIE};
 use super::settings::{self, AuthSettings, OAuthSettings, SecretScope};
-use super::verification::verify_turnstile;
+use super::verification::{turnstile_policy_digest, verify_turnstile};
 use super::MemberAuth;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::db::DbError;
@@ -64,10 +64,10 @@ impl Provider {
         }
     }
 
-    fn secret_scope(self) -> SecretScope {
+    fn secret_scope(self, login: bool) -> SecretScope {
         match self {
-            Self::Github => SecretScope::Github,
-            Self::Google => SecretScope::Google,
+            Self::Github => SecretScope::Github { turnstile: login },
+            Self::Google => SecretScope::Google { turnstile: login },
         }
     }
 
@@ -127,6 +127,30 @@ struct Flow {
     session_sha256: Option<Vec<u8>>,
     link_member_id: Option<Uuid>,
     reauth_sha256: Option<Vec<u8>>,
+    turnstile_policy_sha256: Option<Vec<u8>>,
+}
+
+impl Flow {
+    fn is_login(&self) -> bool {
+        self.link_member_id.is_none()
+    }
+
+    fn check_turnstile(&self, state: &AppState, config: &AuthSettings) -> Result<(), ApiError> {
+        if self.is_login()
+            && self.turnstile_policy_sha256.as_deref()
+                != Some(turnstile_policy_digest(state, config).as_slice())
+        {
+            return Err(settings_changed());
+        }
+        Ok(())
+    }
+}
+
+fn settings_changed() -> ApiError {
+    ApiError::conflict(
+        "auth_settings_changed",
+        "登录验证设置已更新，请重新发起登录",
+    )
 }
 
 fn token() -> String {
@@ -258,13 +282,7 @@ pub async fn start(
     let flow_sha = digest(&flow_token);
     let browser_sha = digest(&browser);
     let client_id = config.client_id.clone();
-    let turnstile_snapshot = login.then(|| {
-        (
-            cfg.turnstile.enabled,
-            cfg.turnstile.site_key.clone(),
-            cfg.turnstile.secret_key.clone(),
-        )
-    });
+    let turnstile_snapshot = login.then(|| turnstile_policy_digest(&state, &cfg));
     let app = state.clone();
 
     // 登录可以在 Turnstile 停用时公开发起，限制短期状态表的占用。
@@ -278,12 +296,8 @@ pub async fn start(
             {
                 return Err(ApiError::not_found());
             }
-            if turnstile_snapshot.is_some_and(|(enabled, site_key, secret)| {
-                enabled != current.turnstile.enabled
-                    || site_key != current.turnstile.site_key
-                    || secret != current.turnstile.secret_key
-            }) {
-                return Err(ApiError::conflict("auth_settings_changed", "验证设置已更新，请刷新后重试"));
+            if turnstile_snapshot.is_some_and(|verified| verified != turnstile_policy_digest(&app, &current)) {
+                return Err(settings_changed());
             }
             let reserved: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
                 .bind(FLOW_LOCK_KEY)
@@ -303,8 +317,8 @@ pub async fn start(
             sqlx::query(
                 "INSERT INTO portal_oauth_flows \
                  (state_sha256, browser_sha256, provider, verifier_sealed, client_id, redirect_uri, \
-                  expires_at, session_sha256, link_member_id, reauth_sha256) \
-                 VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9, $10)",
+                  expires_at, session_sha256, link_member_id, reauth_sha256, turnstile_policy_sha256) \
+                 VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7), $8, $9, $10, $11)",
             )
             .bind(flow_sha)
             .bind(browser_sha)
@@ -316,6 +330,7 @@ pub async fn start(
             .bind(carried)
             .bind(link_member)
             .bind(reauth)
+            .bind(turnstile_snapshot.as_ref().map(|snapshot| snapshot.as_slice()))
             .execute(conn)
             .await
             .map_err(DbError::from)?;
@@ -347,7 +362,8 @@ async fn consume(
     Ok(sqlx::query_as(
         "DELETE FROM portal_oauth_flows \
          WHERE state_sha256 = $1 AND browser_sha256 = $2 AND provider = $3 AND expires_at > now() \
-         RETURNING verifier_sealed, client_id, redirect_uri, session_sha256, link_member_id, reauth_sha256",
+         RETURNING verifier_sealed, client_id, redirect_uri, session_sha256, link_member_id,
+                   reauth_sha256, turnstile_policy_sha256",
     )
     .bind(digest(flow_token))
     .bind(digest(browser))
@@ -553,7 +569,8 @@ async fn bind_or_login(
     state.db.clone().tx(move |conn| {
         async move {
             // 在网络兑换之后再次读取。后台关闭提供方和会话签发都在事务中线性化。
-            let current = settings::load_locked(&state, conn, provider.secret_scope()).await?;
+            let current = settings::load_locked(&state, conn, provider.secret_scope(flow.is_login())).await?;
+            flow.check_turnstile(&state, &current)?;
             let settings = provider.settings(&current);
             if !settings.enabled
                 || settings.client_id != flow.client_id
@@ -681,11 +698,10 @@ pub async fn callback(
     query: Result<Query<CallbackQuery>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let provider = Provider::parse(&raw)?;
-    let cfg = settings::load(&state, provider.secret_scope()).await?;
-    let config = provider.settings(&cfg);
-    let base = settings::portal_base(&state, &cfg.portal_origin);
+    let portal = settings::load(&state, SecretScope::Flags).await?;
+    let base = settings::portal_base(&state, &portal.portal_origin);
     let prefix = base
-        .strip_prefix(&cfg.portal_origin)
+        .strip_prefix(&portal.portal_origin)
         .filter(|path| path.starts_with('/') && !path.starts_with("//"))
         .unwrap_or_default();
     let refused = || landing(prefix, "error");
@@ -694,7 +710,7 @@ pub async fn callback(
     };
     let (Some(flow_token), Some(browser)) = (
         query.state.as_deref().filter(|s| valid_token(s)),
-        session::token_from_headers(&headers, &provider.cookie_name(&cfg.portal_origin))
+        session::token_from_headers(&headers, &provider.cookie_name(&portal.portal_origin))
             .filter(|s| valid_token(s)),
     ) else {
         return Ok(refused());
@@ -703,6 +719,9 @@ pub async fn callback(
         return Ok(refused());
     };
     let result = async {
+        let cfg = settings::load(&state, provider.secret_scope(flow.is_login())).await?;
+        flow.check_turnstile(&state, &cfg)?;
+        let config = provider.settings(&cfg);
         let code = query
             .code
             .as_deref()
@@ -751,10 +770,14 @@ pub async fn callback(
                 code = error.code,
                 "portal OAuth callback refused"
             );
-            refused()
+            if error.code == "auth_settings_changed" {
+                landing(prefix, "restart")
+            } else {
+                refused()
+            }
         }
     };
-    let cleared = provider.cookie(&cfg.portal_origin, "", 0);
+    let cleared = provider.cookie(&portal.portal_origin, "", 0);
     response.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&cleared).map_err(ApiError::internal)?,

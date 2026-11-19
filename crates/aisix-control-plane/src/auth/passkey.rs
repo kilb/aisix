@@ -6,9 +6,11 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use rand_core::RngCore;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -16,7 +18,10 @@ use sqlx::types::Json as DbJson;
 use sqlx::PgConnection;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
-use webauthn_rs::fake::{FakePasskeyDistribution, WebauthnFakeCredentialGenerator};
+use webauthn_rs::fake::{
+    APPLE_CRED_LEN, BITWARDEN_CRED_LEN, G_PIXEL_CRED_LEN, TPM_CRED_LEN, YUBIKEY_CRED_LEN,
+    YUBIKEY_EDDSA_CRED_LEN,
+};
 use webauthn_rs::prelude::{
     Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
     RegisterPublicKeyCredential, Url, Webauthn, WebauthnBuilder,
@@ -138,16 +143,62 @@ fn digest(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
-fn turnstile_digest(config: &settings::AuthSettings) -> Result<Option<[u8; 32]>, ApiError> {
-    config
-        .turnstile
-        .enabled
-        .then(|| {
-            serde_json::to_vec(&config.turnstile)
-                .map(|encoded| Sha256::digest(encoded).into())
-                .map_err(ApiError::internal)
-        })
-        .transpose()
+fn padded_allow_credentials(
+    state: &AppState,
+    rp_id: &str,
+    email: &str,
+    credentials: &[Passkey],
+) -> Value {
+    // 对每个邮箱返回相同数量的凭据描述符；长度来自常见认证器，顺序和填充稳定。
+    // https://www.w3.org/TR/webauthn-3/#sctn-username-enumeration
+    const LENGTHS: &[usize] = &[
+        G_PIXEL_CRED_LEN,
+        G_PIXEL_CRED_LEN,
+        G_PIXEL_CRED_LEN,
+        G_PIXEL_CRED_LEN,
+        APPLE_CRED_LEN,
+        APPLE_CRED_LEN,
+        APPLE_CRED_LEN,
+        TPM_CRED_LEN,
+        TPM_CRED_LEN,
+        TPM_CRED_LEN,
+        BITWARDEN_CRED_LEN,
+        YUBIKEY_CRED_LEN,
+        YUBIKEY_EDDSA_CRED_LEN,
+    ];
+    let key = hmac::Key::new(hmac::HMAC_SHA256, &state.cfg.master_key.0);
+    let mut account = hmac::Context::with_key(&key);
+    account.update(b"cp/portal/passkey/padding/v2\0");
+    account.update(rp_id.as_bytes());
+    account.update(b"\0");
+    account.update(email.as_bytes());
+    let key = hmac::Key::new(hmac::HMAC_SHA256, account.sign().as_ref());
+    let mut ids: Vec<Vec<u8>> = credentials
+        .iter()
+        .map(|credential| credential.cred_id().as_slice().to_vec())
+        .collect();
+    for slot in ids.len()..MAX_PASSKEYS as usize {
+        let slot = slot as u8;
+        let choice = hmac::sign(&key, &[0, slot]);
+        let len = LENGTHS[usize::from(choice.as_ref()[0]) % LENGTHS.len()];
+        let mut id = vec![0; len];
+        for (block, chunk) in id.chunks_mut(32).enumerate() {
+            let bytes = hmac::sign(&key, &[1, slot, block as u8]);
+            chunk.copy_from_slice(&bytes.as_ref()[..chunk.len()]);
+        }
+        ids.push(id);
+    }
+    ids.sort_by_cached_key(|id| {
+        let mut key_bytes = [0; 32];
+        key_bytes.copy_from_slice(hmac::sign(&key, id).as_ref());
+        key_bytes
+    });
+    // 描述符统一省略传输提示，客户端可尝试其支持的认证器。
+    Value::Array(
+        ids.into_iter()
+            .map(|id| json!({"type": "public-key", "id": URL_SAFE_NO_PAD.encode(id)}))
+            .collect(),
+    )
 }
 
 fn login_cookie(headers: &HeaderMap) -> Option<&str> {
@@ -503,12 +554,9 @@ pub async fn login_start(
         .into_iter()
         .map(|(_, id, revision, DbJson(cred))| ((id, revision), cred))
         .unzip();
-    let (mut options, ceremony) = webauthn
+    let (options, ceremony) = webauthn
         .start_passkey_authentication(&credentials)
         .map_err(ApiError::internal)?;
-    for credential in &mut options.public_key.allow_credentials {
-        credential.transports = None;
-    }
 
     let id = Uuid::new_v4();
     let marker = login_cookie(&headers)
@@ -519,6 +567,8 @@ pub async fn login_start(
             hex::encode(bytes)
         });
     let mut options = serde_json::to_value(options).map_err(ApiError::internal)?;
+    options["publicKey"]["allowCredentials"] =
+        padded_allow_credentials(&state, &rp_id, &email, &credentials);
     if let Some(member) = member {
         store_challenge(
             &state,
@@ -530,28 +580,10 @@ pub async fn login_start(
             LoginState {
                 ceremony,
                 revisions,
-                turnstile_digest: turnstile_digest(&config)?,
+                turnstile_digest: Some(verification::turnstile_policy_digest(&state, &config)),
             },
         )
         .await?;
-    } else {
-        // 账号不存在、停用或没有通行密钥时仍返回挑战，减少账号枚举信息。
-        let fake_key = ring::hmac::sign(
-            &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &state.cfg.master_key.0),
-            b"cp/portal/passkey/fake-credential/v1",
-        );
-        let generator =
-            WebauthnFakeCredentialGenerator::<FakePasskeyDistribution>::new(fake_key.as_ref())
-                .map_err(ApiError::internal)?;
-        let decoys = generator
-            .generate(email.as_bytes())
-            .map_err(ApiError::internal)?;
-        options["publicKey"]["allowCredentials"] = Value::Array(
-            decoys
-                .into_iter()
-                .map(|id| json!({"type": "public-key", "id": id}))
-                .collect(),
-        );
     }
     let response = challenge_response(id, options);
     Ok((
@@ -603,7 +635,8 @@ pub async fn login_finish(
                     settings::load_locked(&state, conn, settings::SecretScope::Turnstile).await?;
                 if !current.passkey.enabled
                     || current.portal_origin != config.portal_origin
-                    || turnstile_digest(&current)? != login.turnstile_digest
+                    || Some(verification::turnstile_policy_digest(&state, &current))
+                        != login.turnstile_digest
                 {
                     return Err(invalid_challenge());
                 }
