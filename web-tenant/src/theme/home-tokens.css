@@ -1,0 +1,27 @@
+/* 仅作用于公开目录，登录和组织控制台继续使用各自的语义配色。 */
+.routio-public {
+  --home-bg: #FAF8F4;
+  --home-panel: #F2EBE1;
+  --home-surface: #FFFEFC;
+  --home-ink: #112834;
+  --home-muted: #50616A;
+  --home-accent: #A43B20;
+  --home-button: #143340;
+  --home-on-button: #FFFFFF;
+  --home-line: #DED8CF;
+  --home-control-line: #C8C4BB;
+  --home-art: #082732;
+}
+
+[data-theme="dark"] .routio-public {
+  --home-bg: #111C21;
+  --home-panel: #1D2B32;
+  --home-surface: #18252C;
+  --home-ink: #F5EFE5;
+  --home-muted: #BCC8CA;
+  --home-accent: #FFAD85;
+  --home-button: #ECDFCB;
+  --home-on-button: #142832;
+  --home-line: #34434A;
+  --home-control-line: #516067;
+}

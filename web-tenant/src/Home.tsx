@@ -1,12 +1,12 @@
 import { useEffect, useId, useState } from "react";
-import { ChevronDown, Search } from "lucide-react";
-import routingArtwork from "./assets/routio-routing.webp";
+import { ArrowDown, ArrowRight, ChevronDown, Search } from "lucide-react";
+import routingArtwork from "./assets/routio-optical-fibers.webp";
 import { PriceDetails } from "./PriceDetails";
 import { modelNameMatcher } from "./lib/modelNameMatcher";
 import { fmtCnyPerMillion } from "./lib/money";
 import { loadPublicPrices, type PublicPricedModel, type PublicPriceList } from "./lib/publicPrices";
 import { fmtBeijing } from "./lib/time";
-import "./PublicTheme.css";
+import "./theme/home-tokens.css";
 import "./Prices.css";
 import "./Home.css";
 
@@ -44,14 +44,14 @@ function PriceRow({ model }: { model: PublicPricedModel }) {
               aria-controls={expanded ? detailId : undefined}
               onClick={() => setExpanded(!expanded)}
             >
-              <span>{model.name}</span><ChevronDown size={15} aria-hidden="true" />
+              <ChevronDown size={15} aria-hidden="true" /><span>{model.name}</span>
             </button>
           : <span className="public-model-name">{model.name}</span>}
       </th>
       {RATE_COLUMNS.map(({ key }) => <td key={key}>
         {model[key] === null
           ? <><span className="public-rate-missing" aria-hidden="true">—</span><span className="vh">未提供价格</span></>
-          : <span className="public-rate">{fmtCnyPerMillion(model[key])}</span>}
+          : fmtCnyPerMillion(model[key])}
       </td>)}
     </tr>
     {expanded && tiers !== null && <tr className="public-model-details" id={detailId}>
@@ -138,13 +138,12 @@ export function Home({ homeHref, consoleHref, loginHref, signupHref, signedIn = 
           <span>Routio</span>
         </a>
         <nav className="public-nav" aria-label="网站导航">
-          <a href={homeHref} aria-current="page">首页</a>
           <a href="#pricing">模型价格</a>
         </nav>
         <div className="public-nav-actions">
-          {signedIn ? <a className="public-action public-action-primary" href={consoleHref}>进入控制台</a> : <>
+          {signedIn ? <a className="public-action public-action-primary" href={consoleHref}>进入控制台<ArrowRight size={16} aria-hidden="true" /></a> : <>
             <a className="public-action public-action-subtle" href={loginHref}>登录</a>
-            <a className="public-action public-action-primary" href={signupHref}>注册</a>
+            <a className="public-action public-action-primary" href={signupHref}>注册<ArrowRight size={16} aria-hidden="true" /></a>
           </>}
         </div>
       </div>
@@ -152,16 +151,16 @@ export function Home({ homeHref, consoleHref, loginHref, signupHref, signedIn = 
     <main className="public-container public-main">
       <section className="public-hero" aria-labelledby="public-home-title">
         <div className="public-hero-copy">
-          <h1 id="public-home-title">一个入口，<br />调用你需要的模型</h1>
-          <p>浏览公开模型与标准价格，登录后创建 API 密钥并管理用量。</p>
+          <h1 id="public-home-title">统一接入 AI 模型</h1>
+          <p>在这里比较公开模型价格。登录后创建 API 密钥，查看用量。</p>
           <div className="public-hero-actions">
-            <a className="public-action public-action-primary" href="#pricing">查看模型价格</a>
-            <a className="public-action public-action-secondary" href={signedIn ? consoleHref : signupHref}>
-              {signedIn ? "进入控制台" : "注册组织"}
-            </a>
+            <a className="public-action public-action-primary" href="#pricing">查看模型价格<ArrowDown size={18} aria-hidden="true" /></a>
+            {!signedIn && <a className="public-action public-action-secondary" href={signupHref}>
+              注册组织<ArrowRight size={16} aria-hidden="true" />
+            </a>}
           </div>
         </div>
-        <img className="public-hero-art" src={routingArtwork} width={1200} height={800} alt="" fetchPriority="high" />
+        <img className="public-hero-art" src={routingArtwork} width={1200} height={900} alt="" decoding="async" />
       </section>
       <PublicPricing />
     </main>

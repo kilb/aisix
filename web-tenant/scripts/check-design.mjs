@@ -53,7 +53,8 @@ const rules = [
   },
 ];
 
-/** 所有可交付源码都扫描；只有令牌定义文件可声明原始设计值。 */
+/** 所有可交付源码都扫描；只有共享与公开目录的令牌定义可声明原始设计值。 */
+const tokenFiles = new Set(["src/theme/tokens.css", "src/theme/home-tokens.css"]);
 const cssRules = [
   { id: "css-color", re: /(?:(?:#|%23)[0-9a-f]{3,8}\b|(?:rgba?|hsla?|oklch)\()/i, msg: "CSS 颜色集中在 theme/tokens.css" },
   { id: "css-font-size", re: /font-size\s*:\s*\d+(?:\.\d+)?(?:px|rem)\b/, msg: "CSS 字号使用 --text-* 语义令牌" },
@@ -62,7 +63,7 @@ const cssRules = [
 ];
 
 export function violations(name, text) {
-  const active = name.endsWith(".css") ? name === "src/theme/tokens.css" ? [] : cssRules : rules;
+  const active = name.endsWith(".css") ? tokenFiles.has(name) ? [] : cssRules : rules;
   return text.split("\n").flatMap((line, index) => {
     if (/^\s*(?:\/\/|\*|\/\*)/.test(line)) return [];
     return active.filter(rule => rule.re.test(line)).map(rule => ({ id: rule.id, line: index + 1, message: rule.msg, source: line.trim() }));

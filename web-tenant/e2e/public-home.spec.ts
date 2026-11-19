@@ -63,6 +63,15 @@ test("访客可以查看人民币标准价并按模型名称搜索", async ({ pa
   await expect(unpriced).toBeVisible();
   await expect(unpriced.getByRole("cell", { name: "未提供价格", exact: true })).toHaveCount(3);
 
+  const details = page.getByRole("table", { name: "完整模型单价" });
+  const toggle = priced.getByRole("button", { name: PRICED_MODEL, exact: true });
+  await expect(details).toHaveCount(0);
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+  await expect(details.getByRole("cell", { name: UNIT_PRICE.output })).toBeVisible();
+  await toggle.click();
+  await expect(details).toHaveCount(0);
+
   const search = page.getByRole("searchbox", { name: "搜索模型" });
   await search.fill(PRICED_MODEL);
   await expect(priced).toBeVisible();
@@ -94,15 +103,16 @@ test("首页链接可进入独立登录和注册页面并返回首页", async ({
   await expect(modelRow(page, PRICED_MODEL)).toBeVisible();
 });
 
-test("窄屏首页可以找到并横向完整看到价格", async ({ page }) => {
-  await page.setViewportSize({ width: 375, height: 812 });
+test("窄屏首屏直接展示价格且可横向完整比较", async ({ page }) => {
+  await page.setViewportSize({ width: 375, height: 667 });
   await page.goto(stack.previewUrl);
-  await page.getByRole("link", { name: "查看模型价格", exact: true }).click();
   const row = modelRow(page, PRICED_MODEL);
-  await row.scrollIntoViewIfNeeded();
   await expect(row.getByRole("cell", { name: UNIT_PRICE.input })).toBeInViewport({ ratio: 0.95 });
   await expect(row.getByRole("cell", { name: UNIT_PRICE.output })).toBeInViewport({ ratio: 0.95 });
   await expect(row.getByRole("cell", { name: UNIT_PRICE.cacheRead })).toBeInViewport({ ratio: 0.95 });
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
   expect(overflow).toBeLessThanOrEqual(1);
+
+  await page.getByRole("link", { name: "查看模型价格", exact: true }).click();
+  await expect(page).toHaveURL(`${stack.previewUrl}/#pricing`);
 });
