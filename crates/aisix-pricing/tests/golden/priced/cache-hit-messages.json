@@ -4,7 +4,7 @@
     "charge": 0,
     "cost": null,
     "discount": null,
-    "engine_version": 3,
+    "engine_version": 4,
     "estimated": false,
     "event_id": "evt-cache-hit-messages-1",
     "group_id": "group-golden",

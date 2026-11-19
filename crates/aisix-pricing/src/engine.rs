@@ -356,8 +356,9 @@ pub(crate) fn discount_at(
 ///    exemption looks anything up.
 /// 5. Counters that contradict each other are `InconsistentUsage`; they are
 ///    refused, never clamped.
-/// 6. With every quantity 0, a successful operation priced in other units is
-///    `UnpricedOperation`; any other row is `NothingToBill`, with no lookup.
+/// 6. 502 流中断或含估算用量的 502 不计费。其余全零用量按以下规则处理：
+///    a successful operation priced in other units is `UnpricedOperation`;
+///    any other row is `NothingToBill`, with no price lookup.
 /// 7. Without a payer tenant the row is `UnknownTenant`, and without a model
 ///    `UnknownModel`. A payer whose key names no group is `NoGroup`.
 /// 8. The model's baseline in effect: none is `MissingPrice`, an unreadable
@@ -421,6 +422,19 @@ pub fn price_event(
     }
 
     let q = quantities(u).map_err(PricingError::InconsistentUsage)?;
+    // 流可能在上游结算前发出临时的输入或缓存计数。502 中断的计数和
+    // 502 的网关估算都保留给日志和统计，但不能触发余额、额度或成本入账。
+    if u.status_code == 502
+        && (u.usage_estimated || u.error_class.as_deref() == Some("stream_aborted"))
+    {
+        return Ok(unbilled(
+            u,
+            payer,
+            price_instant,
+            Outcome::NothingToBill,
+            warnings,
+        ));
+    }
     if q.is_zero() {
         if (200..300).contains(&u.status_code)
             && PRICED_IN_OTHER_UNITS.contains(&u.operation.as_str())
@@ -1645,6 +1659,38 @@ mod tests {
     #[test]
     fn a_failed_attempt_that_used_tokens_is_billed() {
         assert_eq!(charge(r#"{"status_code":502,"prompt_tokens":100}"#), 100);
+    }
+
+    #[test]
+    fn a_bad_gateway_does_not_bill_unconfirmed_usage() {
+        for wire in [
+            r#"{"operation":"messages","status_code":502,"error_class":"stream_aborted",
+                "prompt_tokens":28,"completion_tokens":46,"cache_read_tokens":296967,
+                "cache_creation_tokens":3004,"usage_estimated":true}"#,
+            r#"{"operation":"messages","status_code":502,"error_class":"stream_aborted",
+                "prompt_tokens":28,"completion_tokens":1,"cache_read_tokens":296967,
+                "cache_creation_tokens":3004}"#,
+            r#"{"operation":"chat","status_code":502,"error_class":"transport",
+                "prompt_tokens":100,"completion_tokens":20,"usage_estimated":true}"#,
+        ] {
+            let p = price(wire).unwrap();
+            assert_eq!(
+                (p.outcome, p.charge),
+                (Outcome::NothingToBill, MicroCny(0)),
+                "{wire}"
+            );
+            assert!(p.lines.is_empty(), "{wire}");
+            assert!(p.cost.is_none(), "{wire}");
+        }
+    }
+
+    #[test]
+    fn a_successful_response_still_bills_its_estimate() {
+        let p = price(
+            r#"{"status_code":200,"usage_estimated":true,"prompt_tokens":100,"completion_tokens":20}"#,
+        )
+        .unwrap();
+        assert_eq!((p.charge, p.estimated), (MicroCny(140), true));
     }
 
     #[test]

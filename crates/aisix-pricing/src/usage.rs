@@ -50,6 +50,9 @@ pub struct BillableUsage {
     /// The status the gateway returned to the caller.
     #[serde(default)]
     pub status_code: u16,
+    /// 网关为这次尝试记录的失败类型。旧事件可以没有此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
     /// The response-cache outcome; `hit` means no upstream served the row.
     #[serde(default)]
     pub cache_status: String,
@@ -709,6 +712,7 @@ mod tests {
                 completion_image_tokens: Some(14),
             },
             web_search_requests: 15,
+            error_class: "stream_aborted".into(),
             usage_estimated: true,
             service_tier: Some("flex".into()),
             requested_service_tier: Some("priority".into()),
@@ -730,6 +734,7 @@ mod tests {
                 requested_model_id: "model".into(),
                 operation: "chat".into(),
                 status_code: 201,
+                error_class: Some("stream_aborted".into()),
                 cache_status: "miss".into(),
                 prompt_tokens: 1,
                 completion_tokens: 2,

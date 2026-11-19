@@ -107,7 +107,8 @@ failing unless it was written for them.
   `BillableUsage`). Add the event field, its `BillableUsage` field and the
   dimension in the same change; a rate for a quantity nobody reports bills
   nothing, silently.
-- The same change bumps `ENGINE_VERSION`. It is 3: version 3 prices the
+- The same change bumps `ENGINE_VERSION`. Version 4 waives interrupted or
+  estimated 502 attempts. Version 3 prices the
   upstream-reported 12-hour cache-write subset separately and refuses a
   short-only service tier above its explicit published limit. Version 2 prices a row at
   its model's baseline times its group's rate, with the tenant discount

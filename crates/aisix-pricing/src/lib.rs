@@ -36,4 +36,4 @@ pub use rates::{
 pub use usage::{BillableUsage, Inconsistency};
 
 /// Stamped on every charge and price revision; bumped on any rule change.
-pub const ENGINE_VERSION: u32 = 3;
+pub const ENGINE_VERSION: u32 = 4;
