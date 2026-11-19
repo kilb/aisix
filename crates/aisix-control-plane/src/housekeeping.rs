@@ -52,6 +52,7 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
     // 保留邮件发送记录到滚动限流窗口结束，避免失效验证码绕过发送限额。
     for statement in [
         "DELETE FROM portal_email_codes WHERE issued_at <= now() - interval '1 hour'",
+        "DELETE FROM portal_password_recovery WHERE issued_at <= now() - interval '1 hour'",
         "DELETE FROM portal_oauth_flows WHERE expires_at <= now()",
         "DELETE FROM portal_passkey_challenges WHERE expires_at <= now()",
     ] {

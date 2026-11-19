@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useState } from "react";
 import { keyLimitText } from "./lib/keyRateLimits";
 import { ArrowLeft, Pencil } from "lucide-react";
 import { KeyBudgetEditor } from "./KeyBudgetEditor";
+import { KeyQuickstart, QUICKSTART_TITLE } from "./KeyQuickstart";
 import { KeyForm, stateOf, when } from "./Keys";
 import { ApiError, groups as groupApi, keys as keyApi, models as modelApi, org as readOrg, usageSummary, type Org, type PortalGroup, type PortalModel, type SessionMember, type TenantKey, type TenantStatus, type UsageSummaryRow } from "./lib/api";
 import { formMessageFor } from "./lib/errors";
@@ -17,6 +18,7 @@ import { BentoGrid, Card, CardHeader, CardMessage, PageHeader, span } from "./co
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
 import { Field } from "./ui/Field";
+import { FormDialog } from "./ui/FormDialog";
 import { Lamp } from "./ui/Lamp";
 import { RecordTablePager } from "./ui/RecordTable";
 
@@ -118,6 +120,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
   const [readErr, setReadErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [quickstartOpen, setQuickstartOpen] = useState(false);
   useEffect(() => {
     let live = true;
     setAnswer({ id: keyId, key: null, error: null });
@@ -156,6 +159,7 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
     description={editing ? "修改现有调用范围、限流与有效期。" : "查看该密钥的用量、费用与配置。"}
     actions={<>
       <Button onClick={onBack} disabled={busy}><ArrowLeft aria-hidden />返回密钥列表</Button>
+      {key && active && !editing && stateOf(key).lamp === "applied" && <Button onClick={() => setQuickstartOpen(true)}>{QUICKSTART_TITLE}</Button>}
       {key && active && !editing && <Button kind="primary" onClick={() => { setSaved(false); update({ edit: "1" }); }}><Pencil aria-hidden />修改密钥</Button>}
     </>}
   />;
@@ -199,6 +203,9 @@ export function KeyDetail({ keyId, onBack, member, status, onSelfChanged }: {
         <div><dt>创建时间</dt><dd>{when(key.created_at)}</dd></div>
       </dl>
     </Card>
+    {active && <FormDialog open={quickstartOpen} onOpenChange={setQuickstartOpen} title={QUICKSTART_TITLE}>
+      {quickstartOpen && <KeyQuickstart key={key.id} keyId={key.id} />}
+    </FormDialog>}
     {active ? <KeyUsage key={key.id} keyId={key.id} /> : <p className="note crit">组织已停用，暂时无法查询用量或修改密钥。</p>}
   </>;
 }

@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { gatewayBase } from "./src/lib/quickstart";
 
 /** The control plane's browser listener. The e2e stack passes its own. */
 const CP = process.env.CP_ORIGIN ?? "http://127.0.0.1:8090";
@@ -12,6 +13,8 @@ export default defineConfig({
   // deployment that mounts it under a prefix builds with that prefix, and the
   // API prefix follows it (src/lib/api.ts).
   base: process.env.TENANT_BASE ?? "/",
+  // 只将示例可公开显示的地址编入浏览器包。
+  define: { __ROUTIO_GATEWAY_PUBLIC_URL__: JSON.stringify(gatewayBase(process.env.ROUTIO_GATEWAY_PUBLIC_URL)) },
   build: {
     outDir: "dist",
     emptyOutDir: true,

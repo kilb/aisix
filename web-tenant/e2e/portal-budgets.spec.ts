@@ -28,8 +28,23 @@ const region = (page: Page, name: string): Locator => page.getByRole("region", {
 const table = (page: Page, name: string): Locator => page.getByRole("table", { name, exact: true });
 const rowOf = (t: Locator, text: string | RegExp): Locator => t.locator("tbody tr").filter({ hasText: text });
 
+const beijingTime = new Intl.DateTimeFormat("sv-SE", {
+  timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+});
+
+function periodRange(period: "day" | "month"): string {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  const day = now.getUTCDate();
+  const start = new Date(Date.UTC(year, month, period === "day" ? day : 1));
+  const end = new Date(period === "day" ? Date.UTC(year, month, day + 1) : Date.UTC(year, month + 1, 1));
+  return `${beijingTime.format(start)} 至 ${beijingTime.format(end)}（不含结束时刻）`;
+}
+
 async function login(page: Page, who: Login): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
@@ -38,7 +53,7 @@ async function login(page: Page, who: Login): Promise<void> {
 
 async function openBudgets(page: Page, who: Login): Promise<void> {
   await login(page, who);
-  await page.getByRole("tab", { name: "预算" }).click();
+  await page.getByRole("navigation", { name: "组织门户分区" }).getByRole("link", { name: "预算", exact: true }).click();
   await expect(region(page, "成员额度")).toBeVisible();
 }
 
@@ -103,12 +118,16 @@ async function setQuota(
   return (await apiAs(who)).post("/api/budgets", body);
 }
 
+async function openCreateBudget(page: Page): Promise<Locator> {
+  await page.getByRole("button", { name: "新建额度", exact: true }).click();
+  return page.getByRole("dialog", { name: "新建额度", exact: true });
+}
+
 /** Fills 新建额度 as the page offers it and submits. */
 async function createViaPage(
-  page: Page,
+  form: Locator,
   q: { scope: "成员" | "密钥"; target: string; kind?: "periodic" | "cumulative"; period?: string; limit: string },
 ): Promise<void> {
-  const form = region(page, "新建额度");
   await chooseSelect(form.getByLabel(/^对象类型/), { label: q.scope });
   await chooseSelect(form.getByLabel(/^对象(?!类型)/), q.target);
   if (q.kind) await chooseSelect(form.getByLabel(/^类型/), q.kind);
@@ -146,9 +165,9 @@ test("为密钥设每日额度，用尽后该密钥被拒，另一把密钥照�
   await waitClearOfUtcMidnight();
   const s = await seed();
   await openBudgets(page, s.world.owner);
-  await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "day", limit: "0.02" });
+  await createViaPage(await openCreateBudget(page), { scope: "密钥", target: s.k1.id, period: "day", limit: "0.02" });
   const keys = table(page, "密钥额度");
-  await expect(rowOf(keys, "world-owner-key")).toContainText("每天");
+  await expect(rowOf(keys, "world-owner-key")).toContainText(periodRange("day"));
 
   await spend(s.k1, s.world, 2);
   const listed = (await (await apiAs(s.world.owner)).get("/api/budgets")).items as { id: string; target: { id: string } }[];
@@ -169,10 +188,10 @@ test("一次性额度用尽后被拒，提高限额后恢复", async ({ page }) 
   await waitClearOfUtcMidnight();
   const s = await seed();
   await openBudgets(page, s.world.owner);
-  await createViaPage(page, { scope: "密钥", target: s.k1.id, kind: "cumulative", limit: "0.01" });
+  await createViaPage(await openCreateBudget(page), { scope: "密钥", target: s.k1.id, kind: "cumulative", limit: "0.01" });
   const keys = table(page, "密钥额度");
-  const today = new Date().toISOString().slice(0, 10);
-  await expect(rowOf(keys, "world-owner-key")).toContainText(`自 ${today} 起`);
+  const today = beijingTime.format(new Date()).slice(0, 10);
+  await expect(rowOf(keys, "world-owner-key")).toContainText(new RegExp(`自 ${today} [0-9]{2}:[0-9]{2}:[0-9]{2} 起`));
   await expect(rowOf(keys, "world-owner-key")).toContainText("一次性额度");
 
   await spend(s.k1, s.world, 1);
@@ -193,8 +212,8 @@ test("成员额度覆盖该成员的全部密钥", async ({ page }) => {
   const s = await seed();
   const km2 = await mint(s.m, "m-key-two");
   await openBudgets(page, s.world.owner);
-  await createViaPage(page, { scope: "成员", target: s.m.id, limit: "0.02" });
-  await expect(rowOf(table(page, "成员额度"), "每月")).toHaveCount(1);
+  await createViaPage(await openCreateBudget(page), { scope: "成员", target: s.m.id, limit: "0.02" });
+  await expect(rowOf(table(page, "成员额度"), periodRange("month"))).toHaveCount(1);
 
   await spend(s.km, s.world, 2);
   await refused(s.km, s.world).toBe(429);
@@ -223,7 +242,7 @@ test("成员只能给自己的密钥设额度，看不到组织额度", async ({
   // The organisation's own quota, its amount, and the balance figure it would carry.
   for (const token of ['"scope":"team"', "5430000"]) expect(seen).not.toContain(token);
 
-  const form = region(page, "新建额度");
+  const form = await openCreateBudget(page);
   await expect(await selectOptions(form.getByLabel(/^对象类型/))).toHaveText(["密钥"]);
   await page.keyboard.press("Escape");
   const targets = await selectOptions(form.getByLabel(/^对象(?!类型)/));
@@ -231,7 +250,7 @@ test("成员只能给自己的密钥设额度，看不到组织额度", async ({
   await expect(targets.first()).toHaveText("m-key-one");
   await page.keyboard.press("Escape");
 
-  await createViaPage(page, { scope: "密钥", target: s.km.id, period: "month", limit: "0.01" });
+  await createViaPage(form, { scope: "密钥", target: s.km.id, period: "month", limit: "0.01" });
   const keys = table(page, "密钥额度");
   await expect(rowOf(keys, "成员")).toBeVisible();
   const mine = keys.locator("tbody tr").filter({ has: page.getByText("成员", { exact: true }) });
@@ -244,10 +263,10 @@ test("成员只能给自己的密钥设额度，看不到组织额度", async ({
 test("超过上级额度时给出提示，但仍能保存", async ({ page }) => {
   const s = await seed();
   await openBudgets(page, s.world.owner);
-  await createViaPage(page, { scope: "成员", target: s.m.id, limit: "0.01" });
-  await expect(rowOf(table(page, "成员额度"), "每月")).toHaveCount(1);
+  await createViaPage(await openCreateBudget(page), { scope: "成员", target: s.m.id, limit: "0.01" });
+  await expect(rowOf(table(page, "成员额度"), periodRange("month"))).toHaveCount(1);
 
-  const form = region(page, "新建额度");
+  const form = await openCreateBudget(page);
   await chooseSelect(form.getByLabel(/^对象类型/), { label: "密钥" });
   await chooseSelect(form.getByLabel(/^对象(?!类型)/), s.km.id);
   const warning = form.getByText("超过上级额度时以先用尽者为准");
@@ -307,10 +326,12 @@ test("删除额度需要二次确认，删除后不再拦截", async ({ page }) 
 test("同一对象同一周期不能建两个额度，提示已存在", async ({ page }) => {
   const s = await seed();
   await openBudgets(page, s.world.owner);
-  await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "1.00" });
+  await createViaPage(await openCreateBudget(page), { scope: "密钥", target: s.k1.id, period: "month", limit: "1.00" });
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(1);
-  await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "2.00" });
-  await expect(region(page, "新建额度").getByRole("alert")).toHaveText("该对象在这个周期已有额度");
+  const duplicate = await openCreateBudget(page);
+  await createViaPage(duplicate, { scope: "密钥", target: s.k1.id, period: "month", limit: "2.00" });
+  await expect(duplicate.getByRole("alert")).toHaveText("该对象在这个周期已有额度");
+  await duplicate.getByRole("button", { name: "关闭新建额度", exact: true }).click();
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(1);
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toContainText("¥1.00");
 });
@@ -323,10 +344,10 @@ test("账单角色只能查看额度，没有新建与修改", async ({ page }) 
   await setQuota(s.world.owner, { scope: "member", scope_ref: billing.id, kind: "periodic", period: "month", limit_cny: "0.70" });
 
   await openBudgets(page, billing);
-  await expect(rowOf(table(page, "组织额度"), "每月")).toHaveCount(1);
-  await expect(rowOf(table(page, "成员额度"), "每月")).toHaveCount(1);
+  await expect(rowOf(table(page, "组织额度"), periodRange("month"))).toHaveCount(1);
+  await expect(rowOf(table(page, "成员额度"), periodRange("month"))).toHaveCount(1);
   await expect(rowOf(table(page, "密钥额度"), "world-owner-key")).toHaveCount(1);
-  await expect(page.getByRole("region", { name: "新建额度" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "新建额度", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "修改限额" })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "删除", exact: true })).toHaveCount(0);
 });
@@ -335,7 +356,7 @@ test("组织额度对所有者只读", async ({ page }) => {
   const s = await seed();
   await stack.admin.post(`/admin/tenants/${s.world.tenantId}/budgets`, { kind: "periodic", period: "month", limit_cny: "5.00" });
   await openBudgets(page, s.world.owner);
-  const org = rowOf(table(page, "组织额度"), "每月");
+  const org = rowOf(table(page, "组织额度"), periodRange("month"));
   await expect(org).toHaveCount(1);
   await expect(org).toContainText("平台");
   await expect(org.getByRole("button")).toHaveCount(0);
@@ -345,10 +366,10 @@ test("管理员可以给任何密钥设额度，并修改、删除自己设的�
   const s = await seed();
   await (await apiAs(s.world.owner)).patch(`/api/members/${s.m.id}`, { role: "admin" });
   await openBudgets(page, s.m);
-  const form = region(page, "新建额度");
+  const form = await openCreateBudget(page);
   await expect(await selectOptions(form.getByLabel(/^对象类型/))).toHaveText(["成员", "密钥"]);
   await page.keyboard.press("Escape");
-  await createViaPage(page, { scope: "密钥", target: s.k1.id, period: "month", limit: "0.50" });
+  await createViaPage(form, { scope: "密钥", target: s.k1.id, period: "month", limit: "0.50" });
   const row = rowOf(table(page, "密钥额度"), "world-owner-key");
   await expect(row).toContainText("组织管理员");
   await row.getByRole("button", { name: "修改限额" }).click();
@@ -419,9 +440,10 @@ test("预算最多同时发出 4 个额度请求，且只读视图内的密钥",
   expect(peak).toBeLessThanOrEqual(4);
   expect(peak).toBeGreaterThan(1);
 
-  // 显示更多 brings the next keys in, read the same way.
-  await page.getByRole("button", { name: "显示更多" }).click();
-  await expect(table(page, "密钥实际可用").locator("tbody tr")).toHaveCount(total);
+  // 下一页只显示剩余的密钥，请求仍按当前页发出。
+  const pager = page.getByRole("navigation", { name: "密钥实际可用", exact: true });
+  await pager.getByRole("button", { name: "下一页", exact: true }).click();
+  await expect(table(page, "密钥实际可用").locator("tbody tr")).toHaveCount(total - 25);
   await expect.poll(() => asked.size).toBe(total);
   await expect.poll(() => inFlight).toBe(0);
   expect(peak).toBeLessThanOrEqual(4);

@@ -34,6 +34,7 @@ import { BentoGrid, Card, CardHeader, Metric, PageHeader, span } from "./compone
 import { TrendChart } from "./components/charts";
 import { exactInteger, normalizeExactValues } from "./lib/chartFormat";
 import { cn } from "./lib/cn";
+import { CsvExportButton } from "./components/CsvExportButton";
 import "./Billing.css";
 
 function failure(e: unknown): string {
@@ -601,18 +602,31 @@ function explanation(t: Topup): string | null {
 
 function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (items: Topup[]) => void }) {
   const [status, setStatus] = useState<"" | Topup["status"]>("");
+  const [fromDate, setFromDate] = useState("");
+  const [toDate, setToDate] = useState("");
+  const range = rangeOf(fromDate, toDate);
+  const filters = { ...range, status: status || undefined };
   const records = useBillingRecords({
-    fetchPage: (before, limit) => billing.topups({ ...(status ? { status } : {}), before, limit }),
+    fetchPage: (before, limit) => billing.topups({ ...filters, before, limit }),
     keyOf: (item) => item.id,
     searchText: (item) => [item.origin === "tenant" ? item.reference ?? "" : "", item.requested_by?.display_name ?? ""],
-    resetKey: `${reloadKey}/${status}`,
+    resetKey: `${reloadKey}/${status}/${fromDate}/${toDate}`,
+    enabled: range !== null,
     onLoaded,
   });
   const { rows: items, err } = records;
   return (
-    <Section number={3} title="充值记录" className={span.d12} table>
-      <p className="px-3 text-caption text-fg-3">按时间读取申请与平台入账记录，搜索仅作用于已加载记录；待审批总数见账户余额。</p>
+    <Section number={3} title="充值记录" className={span.d12} table actions={
+      <CsvExportButton disabled={!range} onExport={() => billing.exportTopups(filters)} />
+    }>
+      <p className="px-3 text-caption text-fg-3">搜索仅作用于已加载记录，CSV 按日期和状态下载。待审批总数见账户余额。</p>
       <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载充值记录", placeholder: "付款凭证号、提交人" }}>
+        <Field label="充值开始日期" error={range ? null : "结束日期不能早于开始日期"}>
+          <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
+        </Field>
+        <Field label="充值结束日期">
+          <input type="date" value={toDate} min={fromDate || undefined} onChange={(e) => setToDate(e.target.value)} />
+        </Field>
         <Field label="充值状态">
           <Select value={status} onValueChange={(selectedValue) => setStatus(selectedValue as "" | Topup["status"])}>
             <option value="">全部</option>
@@ -627,7 +641,7 @@ function TopupList({ reloadKey, onLoaded }: { reloadKey: number; onLoaded: (item
           {err}
         </div>
       )}
-      {!records.loaded && !err && <Loading />}
+      {!records.loaded && range && !err && <Loading />}
       {records.loaded && items.length === 0 && !err && <EmptyState text={records.query ? "已加载记录中没有匹配的充值记录" : "所选范围内没有充值记录"} mark="route" />}
       {items.length > 0 && (
         <DataTable label="充值记录" tableClassName="billing-topups-table">
@@ -703,8 +717,9 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
   const [toDate, setToDate] = useState("");
   const [kind, setKind] = useState<"" | LedgerKind>("");
   const range = rangeOf(fromDate, toDate);
+  const filters = { ...range, kind: kind || undefined };
   const records = useBillingRecords({
-    fetchPage: (before, limit) => formulaLedger({ ...range, ...(kind ? { kind } : {}), before, limit }),
+    fetchPage: (before, limit) => formulaLedger({ ...filters, before, limit }),
     keyOf: (item) => item.seq,
     searchText: (item) => [item.event_id ?? "", item.model?.name ?? "", KIND_LABEL[item.kind]],
     resetKey: `${fromDate}/${toDate}/${kind}`,
@@ -747,7 +762,9 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
 
   return (
     <>
-      <Section number={5} title="余额流水" table>
+      <Section number={5} title="余额流水" table actions={
+        <CsvExportButton disabled={!range} onExport={() => billing.exportLedger(filters)} />
+      }>
         <RecordTableToolbar search={{ value: records.query, onChange: records.setQuery, label: "搜索已加载余额流水", placeholder: "模型、事件 ID、类型" }}>
           <Field label="开始日期" error={range ? null : "结束日期不能早于开始日期"}>
             <input type="date" value={fromDate} max={toDate || undefined} onChange={(e) => setFromDate(e.target.value)} />
@@ -764,7 +781,7 @@ function Ledger({ topups }: { topups: Topup[] | null }) {
             </Select>
           </Field>
         </RecordTableToolbar>
-        <p className="px-3 text-caption text-fg-3">搜索仅作用于已加载记录；日期和类型筛选由服务端执行，金额与余额快照不随分页重算。</p>
+        <p className="px-3 text-caption text-fg-3">搜索仅作用于已加载记录，CSV 按日期和类型下载。金额与余额快照不随分页重算。</p>
         {originErr && <p className="note crit" role="alert">入账来源读取失败：{originErr}</p>}
         {err && (
           <div className="note crit" role="alert">

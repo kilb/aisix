@@ -1,0 +1,17 @@
+/* 公共首页和登录使用同一组语义角色，保留已选的深浅主题。 */
+:where(.routio-public, .portal-auth) {
+  --public-bg: color-mix(in srgb, var(--card) 48%, var(--background));
+  --public-surface: var(--card);
+  --public-ink: color-mix(in srgb, var(--foreground) 90%, var(--chart-3));
+  --public-ink-muted: var(--ink-soft);
+  --public-accent: color-mix(in srgb, var(--chart-3) 57%, var(--ink-solid));
+  --public-accent-hover: color-mix(in srgb, var(--public-accent) 86%, var(--foreground));
+  --public-accent-soft: color-mix(in srgb, var(--chart-3) 8%, var(--public-surface));
+  --public-on-accent: var(--fg-inverse);
+  --public-line: color-mix(in srgb, var(--input) 28%, var(--border));
+  --public-hero: color-mix(in srgb, var(--chart-3) 11%, var(--background));
+}
+
+[data-theme="dark"] :where(.routio-public, .portal-auth) {
+  --public-accent: color-mix(in srgb, var(--chart-3) 68%, var(--foreground));
+}

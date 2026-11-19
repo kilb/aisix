@@ -16,6 +16,7 @@ import {
   type TenantKey,
 } from "./lib/api";
 import { BudgetAccountAmounts, type BudgetAccountBalance } from "./BudgetAccountAmounts";
+import { BudgetAlerts } from "./BudgetAlerts";
 import { formulaBalance } from "./lib/formulaApi";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { isCnyAmount, microCnyToInput } from "./lib/money";
@@ -288,6 +289,7 @@ export function Budgets({ member }: { member: SessionMember }) {
             empty={creator ? "还没有密钥额度，可在「新建额度」中新建" : "还没有密钥额度"}
             role={role} parentsOf={(b) => keyParents(quotas[b.target.id])} onVisibleKeys={setVisibleBudgetKeys} onChanged={reload} />}
         </Section>
+        {manager && <BudgetAlerts />}
       </BentoGrid>
     </>
   );

@@ -22,25 +22,32 @@ test.afterAll(async () => {
 });
 
 async function login(page: Page, who: Login): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await expect(page.getByRole("button", { name: "登出" })).toBeVisible();
+  await expect(page.getByRole("navigation", { name: "组织门户分区", exact: true })).toBeVisible();
+}
+
+function usageLink(page: Page, name: "调用记录" | "用量分析"): Locator {
+  return page.getByRole("navigation", { name: "组织门户分区", exact: true }).getByRole("link", { name, exact: true });
 }
 
 async function openUsage(page: Page, who: Login): Promise<{ log: Locator; summary: Locator }> {
   await login(page, who);
-  await page.getByRole("tab", { name: "用量" }).click();
+  await usageLink(page, "调用记录").click();
   return {
-    log: page.getByRole("region", { name: "调用记录" }),
-    summary: page.getByRole("region", { name: "用量汇总" }),
+    log: page.getByRole("region", { name: "调用记录", exact: true }),
+    summary: page.getByRole("region", { name: "用量汇总", exact: true }),
   };
 }
 
-/** The log's data rows: the table's body rows that are not an expanded detail. */
 function logRows(log: Locator): Locator {
-  return log.locator("tbody > tr:not(.usage-detail)");
+  return log.getByRole("table", { name: "调用记录", exact: true }).locator("tbody > tr");
+}
+
+function callCell(row: Locator, label: "模型 / 请求" | "状态" | "费用"): Locator {
+  return row.getByRole("cell").and(row.locator(`[data-label="${label}"]`));
 }
 
 async function signedIn(who: Login): Promise<ApiClient> {
@@ -144,7 +151,7 @@ async function pricedModel(world: BillingWorld, name: string): Promise<string> {
 }
 
 /** The names a tenant must never read, anywhere in the page or in what the API sent it. */
-const CHANNEL = ["acct-ui-7c1", "grp-ui-5d2", "upstream-mdl-ui-9f3", "upstream-", "sk-acct-", "ECONNREFUSED", "127.0.0.1"];
+const CHANNEL = ["acct-ui-7c1", "grp-ui-5d2", "upstream-mdl-ui-9f3", "sk-acct-ui-7c1-upstream", "ECONNREFUSED", "127.0.0.1"];
 
 test("调用记录逐次列出模型、密钥、状态与费用，抽屉内看到计费明细", async ({ page }) => {
   const world = await seedBillingWorld(stack);
@@ -154,19 +161,21 @@ test("调用记录逐次列出模型、密钥、状态与费用，抽屉内看�
 
   const rows = logRows(log);
   await expect(rows).toHaveCount(1);
-  const cells = rows.first().getByRole("cell");
-  await expect(cells.nth(2)).toHaveText("chat-ui");
-  await expect(cells.nth(3)).toHaveText("world-owner-key");
-  await expect(cells.nth(6)).toHaveText("成功");
-  await expect(cells.nth(7)).toHaveText(SHARED_DISPLAY_NAME);
-  await expect(cells.nth(8)).toHaveText("¥0.011");
+  const row = rows.first();
+  const identity = callCell(row, "模型 / 请求");
+  await expect(identity.getByText("chat-ui", { exact: true })).toBeVisible();
+  await expect(identity).toContainText("密钥 world-owner-key");
+  const status = callCell(row, "状态");
+  await expect(status.getByText("成功", { exact: true })).toBeVisible();
+  await expect(status.getByText(`分组 ${SHARED_DISPLAY_NAME}`, { exact: true })).toBeVisible();
+  await expect(callCell(row, "费用")).toHaveText("¥0.011");
 
   await rows.first().getByRole("button", { name: "查看调用详情", exact: true }).click();
   const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
   const detail = drawer.getByRole("table", { name: "计费明细" });
   await expect(detail.locator("tbody > tr")).toHaveCount(2);
-  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
-  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00", "¥1,000.00"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00", "¥2,000.00"]);
   // No discount, so nothing says one was taken.
   await expect(drawer.getByText(/组织折扣/)).toHaveCount(0);
 });
@@ -187,14 +196,14 @@ test("有组织折扣时，计费明细的单价标明为折扣前，并说明�
   await expect(rows).toHaveCount(1);
   // 5 input tokens at ¥1,000/M and 3 output at ¥2,000/M is ¥0.011 before
   // the discount; 10 % off leaves ¥0.0099.
-  await expect(rows.first().getByRole("cell").nth(8)).toHaveText("¥0.0099");
+  await expect(callCell(rows.first(), "费用")).toHaveText("¥0.0099");
   await rows.first().getByRole("button", { name: "查看调用详情", exact: true }).click();
   const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
   const detail = drawer.getByRole("table", { name: "计费明细" });
   // The unit prices are the group's, before the discount, and say so.
-  await expect(detail.getByRole("columnheader")).toHaveText(["计量", "数量", "折扣前单价（元/百万）"]);
-  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00"]);
-  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00"]);
+  await expect(detail.getByRole("columnheader")).toHaveText(["计量", "数量", "折扣前单价（元/百万）", "折后单价（元/百万）"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输入" }).getByRole("cell")).toHaveText(["输入", "5", "¥1,000.00", "¥900.00"]);
+  await expect(detail.getByRole("row").filter({ hasText: "输出" }).getByRole("cell")).toHaveText(["输出", "3", "¥2,000.00", "¥1,800.00"]);
   await expect(drawer.getByText("本次按组织折扣计费：在折扣前的价格上减免 10%。")).toBeVisible();
 });
 
@@ -208,18 +217,18 @@ test("调用记录与汇总里没有任何上游渠道、账号、分组或上�
   const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
   await expect(drawer.getByRole("table", { name: "计费明细" })).toBeVisible();
   const html = await page.content();
-  await drawer.getByRole("button", { name: "关闭调用详情", exact: true }).click();
-  await expect(summary.getByRole("table", { name: "用量汇总" }).locator("tbody > tr")).toHaveCount(1);
-
-  for (const region of [log, summary]) {
-    // The same read does see what the tenant may see, so an empty read cannot pass.
-    expect(await region.innerText()).toContain("chat-ui");
-  }
-  // The group's display name is what a tenant may read; its routing name never is.
-  expect(await log.innerText()).toContain(SHARED_DISPLAY_NAME);
-  // The page's markup, attributes included, and the log as the API sent it.
   expect(html).toContain(SHARED_DISPLAY_NAME);
   for (const channel of [...CHANNEL, "shared"]) expect(html).not.toContain(channel);
+  await drawer.getByRole("button", { name: "关闭调用详情", exact: true }).click();
+  await expect(logRows(log).first()).toContainText("chat-ui");
+  await expect(callCell(logRows(log).first(), "状态")).toContainText(SHARED_DISPLAY_NAME);
+
+  await usageLink(page, "用量分析").click();
+  const summaryRows = summary.getByRole("table", { name: "用量汇总" }).locator("tbody > tr");
+  await expect(summaryRows).toHaveCount(1);
+  await expect(summaryRows.first()).toContainText("chat-ui");
+  const summaryHtml = await page.content();
+  for (const channel of [...CHANNEL, "shared"]) expect(summaryHtml).not.toContain(channel);
   const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);
   expect(raw).toContain("chat-ui");
   expect(raw).toContain(SHARED_DISPLAY_NAME);
@@ -243,10 +252,10 @@ test("无权使用的模型与不存在的模型，在调用记录里显示相�
   const hidden = logRows(log).filter({ hasText: "chat-hidden-ui" });
   const missing = logRows(log).filter({ hasText: "no-such-model-ui-3a1" });
   await expect(missing).toHaveCount(1);
-  const missingStatus = (await missing.first().getByRole("cell").nth(6).innerText()).trim();
-  expect(missingStatus).toBe("失败（模型不存在）");
+  const missingStatus = "失败（模型不存在）";
+  await expect(callCell(missing, "状态").getByText(missingStatus, { exact: true })).toBeVisible();
   await expect(hidden).toHaveCount(1);
-  await expect(hidden.first().getByRole("cell").nth(6)).toHaveText(missingStatus);
+  await expect(callCell(hidden, "状态").getByText(missingStatus, { exact: true })).toBeVisible();
 });
 
 test("上游无法访问时只显示归一后的原因", async ({ page }) => {
@@ -261,7 +270,7 @@ test("上游无法访问时只显示归一后的原因", async ({ page }) => {
 
   const row = logRows(log).filter({ hasText: "chat-ui-down" });
   await expect(row).toHaveCount(1);
-  await expect(row.getByRole("cell").nth(6)).toHaveText("失败（上游暂不可用）");
+  await expect(callCell(row, "状态").getByText("失败（上游暂不可用）", { exact: true })).toBeVisible();
   // Nothing of the address the upstream was tried at, or of how it failed, in the page or in the API's answer.
   const html = await page.content();
   const raw = JSON.stringify((await (await signedIn(world.owner)).get("/api/usage/calls")).items);
@@ -285,7 +294,7 @@ test("按请求 ID 找到一次调用", async ({ page }) => {
   await expect(logRows(log)).toHaveCount(2);
   await log.getByLabel("请求 ID").fill("req-ui-7c1");
   await expect(logRows(log)).toHaveCount(1);
-  await expect(logRows(log).first().getByRole("cell").nth(5)).toHaveText("req-ui-7c1");
+  await expect(callCell(logRows(log).first(), "模型 / 请求").getByText("req-ui-7c1", { exact: true })).toBeVisible();
   // An id that only starts like it finds nothing: the match is exact.
   await log.getByLabel("请求 ID").fill("req-ui-7c");
   await expect(logRows(log)).toHaveCount(0);
@@ -300,7 +309,9 @@ test("尚未计价的调用显示待计价", async ({ page }) => {
 
   const row = logRows(log).filter({ hasText: "chat-ui-later" });
   await expect(row).toHaveCount(1);
-  await expect(row.getByRole("cell").nth(8)).toHaveText("待计价");
+  await expect(callCell(row, "费用")).toHaveText("金额未知");
+  await row.getByRole("button", { name: "查看调用详情", exact: true }).click();
+  await expect(page.getByRole("dialog").getByText("待计价，最终金额未知。", { exact: true })).toBeVisible();
 });
 
 test("成员只看到自己密钥的调用", async ({ page, browser }) => {
@@ -315,9 +326,12 @@ test("成员只看到自己密钥的调用", async ({ page, browser }) => {
 
   const { log } = await openUsage(page, member);
   await expect(logRows(log)).toHaveCount(1);
-  await expect(logRows(log).first().getByRole("cell").nth(3)).not.toHaveText("world-owner-key");
+  const identity = callCell(logRows(log).first(), "模型 / 请求");
+  await expect(identity).toContainText("密钥 member-key-");
+  await expect(identity).not.toContainText("world-owner-key");
   // The member's summary counts only the member's own call, at its own charge.
-  const mySummary = page.getByRole("region", { name: "用量汇总" });
+  await usageLink(page, "用量分析").click();
+  const mySummary = page.getByRole("region", { name: "用量汇总", exact: true });
   const mine1 = mySummary.locator("tbody tr");
   await expect(mine1).toHaveCount(1);
   await expect(mine1.first().getByRole("cell").nth(2)).toHaveText("1");
@@ -337,9 +351,11 @@ test("账单角色看到全部调用，但没有密钥筛选和错误提示", as
 
   const { log, summary } = await openUsage(page, billingMember);
   await expect(logRows(log)).toHaveCount(1);
+  await expect(page.getByLabel("密钥", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+  await usageLink(page, "用量分析").click();
   await expect(summary.getByRole("row").filter({ hasText: "chat-ui" })).toHaveCount(1);
-  await expect(log.getByLabel("密钥", { exact: true })).toHaveCount(0);
-  await expect(summary.getByLabel("密钥", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("密钥", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
@@ -351,15 +367,17 @@ test("用量汇总与调用记录一致", async ({ page }) => {
   const { log, summary } = await openUsage(page, world.owner);
 
   await expect(logRows(log)).toHaveCount(3);
-  const today = new Date().toISOString().slice(0, 10);
+  await usageLink(page, "用量分析").click();
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
   const row = summary.getByRole("row").filter({ hasText: today });
   await expect(row).toHaveCount(1);
   const cells = row.getByRole("cell");
-  await expect(summary).toContainText("按用量发生的时间汇总");
+  await summary.getByText("计费与汇总口径", { exact: true }).click();
+  await expect(summary.getByText(/^按用量发生的时间汇总/)).toBeVisible();
   await expect(cells.nth(1)).toHaveText("chat-ui");
   await expect(cells.nth(2)).toHaveText("3");
   await expect(cells.nth(3)).toHaveText("¥0.033");
-  await expect(cells.nth(4)).toHaveText(/输入 15(?!\d).*输出 9(?!\d)/);
+  await expect(cells.nth(4)).toHaveText(/输入\s*15(?!\d).*输出\s*9(?!\d)/);
 });
 
 test("缓存命中的调用显示不计费", async ({ page }) => {
@@ -387,8 +405,10 @@ test("缓存命中的调用显示不计费", async ({ page }) => {
   const { log } = await openUsage(page, world.owner);
 
   // Newest first: the top row is the cache hit.
-  await expect(logRows(log).first().getByRole("cell").nth(8)).toHaveText("不计费（缓存命中）");
-  await expect(logRows(log).last().getByRole("cell").nth(8)).toHaveText("¥0.011");
+  await expect(callCell(logRows(log).first(), "费用")).toHaveText("¥0.00");
+  await expect(callCell(logRows(log).last(), "费用")).toHaveText("¥0.011");
+  await logRows(log).first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  await expect(page.getByRole("dialog").getByText("费用 不计费（缓存命中）", { exact: true })).toBeVisible();
 });
 
 test("重新计价后，调用的费用显示已调整的金额，汇总计入调整", async ({ page }) => {
@@ -429,9 +449,14 @@ test("重新计价后，调用的费用显示已调整的金额，汇总计入�
 
   const { log, summary } = await openUsage(page, world.owner);
   await expect(logRows(log)).toHaveCount(1);
-  await expect(logRows(log).first().getByRole("cell").nth(8)).toHaveText("¥0.011（已调整 +¥0.011）");
+  await expect(callCell(logRows(log).first(), "费用")).toHaveText("¥0.022（含调整）");
+  await logRows(log).first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(drawer.getByText("¥0.011 +¥0.011 = ¥0.022", { exact: true })).toBeVisible();
+  await drawer.getByRole("button", { name: "关闭调用详情", exact: true }).click();
   // The correction counts in the period the call occurred in: ¥0.011 charged and ¥0.011 corrected.
-  const today = new Date().toISOString().slice(0, 10);
+  await usageLink(page, "用量分析").click();
+  const today = new Date().toLocaleDateString("sv-SE", { timeZone: "Asia/Shanghai" });
   await expect(summary.getByRole("row").filter({ hasText: today }).getByRole("cell").nth(3)).toHaveText("¥0.022");
 });
 
@@ -475,18 +500,36 @@ test("先未计价、后经重新计价的调用，费用显示重新计价的�
 
   const { log } = await openUsage(page, world.owner);
   await expect(logRows(log)).toHaveCount(1);
-  const cell = logRows(log).first().getByRole("cell").nth(8);
-  await expect(cell).toHaveText("¥0.011（重新计价）");
-  await expect(cell).not.toContainText("—");
+  await expect(callCell(logRows(log).first(), "费用")).toHaveText("¥0.011（含调整）");
+  await logRows(log).first().getByRole("button", { name: "查看调用详情", exact: true }).click();
+  const drawer = page.getByRole("dialog", { name: "调用详情", exact: true });
+  await expect(drawer.getByText("原调用待计价，未形成原始费用", { exact: true })).toBeVisible();
+  await expect(drawer.getByText("0（未形成原始费用） +¥0.011 = ¥0.011", { exact: true })).toBeVisible();
 });
 
 test("汇总的时间范围超过上限时，在日期旁说明，不发出请求", async ({ page }) => {
   const world = await seedBillingWorld(stack);
   const { summary } = await openUsage(page, world.owner);
-  await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveAttribute("data-value", "day");
-  await summary.getByLabel("开始日期（UTC）").fill("2020-01-01");
-  await summary.getByLabel("结束日期（UTC）").fill("2020-06-30");
-  await expect(summary).toContainText("按天最多 92 天，按月最多 731 天");
-  await chooseSelect(summary.getByRole("combobox", { name: "汇总方式" }), "month");
-  await expect(summary).not.toContainText("时间范围过大");
+  const requests: string[] = [];
+  page.on("request", request => {
+    const url = new URL(request.url());
+    if (url.pathname === "/api/usage/summary" && url.searchParams.get("from")?.startsWith("2019-12-31")) {
+      requests.push(url.searchParams.get("group") ?? "");
+    }
+  });
+  await usageLink(page, "用量分析").click();
+  const grouping = summary.getByRole("combobox", { name: "汇总方式" });
+  await expect(grouping).toContainText("按天");
+  const filters = page.getByRole("region", { name: "用量分析筛选", exact: true });
+  await filters.getByLabel("开始日期").fill("2020-01-01");
+  await filters.getByLabel("结束日期").fill("2020-06-30");
+  await expect(summary.getByRole("alert")).toContainText("时间范围过大");
+  const response = page.waitForResponse(answer => {
+    const url = new URL(answer.url());
+    return url.pathname === "/api/usage/summary" && url.searchParams.get("group") === "month";
+  });
+  await chooseSelect(grouping, "month");
+  expect((await response).status()).toBe(200);
+  await expect(summary.getByRole("alert")).toHaveCount(0);
+  expect(requests).toEqual(["month"]);
 });

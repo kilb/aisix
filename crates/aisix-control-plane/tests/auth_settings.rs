@@ -42,7 +42,7 @@ async fn authentication_settings_activate_independently_and_preserve_secrets_on_
     assert_eq!(
         options.body,
         json!({
-            "email_verification": false, "turnstile_site_key": null,
+            "email_verification": false, "password_recovery": false, "turnstile_site_key": null,
             "passkey": false, "github": false, "google": false,
         })
     );
@@ -71,7 +71,7 @@ async fn authentication_settings_activate_independently_and_preserve_secrets_on_
     assert_eq!(
         public.body,
         json!({
-            "email_verification": true, "turnstile_site_key": null,
+            "email_verification": true, "password_recovery": false, "turnstile_site_key": null,
             "passkey": true, "github": true, "google": false,
         })
     );

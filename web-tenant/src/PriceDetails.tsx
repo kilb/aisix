@@ -41,7 +41,12 @@ function PriceBandLabel({ column }: { column: PriceColumn }) {
   </>;
 }
 
-function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<DisplayPriceRate>; currency: "CNY" | "USD" }) {
+function TierPrices({ name, tier, currency, rateDescription }: {
+  name: string;
+  tier: TierQuote<DisplayPriceRate>;
+  currency: "CNY" | "USD";
+  rateDescription: string;
+}) {
   const heading = useId();
   const columns: PriceColumn[] = [
     { label: "基础价", through: tier.long_context[0]?.above_input_tokens ?? tier.unpriced_above_input_tokens, rates: tier.base },
@@ -57,7 +62,7 @@ function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<Di
   return <section className="price-tier" aria-labelledby={heading}>
     <header className="price-tier-header">
       <h4 id={heading} className="text-title text-fg">{tierName}</h4>
-      <p className="text-caption text-fg-3">{currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）"}</p>
+      <p className="text-caption text-fg-3">{rateDescription}</p>
     </header>
     <div className="price-matrix-scroll" role="region" aria-label={`${tierName}档完整模型单价`} tabIndex={0}>
       <table className="price-matrix" role="table" aria-label="完整模型单价" style={{ "--price-band-count": columns.length } as CSSProperties}>
@@ -92,10 +97,18 @@ function TierPrices({ name, tier, currency }: { name: string; tier: TierQuote<Di
   </section>;
 }
 
-export function PriceDetails({ tiers, currency = "CNY" }: { tiers: Record<string, TierQuote<DisplayPriceRate>>; currency?: "CNY" | "USD" }) {
+export function PriceDetails({
+  tiers,
+  currency = "CNY",
+  rateDescription = currency === "USD" ? "美元基准单价" : "组织实际单价（已含优惠）",
+}: {
+  tiers: Record<string, TierQuote<DisplayPriceRate>>;
+  currency?: "CNY" | "USD";
+  rateDescription?: string;
+}) {
   return <div className="price-details">
     <p className="text-caption text-fg-3">长上下文按包含缓存、音频和图像的整个输入 token 数选择价格列，整次请求使用本段价格。回退价格仅说明计费规则，不代表模型支持该模态。窄屏按计费项目逐项显示各上下文段的价格。</p>
     {Object.entries(tiers).sort(([a], [b]) => a === "default" ? -1 : b === "default" ? 1 : a.localeCompare(b))
-      .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} currency={currency} />)}
+      .map(([name, tier]) => <TierPrices key={name} name={name} tier={tier} currency={currency} rateDescription={rateDescription} />)}
   </div>;
 }

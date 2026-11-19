@@ -1,0 +1,9 @@
+.key-quickstart { display: grid; gap: 16px; min-width: 0; }
+.key-created-result > .btn { margin-top: 12px; }
+.key-quickstart-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.key-quickstart-example { display: grid; gap: 6px; min-width: 0; }
+.key-quickstart-example-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.key-quickstart-example-header h3 { margin: 0; font-size: var(--text-small); font-weight: 600; }
+.key-quickstart-example pre { margin: 0; padding: 12px; max-width: 100%; overflow-x: auto; color: var(--foreground); background: var(--muted); border: 1px solid var(--border); border-radius: var(--r-field); font-size: var(--text-small); }
+.key-quickstart-example :is(pre, code) { font-family: var(--font-mono); }
+@media (max-width: 540px) { .key-quickstart-fields { grid-template-columns: minmax(0, 1fr); } }

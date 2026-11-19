@@ -6,7 +6,7 @@ type Email = { enabled: boolean; endpoint: string; from: string };
 type Turnstile = { enabled: boolean; site_key: string };
 type OAuth = { enabled: boolean; client_id: string };
 
-type Common = { version: number; portal_origin: string; passkey: { enabled: boolean } };
+type Common = { version: number; portal_origin: string; passkey: { enabled: boolean }; password_recovery_enabled?: boolean };
 export type AuthenticationSettings = Common & {
   email: Email & { api_key_configured: boolean };
   turnstile: Turnstile & { secret_key_configured: boolean };
@@ -28,10 +28,11 @@ export async function writeAuthenticationSettings(draft: AuthenticationDraft): P
 }
 
 export function authenticationDraft(settings: AuthenticationSettings): AuthenticationDraft {
-  const { version, portal_origin, email, turnstile, passkey, github, google } = settings;
+  const { version, portal_origin, email, password_recovery_enabled, turnstile, passkey, github, google } = settings;
   return {
     version,
     portal_origin,
+    password_recovery_enabled,
     email: { enabled: email.enabled, endpoint: email.endpoint, from: email.from },
     turnstile: { enabled: turnstile.enabled, site_key: turnstile.site_key },
     passkey: { enabled: passkey.enabled },

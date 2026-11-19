@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::engine::{discount_at, model_pricing};
 use crate::{
     cny_per_million, effective_multiplier, CnyPerUsd, Dimension, Payer, PriceBook, PricingError,
-    Rates, ServiceTier,
+    RateCard, Rates, ServiceTier,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -134,6 +134,33 @@ fn baseline_rates_quote(rates: &Rates) -> Vec<BaselinePriceRate> {
         .collect()
 }
 
+fn tier_quotes(
+    card: &RateCard,
+    cny: CnyPerUsd,
+    discount_bps: u16,
+) -> BTreeMap<ServiceTier, TierQuote> {
+    card.0
+        .iter()
+        .map(|(tier, rates)| {
+            (
+                tier.clone(),
+                TierQuote {
+                    base: rates_quote(&rates.base, cny, discount_bps),
+                    unpriced_above_input_tokens: rates.unpriced_above_input_tokens,
+                    long_context: rates
+                        .long_context
+                        .iter()
+                        .map(|band| LongContextQuote {
+                            above_input_tokens: band.above_input_tokens,
+                            rates: rates_quote(&band.rates, cny, discount_bps),
+                        })
+                        .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
 impl PriceBook {
     /// 请求入口模型在同一时刻的 USD 基准价；当前无价或非法时从不回退旧价。
     pub fn baseline_quote(
@@ -168,6 +195,18 @@ impl PriceBook {
         )
     }
 
+    /// 公共分组按当前基准价与分组换算率报价，不读取任何组织优惠。
+    pub fn public_quote(
+        &self,
+        model_id: &str,
+        group_id: &str,
+        at: DateTime<Utc>,
+    ) -> Option<BTreeMap<ServiceTier, TierQuote>> {
+        let baseline = self.baseline(model_id, at)?.ok()?;
+        let rate = self.rate(group_id, model_id, at)?.ok()?;
+        Some(tier_quotes(baseline.card, rate.cny, 0))
+    }
+
     /// 与真实收费相同的组织优惠；非法当前修订从不回退为原价。
     pub fn customer_discount_bps(
         &self,
@@ -188,33 +227,11 @@ impl PriceBook {
         let discount_bps = self.customer_discount_bps(&payer.tenant_id, at)?;
         let effective_multiplier = effective_multiplier(rate.cny, discount_bps)
             .ok_or(PricingError::DiscountAboveWhole { bps: discount_bps })?;
-        let prices_by_tier = baseline
-            .card
-            .0
-            .iter()
-            .map(|(tier, rates)| {
-                (
-                    tier.clone(),
-                    TierQuote {
-                        base: rates_quote(&rates.base, rate.cny, discount_bps),
-                        unpriced_above_input_tokens: rates.unpriced_above_input_tokens,
-                        long_context: rates
-                            .long_context
-                            .iter()
-                            .map(|band| LongContextQuote {
-                                above_input_tokens: band.above_input_tokens,
-                                rates: rates_quote(&band.rates, rate.cny, discount_bps),
-                            })
-                            .collect(),
-                    },
-                )
-            })
-            .collect();
         Ok(CustomerQuote {
             discount_bps,
             cny_per_usd: rate.cny,
             effective_multiplier,
-            prices_by_tier,
+            prices_by_tier: tier_quotes(baseline.card, rate.cny, discount_bps),
         })
     }
 }

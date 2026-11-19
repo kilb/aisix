@@ -148,7 +148,7 @@ async function background(page: Page): Promise<string> {
 }
 
 async function signIn(page: Page): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(OWNER);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();
@@ -178,7 +178,7 @@ const PAGES: Shown[] = [
     name: "登录",
     signedIn: false,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await expect(page.getByLabel("邮箱")).toBeVisible();
     },
   },
@@ -187,7 +187,7 @@ const PAGES: Shown[] = [
     name: "注册组织",
     signedIn: false,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await page.getByRole("tab", { name: "注册组织" }).click();
       await expect(page.getByLabel("组织名称")).toBeVisible();
     },
@@ -197,7 +197,7 @@ const PAGES: Shown[] = [
     name: "组织",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await expect(page.getByRole("main")).toContainText(ORG);
     },
   },
@@ -206,7 +206,7 @@ const PAGES: Shown[] = [
     name: "密钥",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await openTab(page, "密钥", "legacy-import");
     },
   },
@@ -215,7 +215,7 @@ const PAGES: Shown[] = [
     name: "用量",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await openTab(page, "用量", "调用记录");
       await expect(page.getByRole("table", { name: "调用记录" }).locator("tbody tr").first()).toContainText("¥0.011");
     },
@@ -225,7 +225,7 @@ const PAGES: Shown[] = [
     name: "价格",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       // The priced model, at its group's rate: the table is in before the page is judged.
       await openTab(page, "价格", "chat-small");
     },
@@ -235,7 +235,7 @@ const PAGES: Shown[] = [
     name: "预算",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await openTab(page, "预算", "密钥额度");
       await expect(page.getByRole("table", { name: "密钥实际可用" }).locator("tbody tr").first()).toBeVisible();
       await expect(page.getByRole("table", { name: "密钥额度" }).locator("tbody tr").first()).toBeVisible();
@@ -246,7 +246,7 @@ const PAGES: Shown[] = [
     name: "账户",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await openTab(page, "账户", "余额流水");
       // The seven-figure ¥ balance and the readout are in before the page is judged:
       // ¥1,234,567.879, the funding less the one call, is the widest figure either carries.
@@ -259,7 +259,7 @@ const PAGES: Shown[] = [
     name: "成员",
     signedIn: true,
     open: async (page) => {
-      await page.goto(stack.previewUrl);
+      await page.goto(`${stack.previewUrl}/login`);
       await openTab(page, "成员", "new@visual-7e4.test");
     },
   },

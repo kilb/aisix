@@ -33,7 +33,7 @@ async function api(page: Page, path: string, method = "GET", body?: object, vers
 async function login(page: Page): Promise<void> {
   const who = auth.keysOwner ?? auth.metricsOwner;
   if (!who) throw new Error("local-auth.json must provide keysOwner or metricsOwner");
-  await page.goto(baseUrl);
+  await page.goto(`${baseUrl.replace(/\/$/, "")}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   const response = page.waitForResponse(r => new URL(r.url()).pathname === "/api/login" && r.request().method() === "POST");

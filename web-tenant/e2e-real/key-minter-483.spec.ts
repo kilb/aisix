@@ -33,7 +33,7 @@ test("organization keys retain their named minter when the minter is disabled an
   const expected = { kind: "member", id: creator.id, display_name: creatorName };
   expect(minted.key.owner).toBeNull();
   expect(minted.key.created_by).toEqual(expected);
-  await page.goto(state.tenantUrl);
+  await page.goto(`${state.tenantUrl.replace(/\/$/, "")}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(owner.email);
   await page.getByLabel("口令", { exact: true }).fill(owner.password);
   const login = page.waitForResponse(response => new URL(response.url()).pathname === "/api/login" && response.request().method() === "POST");
@@ -41,7 +41,7 @@ test("organization keys retain their named minter when the minter is disabled an
   expect((await login).status()).toBe(200);
   await page.goto(state.tenantUrl + "/#keys");
   await expect(page.getByRole("heading", { name: "API 密钥", exact: true })).toBeVisible();
-  await expect(page.getByText("组织密钥归组织所有；创建者被停用或移除后仍保留，不会自动吊销。", { exact: true })).toBeVisible();
+  await expect(page.getByText("组织密钥归组织所有；创建者被停用或移除后仍保留，不会自动吊销。")).toBeVisible();
   const row = page.getByRole("row").filter({ has: page.getByRole("link", { name: minted.key.label, exact: true }) });
   await expect(row.locator('[data-label="归属"]')).toHaveText("组织");
   await expect(row.locator('[data-label="创建者"]')).toHaveText(creatorName);

@@ -17,11 +17,13 @@ import { PORTAL_TABS as TABS, canSeePortalTab, portalRouteOf as routeOf, type Po
 import { RouteNav } from "./ui/RouteNav";
 import { SidebarMenuButton, SidebarShell } from "./ui/Sidebar";
 import { ThemeToggle } from "./ui/ThemeToggle";
-import { Gate } from "./Gate";
+import { Home } from "./Home";
+import { portalEntryOf, portalPagePath, type PortalEntry } from "./lib/portalEntry";
 import { Org, ROLE_LABEL } from "./Org";
 import "./App.css";
 
 // 业务页按实际导航加载，登录与概览不再下载全部管理表单。
+const Gate = lazy(() => import("./Gate").then((module) => ({ default: module.Gate })));
 const AccountSettings = lazy(() => import("./AccountSettings").then((module) => ({ default: module.AccountSettings })));
 const Keys = lazy(() => import("./Keys").then((module) => ({ default: module.Keys })));
 const KeyDetail = lazy(() => import("./KeyDetail").then((module) => ({ default: module.KeyDetail })));
@@ -31,6 +33,9 @@ const Billing = lazy(() => import("./Billing").then((module) => ({ default: modu
 const Budgets = lazy(() => import("./Budgets").then((module) => ({ default: module.Budgets })));
 const Prices = lazy(() => import("./Prices").then((module) => ({ default: module.Prices })));
 const Usage = lazy(() => import("./Usage").then((module) => ({ default: module.Usage })));
+
+const BASE = import.meta.env.BASE_URL;
+const readEntry = () => portalEntryOf(window.location.pathname, window.location.hash, BASE);
 
 export type TabId = PortalTabId;
 
@@ -49,6 +54,7 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
   // null until the session is read: defaulting to signed-out would flash
   // the gate on every reload, and most reloads are signed in.
   const [apiContract, setApiContract] = useState<number | null>(null);
+  const [entry, setEntry] = useState(readEntry);
   const [me, setMe] = useState<SignedIn | null>(null);
   const [invite, setInvite] = useState(inviteToken);
   const [bootError, setBootError] = useState<string | null>(null);
@@ -76,32 +82,54 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
     return () => window.removeEventListener("scroll", read);
   }, []);
 
-  // Any page's request that finds the session gone drops back to the gate:
-  // what was on screen is no longer the member's to see or act on. (The
-  // gate's own requests never answer `unauthenticated`.)
+  const readAddress = useCallback(() => {
+    setEntry(readEntry());
+    const route = routeOf(window.location.hash);
+    setTab(route.tab);
+    setPriceGroup(route.group);
+    setMemberId(route.memberId ?? null);
+    setKeyId(route.keyId ?? null);
+  }, []);
+
+  useEffect(() => {
+    readAddress();
+    window.addEventListener("hashchange", readAddress);
+    window.addEventListener("popstate", readAddress);
+    return () => {
+      window.removeEventListener("hashchange", readAddress);
+      window.removeEventListener("popstate", readAddress);
+    };
+  }, [readAddress]);
+
+  const openEntry = useCallback((next: PortalEntry, replace = false, hash = "") => {
+    const url = portalPagePath(BASE, next, hash);
+    if (window.location.pathname + window.location.hash !== url) {
+      if (replace) window.history.replaceState(null, "", url);
+      else window.history.pushState(null, "", url);
+    }
+    readAddress();
+  }, [readAddress]);
+
+  useEffect(() => {
+    const titles = {
+      home: "Routio · AI 模型网关",
+      login: "登录 Routio",
+      signup: "注册组织 · Routio",
+      invite: "接受邀请 · Routio",
+      console: "Routio 组织门户",
+    };
+    document.title = titles[entry];
+  }, [entry]);
+
+  // 会话过期时立即卸载组织工作区。
   useEffect(() => {
     onSessionEnded(() => {
       setMe(null);
       setNotice("登录已过期，请重新登录");
+      openEntry("login", true);
     });
     return () => onSessionEnded(null);
-  }, []);
-
-  // The address opens a section, and a link to one opens it without a
-  // reload: `#prices?group=<id>` from a key form's 查看价格. Read once here,
-  // then on every change while the page is open.
-  useEffect(() => {
-    const apply = () => {
-      const route = routeOf(window.location.hash);
-      setTab(route.tab);
-      setPriceGroup(route.group);
-      setMemberId(route.memberId ?? null);
-      setKeyId(route.keyId ?? null);
-    };
-    apply();
-    window.addEventListener("hashchange", apply);
-    return () => window.removeEventListener("hashchange", apply);
-  }, []);
+  }, [openEntry]);
 
   // A section opened from the nav writes its own fragment, so the address
   // always names the section shown: a reload reopens it, and a link to the
@@ -121,7 +149,8 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
   const leave = useCallback(() => {
     setMe(null);
     setNotice("你已离开该组织");
-  }, []);
+    openEntry("login", true);
+  }, [openEntry]);
 
   const boot = useCallback(async () => {
     setBootError(null);
@@ -140,6 +169,13 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
     void boot();
   }, [boot]);
 
+  // 登录用户打开旧的 hash 书签时保留分区，统一到独立工作区地址。
+  useEffect(() => {
+    if (!me || invite !== null || entry === "home") return;
+    if (window.location.pathname === portalPagePath(BASE, "console")) return;
+    openEntry("console", true, entry === "console" ? window.location.hash : "#org");
+  }, [entry, invite, me, openEntry]);
+
   const signIn = useCallback((s: Session) => {
     setMe(signedIn(s));
     setInvite(null);
@@ -147,9 +183,9 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
     setNotice(null);
     setAccountNotice(null);
     // 更新地址并卸载认证表单，让密码管理器识别异步登录已成功。
-    window.history.replaceState(null, "", "#org");
-    openSection("org");
-  }, [openSection]);
+    const destination = entry === "console" && window.location.hash ? window.location.hash : "#org";
+    openEntry("console", true, destination);
+  }, [entry, openEntry]);
 
   // Signed out only once the control plane has ended the session (or says
   // there was none): a failed request leaves the session live, and showing
@@ -166,15 +202,28 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
     }
     setMe(null);
     setAccountNotice(null);
-  }, []);
+    openEntry("login", true);
+  }, [openEntry]);
 
   const visible = me ? TABS.filter((t) => canSeePortalTab(t.id, me.member.role, me.tenant.status)) : [];
   const current: TabId = visible.some((t) => t.id === tab) ? tab : "org";
 
   // 长列表进入新页时回到标题，避免把账号页等短页停在旧页的滚动位置。
   useLayoutEffect(() => {
-    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
-  }, [current, memberId, keyId, me?.tenant.id, me?.member.id]);
+    if (entry !== "home") window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [entry, current, memberId, keyId, me?.tenant.id, me?.member.id]);
+
+  if (entry === "home" && invite === null) {
+    return (
+      <Home
+        homeHref={portalPagePath(BASE, "home")}
+        loginHref={portalPagePath(BASE, "login")}
+        signupHref={portalPagePath(BASE, "signup")}
+        consoleHref={portalPagePath(BASE, "console")}
+        signedIn={me !== null}
+      />
+    );
+  }
 
   if (bootError) {
     return (
@@ -210,15 +259,22 @@ export function App({ inviteToken, oauthResult = null }: { inviteToken: string |
   // accepting signs in as the invited member in its place.
   if (!me || invite !== null) {
     return (
-      <Gate
-        theme={theme}
-        onToggleTheme={toggleTheme}
-        invite={invite}
-        signedIn={me !== null}
-        notice={notice}
-        onIn={signIn}
-        onLeaveInvite={() => setInvite(null)}
-      />
+      <Suspense fallback={<div className="boot" role="status">载入中…</div>}>
+        <Gate
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          invite={invite}
+          signedIn={me !== null}
+          notice={notice}
+          mode={entry === "signup" ? "signup" : "login"}
+          onModeChange={(mode) => openEntry(mode)}
+          onIn={signIn}
+          onLeaveInvite={() => {
+            setInvite(null);
+            openEntry(me ? "console" : "login", true);
+          }}
+        />
+      </Suspense>
     );
   }
 

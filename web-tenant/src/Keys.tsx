@@ -18,6 +18,7 @@ import {
 } from "./lib/api";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { ShownOnce } from "./controls";
+import { KeyQuickstart, QUICKSTART_TITLE } from "./KeyQuickstart";
 import { FormDialog } from "./ui/FormDialog";
 import { Button } from "./ui/Button";
 import { DataTable, Loading } from "./ui/DataTable";
@@ -90,7 +91,9 @@ export function Keys({
   const [createBusy, setCreateBusy] = useState(false);
   // The plaintext, in this page's state alone: it goes with a reload or a
   // change of page. The list's own 复制 reveals it again.
-  const [minted, setMinted] = useState<string | null>(null);
+  const [minted, setMinted] = useState<{ id: string; plaintext: string } | null>(null);
+  const [quickstartKey, setQuickstartKey] = useState<string | null>(null);
+  const quickstartReturn = useRef<HTMLElement>(null);
   const createdResult = useRef<HTMLDivElement>(null);
   useEffect(() => { if (minted && createOpen) createdResult.current?.focus(); }, [minted, createOpen]);
   const [actionErr, setActionErr] = useState<string | null>(null);
@@ -196,7 +199,7 @@ export function Keys({
   return (
     <>
       <PageHeader
-        actions={active && <Button kind="primary" onClick={() => { setMinted(null); setCreateOpen(true); }}><Plus aria-hidden />新建密钥</Button>}
+        actions={active && <Button kind="primary" onClick={() => { quickstartReturn.current = null; setMinted(null); setCreateOpen(true); }}><Plus aria-hidden />新建密钥</Button>}
         title="API 密钥"
         eyebrow={visibleScope}
         dataLead={`${visibleScope}，管理调用凭据、模型范围与使用限制。`}
@@ -264,7 +267,7 @@ export function Keys({
                     <tr key={k.id}>
                       <td data-label="名称">
                         <span className="key-name" title={k.label}>
-                          <a className="key-detail-link" href={detailHref}>{k.label}</a>
+                          <a id={`key-name-${k.id}`} className="key-detail-link" href={detailHref}>{k.label}</a>
                         </span>
                         <span className="key-prefix">
                           <KeySecret
@@ -324,6 +327,10 @@ export function Keys({
                         <span className="acts">
                           <Menu label={`更多操作：${k.label}`} disabled={busy === k.id} items={[
                             { label: "查看用量", onSelect: () => { window.location.hash = detailHref; } },
+                            ...(active && state.lamp === "applied" ? [{ label: QUICKSTART_TITLE, onSelect: () => {
+                              quickstartReturn.current = document.getElementById(`key-name-${k.id}`);
+                              setQuickstartKey(k.id);
+                            } }] : []),
                             ...(active ? [{ label: "修改密钥", onSelect: () => { window.location.hash = `${detailHref}&edit=1`; } }] : []),
                           ]} />
                           {/* The organisation's own switch, which the platform's overrides. */}
@@ -363,8 +370,16 @@ export function Keys({
           )}
           {items !== null && <RecordTablePager page={table.page} pageSize={table.pageSize} onPageChange={table.setPage} onPageSizeChange={table.setPageSize} total={table.filteredCount} label="密钥" />}
         </Card>
-        {active && <FormDialog open={createOpen} onOpenChange={(next) => { setCreateOpen(next); if (!next) setMinted(null); }} busy={createBusy} title={minted ? "密钥已创建" : "新建密钥"} description="先选择计价分组，再设置模型范围与限制。留空的限制沿用组织上限。">
-          {minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result"><ShownOnce title="密钥已创建" masked value={minted} onDone={() => { setCreateOpen(false); setMinted(null); }}><span className="hint">密钥已隐藏，复制后即可使用；之后也可以在密钥列表里重新复制。</span></ShownOnce></div> : <KeyForm
+        {active && <FormDialog open={createOpen || quickstartKey !== null} onOpenChange={(next) => {
+          setCreateOpen(next);
+          if (!next) { setMinted(null); setQuickstartKey(null); }
+        }} busy={createBusy} title={quickstartKey ? QUICKSTART_TITLE : minted ? "密钥已创建" : "新建密钥"} description={quickstartKey || minted ? undefined : "先选择计价分组，再设置模型范围与限制。留空的限制沿用组织上限。"} returnFocusRef={quickstartReturn}>
+          {quickstartKey ? <KeyQuickstart key={quickstartKey} keyId={quickstartKey} /> : minted ? <div ref={createdResult} tabIndex={-1} aria-label="密钥已创建" className="key-created-result">
+            <ShownOnce title="密钥已创建" masked value={minted.plaintext} onDone={() => { setCreateOpen(false); setMinted(null); }}>
+              <span className="hint">密钥已隐藏，复制后即可使用；之后也可以在密钥列表里重新复制。</span>
+            </ShownOnce>
+            <Button onClick={() => { setQuickstartKey(minted.id); setMinted(null); }}>{QUICKSTART_TITLE}</Button>
+          </div> : <KeyForm
             me={member}
             manager={manager}
             catalog={catalog}
@@ -375,8 +390,8 @@ export function Keys({
             onInactive={onSelfChanged}
             onBusyChange={setCreateBusy}
             onCancel={() => setCreateOpen(false)}
-            onCreated={(plaintext) => {
-              setMinted(plaintext);
+            onCreated={(id, plaintext) => {
+              setMinted({ id, plaintext });
               void load();
             }}
           />}
@@ -532,7 +547,7 @@ export function KeyForm({
   readErr: string | null;
   /** Called when the control plane says the organisation is no longer active. */
   onInactive: () => void;
-  onCreated?: (plaintext: string) => void;
+  onCreated?: (id: string, plaintext: string) => void;
   initial?: TenantKey;
   onSaved?: (key: TenantKey) => void;
   onConflict?: () => void;
@@ -643,7 +658,7 @@ export function KeyForm({
         onSaved?.(updated);
         return;
       }
-      const { plaintext } = await keyApi.create(body);
+      const { key, plaintext } = await keyApi.create(body);
       setLabel("");
       setGroup(groups !== null && groups.length === 1 ? (groups[0]?.id ?? "") : "");
       setModelScope("inherited");
@@ -655,7 +670,7 @@ export function KeyForm({
       setBudgetAmount("");
       setBudgetPeriod("cumulative");
       setOwner("");
-      onCreated?.(plaintext);
+      onCreated?.(key.id, plaintext);
     } catch (e) {
       if (e instanceof ApiError && e.code === "validation_failed" && e.details.length > 0) {
         // Each refusal beside its field; one the form has no field for above the button.

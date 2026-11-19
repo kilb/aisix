@@ -405,14 +405,50 @@ pub async fn request(
 
 #[derive(Deserialize)]
 pub struct TenantListQuery {
-    status: Option<Status>,
+    #[serde(flatten)]
+    filters: TopupFilters,
     limit: Option<i64>,
     /// Only top-ups with a smaller `seq`: the `next_before` of the previous
     /// page.
     before: Option<i64>,
 }
 
-/// `GET /api/billing/topups[?status&limit&before]` → `{items: [Topup],
+#[derive(Deserialize)]
+pub struct TopupFilters {
+    status: Option<Status>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+}
+
+impl TopupFilters {
+    pub(super) fn validate(&self) -> Result<(), ApiError> {
+        if let (Some(from), Some(to)) = (self.from, self.to) {
+            super::range::checked_range(from, to, None)?;
+        }
+        Ok(())
+    }
+
+    fn push_dates(&self, sql: &mut QueryBuilder<'_, Postgres>) {
+        if let Some(from) = self.from {
+            sql.push(" AND p.requested_at >= ").push_bind(from);
+        }
+        if let Some(to) = self.to {
+            sql.push(" AND p.requested_at < ").push_bind(to);
+        }
+    }
+
+    pub(super) fn push_page(
+        &self,
+        sql: &mut QueryBuilder<'_, Postgres>,
+        before: Option<i64>,
+        limit: i64,
+    ) {
+        self.push_dates(sql);
+        filtered_page(sql, self.status, None, before, limit);
+    }
+}
+
+/// `GET /api/billing/topups[?from&to&status&limit&before]` → `{items: [Topup],
 /// next_before}`: the caller's organization's top-ups, operator credits
 /// included, newest first, paged as `/admin/usage/events` is.
 pub async fn list(
@@ -423,10 +459,11 @@ pub async fn list(
     auth.require_active()?;
     auth.require(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing])?;
     let Query(q) = query.map_err(query_rejected)?;
+    q.filters.validate()?;
     let limit = page_limit(q.limit);
     let mut sql = QueryBuilder::<Postgres>::new(format!("{SELECT} WHERE p.tenant_id = "));
     sql.push_bind(auth.tenant_id);
-    filtered_page(&mut sql, q.status, None, q.before, limit);
+    q.filters.push_page(&mut sql, q.before, limit);
     let rows: Vec<TopupRow> = sql
         .build_query_as()
         .fetch_all(state.db.pool())

@@ -17,7 +17,7 @@ test.afterAll(async () => {
 
 test("种子组织的所有者能登录并看到组织页", async ({ page }) => {
   const world = await seedBillingWorld(stack);
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(world.owner.email);
   await page.getByLabel("口令", { exact: true }).fill(world.owner.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();

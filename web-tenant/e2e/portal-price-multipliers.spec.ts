@@ -121,7 +121,7 @@ test("美元基准与分组精确报价切换、详情、搜索和分页保留�
   expect(baseline.currency).toBe("USD");
   expect(baseline.prices_by_tier.default.base.find((rate: { dimension: string }) => rate.dimension === "input").price_usd_per_million).toBe("4");
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(world.email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();
@@ -243,7 +243,7 @@ test("美元基准与分组精确报价切换、详情、搜索和分页保留�
 test("报价到期时离线也撤下旧价格，恢复网络后重取同一时点的美元与人民币", async ({ page, context }) => {
   test.setTimeout(180_000);
   const world = await priceWorld();
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(world.email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();

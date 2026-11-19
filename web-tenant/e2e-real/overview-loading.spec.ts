@@ -15,7 +15,7 @@ test("用量汇总解释未授权或未知模型，保留这组的调用次数",
   const login = await context.request.post(new URL("/api/login", base).href, { data: auth.metricsOwner });
   expect(login.status()).toBe(200);
   try {
-    await page.goto(baseUrl);
+    await page.goto(`${baseUrl.replace(/\/$/, "")}/console`);
     const recent = await page.evaluate(async () => {
       const response = await fetch("/api/usage/calls?limit=1");
       if (!response.ok) throw new Error("无法读取隔离环境中的历史调用");

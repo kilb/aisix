@@ -58,7 +58,7 @@ test.beforeEach(async ({ page }) => {
   });
   const who = auth.metricsOwner;
   if (typeof who?.email !== "string" || typeof who?.password !== "string") throw new Error("Isolated owner login is required");
-  await page.goto(baseUrl);
+  await page.goto(`${baseUrl.replace(/\/$/, "")}/login`);
   await expect(page.getByLabel("邮箱", { exact: true })).toBeVisible();
   try {
     await page.getByLabel("邮箱", { exact: true }).fill(who.email);

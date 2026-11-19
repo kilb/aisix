@@ -38,11 +38,11 @@ test("实际可用与 API 密钥自查一致", async ({ page }) => {
     )
     .toBe("0.039000");
 
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(world.owner.email);
   await page.getByLabel("口令", { exact: true }).fill(world.owner.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
-  await page.getByRole("tab", { name: "预算" }).click();
+  await page.getByRole("navigation", { name: "组织门户分区" }).getByRole("link", { name: "预算", exact: true }).click();
   const figures = page
     .getByRole("table", { name: "密钥实际可用", exact: true })
     .locator("tbody tr")

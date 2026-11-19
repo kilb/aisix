@@ -19,7 +19,7 @@ mkdirSync(output, { recursive: true });
 
 async function login(page: Page, admin = false): Promise<void> {
   const who = admin ? auth.operator : auth.metricsOwner ?? auth.owner;
-  await page.goto(admin ? adminOrigin : tenantOrigin);
+  await page.goto(admin ? adminOrigin : `${tenantOrigin.replace(/\/$/, "")}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   const answer = page.waitForResponse(response => new URL(response.url()).pathname === (admin ? "/admin/login" : "/api/login") && response.request().method() === "POST");

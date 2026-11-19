@@ -46,7 +46,7 @@ async function submit(page: Page, dialog: Locator): Promise<{ key: CreatedKey; b
 
 async function login(page: Page): Promise<void> {
   const owner = auth.metricsOwner ?? auth.owner;
-  await page.goto(origin);
+  await page.goto(`${origin.replace(/\/$/, "")}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(owner.email);
   await page.getByLabel("口令", { exact: true }).fill(owner.password);
   const answer = page.waitForResponse(response => new URL(response.url()).pathname === "/api/login" && response.request().method() === "POST");

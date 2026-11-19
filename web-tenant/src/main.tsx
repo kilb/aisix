@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import { App } from "./App";
 import { ToastProvider } from "./ui/Toast";
+import { portalPagePath } from "./lib/portalEntry";
 // 中文沿用自托管字体，拉丁字符与数字使用模板的 Manrope。
 import "@fontsource/noto-sans-sc/400.css";
 import "./assets/fonts/fonts.css";
@@ -22,7 +23,7 @@ import "./assets/fonts/fonts.css";
 function takeInviteToken(): string | null {
   const fragment = new URLSearchParams(window.location.hash.slice(1));
   if (!fragment.has("token")) return null;
-  window.history.replaceState(null, "", import.meta.env.BASE_URL);
+  window.history.replaceState(null, "", portalPagePath(import.meta.env.BASE_URL, "invite"));
   const token = fragment.get("token");
   if (!token) return null;
   return token;
@@ -35,7 +36,10 @@ function takeOAuthResult(): "success" | "linked" | "error" | "restart" | null {
   const result = url.searchParams.get("auth");
   if (result !== "success" && result !== "linked" && result !== "error" && result !== "restart") return null;
   url.searchParams.delete("auth");
-  if (result === "linked" || result === "error") url.hash = "account";
+  const account = result === "linked" || result === "error";
+  const path = portalPagePath(import.meta.env.BASE_URL, result === "restart" ? "login" : "console");
+  url.pathname = path;
+  url.hash = account ? "account" : "";
   window.history.replaceState(null, "", url);
   return result;
 }

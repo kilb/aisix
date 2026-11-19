@@ -3,6 +3,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type 
 import { ChevronRight } from "lucide-react";
 import {
   ApiError,
+  exportUsageCalls,
   keys as keyApi,
   models as modelApi,
   usageSummary,
@@ -12,6 +13,7 @@ import {
   type UsageSummaryRow,
 } from "./lib/api";
 import { formulaCalls as usageCalls, type FormulaCall as Call } from "./lib/formulaApi";
+import { CsvExportButton } from "./components/CsvExportButton";
 import { discountedRate, feeMicroCny } from "./lib/formula";
 import { formMessageFor, messageFor } from "./lib/errors";
 import { fmtCnyPerMillion, fmtMicroCny, perThousandOfPerMillion } from "./lib/money";
@@ -535,6 +537,13 @@ function Summary({ keys, showKeys, ownScope, models }: { keys: TenantKey[]; show
           <Field label="模型"><Select value={query.get("model_id") ?? ""} onValueChange={selectedValue => update({ model_id: selectedValue, from: metricsFrom, to: metricsTo })}><option value="">全部</option>{query.get("model_id") && !models.some(model => model.id === query.get("model_id")) && <option value={query.get("model_id")!}>已选模型（{query.get("model_id")}，当前列表未提供）</option>}{models.map(model => <option key={model.id} value={model.id}>{model.name}</option>)}</Select></Field>
           <div className="usage-analysis-actions">
             <Button onClick={() => setRefresh(value => value + 1)}>刷新分析</Button>
+            <CsvExportButton label="下载调用 CSV" disabled={!range} onExport={() => exportUsageCalls({
+              from: metricsFrom,
+              to: metricsTo,
+              model_id: query.get("model_id") || undefined,
+              api_key_id: keyId || undefined,
+              member_id: query.get("member_id") || undefined,
+            })} />
             <a className="metric-scope-action" href={`#calls?${new URLSearchParams({ ...Object.fromEntries(query), from: metricsFrom, to: metricsTo })}`}>查看调用记录</a>
           </div>
         </div>
@@ -631,16 +640,15 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
   // 旧状态深链映射到服务端结果筛选，首次操作写入新的标准参数。
   const recordFilters = { ...usageRecordFilterValues(query), outcome: query.get("outcome") ?? query.get("status") ?? "" };
   const range = usageRange(query);
-  const request = {
+  const serverFilters = {
     ...range,
-    group_requests: true,
-    limit: pageSize,
     ...(keyId ? { api_key_id: keyId } : {}),
     ...(modelId ? { model_id: modelId } : {}),
     ...(requestId ? { request_id: requestId } : {}),
     ...(query.get("member_id") ? { member_id: query.get("member_id")! } : {}),
     ...usageRecordFilterParams(recordFilters, "tenant"),
   };
+  const request = { ...serverFilters, group_requests: true, limit: pageSize };
   const requestKey = usageRequestKey(query, request);
   const shown = currentQueryResult(result, requestKey);
   const rows = shown?.rows ?? null;
@@ -759,9 +767,10 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         </label>
       </UsageRecordFilters>
       <Section ref={resultCard} style={{ minHeight: resultsLoading ? resultHeight : undefined }} title="调用记录" number={8} className="usage-calls-section call-table-card" actions={<>
+        <CsvExportButton disabled={!range || (requestEditing && typed.trim() !== requestId)} onExport={() => exportUsageCalls(serverFilters)} />
         <details className="usage-summary-notes usage-call-notes">
           <summary>筛选、性能与计费口径</summary>
-          <p>文字搜索仅筛选已加载记录；调用结果与更多筛选作用于全部匹配记录。</p>
+          <p>文字搜索仅筛选已加载记录；CSV 按日期与服务端筛选下载。</p>
           <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
           <p>同一请求合并一行，优先展示最终成功结果；费用汇总全部实际计费尝试。详情保留故障转移、同目标重试与每次已保存日志。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。</p>
         </details>

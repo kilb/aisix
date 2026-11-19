@@ -17,10 +17,12 @@
 
 pub mod access;
 pub mod accounts;
+pub mod alerts;
 pub mod budget_routes;
 pub mod budgets;
 pub mod calls;
 pub mod credits;
+pub mod export;
 pub mod ledger;
 pub mod lookup_prices;
 pub mod lookup_quota;
@@ -30,6 +32,7 @@ pub mod money;
 pub mod plans;
 pub mod profit_projection;
 pub mod profit_summary;
+pub mod public_prices;
 pub mod range;
 pub mod reconcile;
 pub mod repricing;

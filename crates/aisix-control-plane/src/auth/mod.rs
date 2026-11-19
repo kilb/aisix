@@ -5,6 +5,7 @@ pub mod extract;
 pub(crate) mod oauth;
 pub(crate) mod passkey;
 pub mod password;
+pub(crate) mod recovery;
 pub mod session;
 pub(crate) mod settings;
 pub(crate) mod verification;

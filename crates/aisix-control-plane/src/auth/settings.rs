@@ -46,6 +46,8 @@ pub(crate) enum SecretScope {
 #[serde(deny_unknown_fields)]
 pub struct Settings<S> {
     pub version: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password_recovery_enabled: Option<bool>,
     pub portal_origin: String,
     pub email: Email<S>,
     pub turnstile: Turnstile<S>,
@@ -105,6 +107,9 @@ impl Sealed {
 #[derive(Default, Deserialize, Serialize)]
 struct Stored {
     config: Settings<Sealed>,
+    // 旧控制面读取外层时会忽略此字段，内层仍沿用原有严格格式。
+    #[serde(default)]
+    password_recovery_enabled: bool,
     // 管理 API 返回遮盖后的地址，原始地址加密保存，供真正发信时使用。
     email_endpoint_sealed: Option<Sealed>,
 }
@@ -114,6 +119,7 @@ impl Stored {
         let c = &self.config;
         json!({
             "email_verification": c.email.enabled,
+            "password_recovery": self.password_recovery_enabled && c.email.enabled && c.email.api_key.is_some(),
             "turnstile_site_key": c.turnstile.enabled.then_some(c.turnstile.site_key.as_str()),
             "passkey": c.passkey.enabled,
             "github": c.github.enabled,
@@ -125,6 +131,7 @@ impl Stored {
         let c = &self.config;
         json!({
             "version": c.version,
+            "password_recovery_enabled": self.password_recovery_enabled,
             "portal_origin": c.portal_origin,
             "email": {
                 "enabled": c.email.enabled,
@@ -152,6 +159,7 @@ impl Stored {
             passkey,
             github,
             google,
+            ..
         } = self.config;
         let open = |enabled: bool, sealed: Option<Sealed>, slot: &str| {
             if enabled {
@@ -183,6 +191,7 @@ impl Stored {
         };
         Ok(Settings {
             version,
+            password_recovery_enabled: Some(self.password_recovery_enabled),
             portal_origin,
             email: Email {
                 enabled: email.enabled,
@@ -374,6 +383,7 @@ pub async fn put(
                         tenant_id: None,
                         detail: json!({
                             "email": next.config.email.enabled,
+                            "password_recovery_enabled": next.password_recovery_enabled,
                             "turnstile": next.config.turnstile.enabled,
                             "passkey": next.config.passkey.enabled,
                             "github": next.config.github.enabled,
@@ -638,6 +648,7 @@ fn validate(
                 .version
                 .checked_add(1)
                 .ok_or_else(|| ApiError::internal("authentication settings version overflow"))?,
+            password_recovery_enabled: None,
             portal_origin,
             email: Email {
                 enabled: form.email.enabled,
@@ -654,6 +665,9 @@ fn validate(
             github,
             google,
         },
+        password_recovery_enabled: form
+            .password_recovery_enabled
+            .unwrap_or(previous.password_recovery_enabled),
         email_endpoint_sealed,
     })
 }

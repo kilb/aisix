@@ -175,7 +175,7 @@ pub(crate) async fn priced_models(
         }
     }
     Ok(PricedModels {
-        valid_until: valid_until(conn, &ids, tenant_id, group_id, context.as_of).await?,
+        valid_until: valid_until(conn, &ids, Some(tenant_id), group_id, context.as_of).await?,
         models,
     })
 }
@@ -183,10 +183,10 @@ pub(crate) async fn priced_models(
 /// The earliest instant a price of one of `models` in `group_id`, or
 /// `tenant_id`'s discount, changes: the least scheduled `effective_from`
 /// among the three, or `None` when none is.
-async fn valid_until(
+pub(crate) async fn valid_until(
     conn: &mut PgConnection,
     models: &[Uuid],
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
     group_id: Uuid,
     as_of: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, DbError> {

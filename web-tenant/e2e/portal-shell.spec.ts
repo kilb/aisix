@@ -30,10 +30,14 @@ async function signup(page: Page, org: string, email: string, password: string):
 }
 
 async function login(page: Page, email: string, password: string): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
+}
+
+function workspaceLinks(page: Page) {
+  return page.getByRole("navigation", { name: "组织门户分区", exact: true }).getByRole("link");
 }
 
 /** The id of the tenant named `name`, as the operators see it. */
@@ -50,15 +54,14 @@ async function tenantNames(): Promise<string[]> {
 }
 
 test("注册组织后显示等待审核，没有密钥与成员入口", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Acme", "owner@acme.test", "correct horse battery");
   await expect(page.getByText("组织正在等待平台审核")).toBeVisible();
-  await expect(page.getByRole("tab", { name: "密钥" })).toHaveCount(0);
-  await expect(page.getByRole("tab", { name: "成员" })).toHaveCount(0);
+  await expect(workspaceLinks(page)).toHaveText(["概览"]);
 });
 
 test("口令过短在注册处就被挡下", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByRole("tab", { name: "注册组织" }).click();
   // The minimum is stated before anything is typed.
   await expect(page.getByText(/12\s*个字符/)).toBeVisible();
@@ -70,16 +73,16 @@ test("口令过短在注册处就被挡下", async ({ page }) => {
   expect(await tenantNames()).not.toContain("Shortpw Org 4e1");
 });
 
-test("审核通过后刷新即可看到密钥页签", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+test("审核通过后刷新即可看到密钥入口", async ({ page }) => {
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Approve Org 7a3", "owner@approve-7a3.test", "approve-pass-7a3x");
   await expect(page.getByText("组织正在等待平台审核")).toBeVisible();
-  await expect(page.getByRole("tab", { name: "密钥" })).toHaveCount(0);
+  await expect(workspaceLinks(page)).toHaveText(["概览"]);
 
   await stack.admin.post(`/admin/tenants/${await tenantId("Approve Org 7a3")}/approve`);
   await page.reload();
   // The owner of an active organisation reaches every page.
-  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "成员", "用量", "预算", "账户"]);
+  await expect(workspaceLinks(page)).toHaveText(["概览", "用量分析", "调用记录", "API 密钥", "模型与价格", "预算", "账务账户", "成员"]);
   await expect(page.getByText("组织正在等待平台审核")).toHaveCount(0);
 });
 
@@ -135,8 +138,8 @@ test("邀请链接：设置口令后以成员身份登录，同一链接再次�
 
   // Signed in as a member of that organisation: no members page.
   await expect(pb.getByRole("banner")).toContainText("Invite Org 2c9");
-  await expect(pb.getByRole("banner")).toContainText("Mia 2c9 · 成员");
-  await expect(pb.getByRole("tab")).toHaveText(["组织", "密钥", "价格", "用量", "预算"]);
+  await expect(pb.getByRole("button", { name: "Mia 2c9 成员 · 账号设置", exact: true })).toBeVisible();
+  await expect(workspaceLinks(pb)).toHaveText(["概览", "用量分析", "调用记录", "API 密钥", "模型与价格", "预算"]);
   // The token went out once, in a request body.
   expect(acceptBodies).toHaveLength(1);
   expect(acceptBodies[0]).toContain(token);
@@ -158,10 +161,11 @@ test("邀请链接：设置口令后以成员身份登录，同一链接再次�
 });
 
 test("登出后回到登录框，组织信息不再渲染", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Logout Org 5b8", "owner@logout-5b8.test", "logout-pass-5b8x");
   await expect(page.getByRole("banner")).toContainText("Logout Org 5b8");
-  await page.getByRole("button", { name: "登出" }).click();
+  await page.getByRole("banner").getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "登出", exact: true }).click();
   await expect(page.getByLabel("邮箱")).toBeVisible();
   await expect(page.getByText("Logout Org 5b8")).toHaveCount(0);
   // The session itself is gone, not just the page's copy of it.
@@ -197,7 +201,7 @@ test("用已有账号的邮箱注册组织，提示不透露该邮箱已有账�
     email: "owner@taken-8f2.test",
     password: "taken-pass-8f2x",
   });
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Second Org 8f2", "owner@taken-8f2.test", "second-pass-8f2x");
   const alert = page.getByRole("alert");
   await expect(alert).toBeVisible();
@@ -239,7 +243,7 @@ test("空的邀请令牌不打开接受邀请表单", async ({ page }) => {
 });
 
 test("已登录时打开邀请链接，可以取消并回到原来的组织", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Present Org 4a8", "owner@present-4a8.test", "present-pass-4a8x");
   await expect(page.getByRole("banner")).toContainText("Present Org 4a8");
   const tenant = await stack.admin.post("/admin/tenants", { name: "Elsewhere Org 4a8" });
@@ -269,18 +273,22 @@ test("停用的组织登录后看到停用说明，仍有密钥与成员入口",
   await expect(page.getByText("组织已被停用，请联系平台")).toBeVisible();
   // Kept so that a leaked key can be revoked and a member removed meanwhile
   // (ruling P1b-R4); what those pages offer is pinned in portal-keys.spec.ts.
-  await expect(page.getByRole("tab")).toHaveText(["组织", "密钥", "成员"]);
+  await expect(workspaceLinks(page)).toHaveText(["概览", "API 密钥", "成员"]);
 });
 
 test("等待审核时也能修改口令，之后旧口令被拒、新口令可登录", async ({ page }) => {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await signup(page, "Password Org 9e5", "owner@password-9e5.test", "first-pass-9e5x");
   await expect(page.getByText("组织正在等待平台审核")).toBeVisible();
-  await page.getByLabel("当前口令").fill("first-pass-9e5x");
-  await page.getByLabel("新口令").fill("second-pass-9e5x");
-  await page.getByRole("button", { name: "修改口令" }).click();
-  await expect(page.getByRole("status")).toContainText("口令已修改");
-  await page.getByRole("button", { name: "登出" }).click();
+  await page.getByRole("banner").getByRole("button", { name: "账号设置", exact: true }).click();
+  const account = page.getByRole("main");
+  const form = account.getByRole("form", { name: "修改口令", exact: true });
+  await form.getByLabel("当前口令", { exact: true }).fill("first-pass-9e5x");
+  await form.getByLabel("新口令", { exact: true }).fill("second-pass-9e5x");
+  await form.getByLabel("确认新口令", { exact: true }).fill("second-pass-9e5x");
+  await form.getByRole("button", { name: "保存新口令", exact: true }).click();
+  await expect(account.getByRole("status")).toContainText("口令已修改");
+  await account.getByRole("button", { name: "登出", exact: true }).click();
   // Wait until the sign-out has landed: navigating away sooner can abort it.
   await expect(page.getByLabel("邮箱")).toBeVisible();
 
@@ -291,7 +299,7 @@ test("等待审核时也能修改口令，之后旧口令被拒、新口令可�
   await expect(page.getByRole("banner")).toContainText("Password Org 9e5");
 });
 
-test("账单角色看不到密钥与成员页签", async ({ page }) => {
+test("账单角色看不到密钥与成员入口", async ({ page }) => {
   const tenant = await stack.admin.post("/admin/tenants", { name: "Billing Org 1f7" });
   const invite = await stack.admin.post(`/admin/tenants/${tenant.id}/invites`, {
     email: "billing@billing-1f7.test",
@@ -304,5 +312,5 @@ test("账单角色看不到密钥与成员页签", async ({ page }) => {
 
   await login(page, "billing@billing-1f7.test", "billing-pass-1f7x");
   await expect(page.getByRole("banner")).toContainText("Billing Org 1f7");
-  await expect(page.getByRole("tab")).toHaveText(["组织", "价格", "用量", "预算", "账户"]);
+  await expect(workspaceLinks(page)).toHaveText(["概览", "用量分析", "调用记录", "模型与价格", "预算", "账务账户"]);
 });

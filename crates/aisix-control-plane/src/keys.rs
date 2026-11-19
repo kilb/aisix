@@ -70,6 +70,8 @@ use crate::resources::Kind;
 use crate::tenants::{self, TenantRow, TenantStatus};
 use crate::AppState;
 
+pub(crate) mod quickstart;
+
 /// 客户密钥明确开放已实现的模型接口；工具与透传仍关闭。
 /// 每次扩展同时提升 KEY_DOC_VERSION，并经兼容门槛追平已有密钥。
 pub const FIRST_PHASE_ENDPOINTS: [&str; 23] = [

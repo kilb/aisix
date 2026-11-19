@@ -64,6 +64,17 @@ pub enum TenantStatus {
     Unknown,
 }
 
+impl TenantStatus {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Retried => "retried",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// The `error_class` a tenant sees for a recorded one. A model the key may
 /// not use reads as an unknown model: the gateway answers it `403` outside
 /// platform mode, and the tenant must not learn a model exists.
@@ -625,7 +636,48 @@ struct Scope {
     before: Option<i64>,
 }
 
+impl CallsQuery {
+    fn into_filters(
+        self,
+        auth: &MemberAuth,
+        before: Option<i64>,
+    ) -> Result<(Scope, CallFilters, Option<Uuid>), ApiError> {
+        let filters = CallFilters {
+            outcome: self.outcome,
+            http_status: self.http_status,
+            error_class: self.error_class,
+            cache_hit: self.cache_hit,
+            service_tier: self.service_tier,
+            operation: self.operation,
+            final_attempt: self.final_attempt,
+        };
+        filters.validate(true)?;
+        let member_filter = uuid_filter(&self.member_id, "/member_id")?;
+        if let (Some(from), Some(to)) = (self.from, self.to) {
+            checked_range(from, to, None)?;
+        }
+        let scope = Scope {
+            tenant: auth.tenant_id,
+            member: (auth.role == MemberRole::Member).then_some(auth.id),
+            from: self.from,
+            to: self.to,
+            api_key_id: uuid_filter(&self.api_key_id, "/api_key_id")?,
+            model_id: uuid_filter(&self.model_id, "/model_id")?,
+            request_id: self.request_id,
+            before,
+        };
+        Ok((scope, filters, member_filter))
+    }
+}
+
 impl Scope {
+    fn push_grouped(&self, sql: &mut QueryBuilder<'_, Postgres>, anchored: bool, joins: &str) {
+        sql.push(crate::request_groups::from_sql(anchored, joins));
+        sql.push(" AND pc.tenant_id = ")
+            .push_bind(self.tenant)
+            .push("::text");
+        self.push_filters(sql);
+    }
     /// 调用明细按费用与事件关联，并附带最新修正。
     fn push_from(&self, sql: &mut QueryBuilder<'_, Postgres>) {
         sql.push(" FROM pricing_charges_cny pc JOIN usage_events ue ON ue.event_id = pc.event_id");
@@ -752,6 +804,26 @@ pub(super) fn tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> Op
     })
 }
 
+/// 请求代表保留仍在进行且尚未计费的行，与调用记录一致。
+fn grouped_tenant_view(ev: &Value, charge_status: &str, repriced: bool) -> TenantView {
+    tenant_view(ev, charge_status, repriced).unwrap_or_else(|| {
+        let (status, status_code, error) = tenant_outcome(
+            ev.get("status_code")
+                .and_then(Value::as_u64)
+                .and_then(|code| u16::try_from(code).ok()),
+            &text(ev, "error_class"),
+            &text(ev, "error_message"),
+            ev.get("is_final_attempt").and_then(Value::as_bool),
+        );
+        TenantView {
+            status,
+            status_code,
+            error,
+            charge_status: tenant_charge_status(charge_status, repriced),
+        }
+    })
+}
+
 /// A charge's stored `lines` as a tenant reads them: each line's dimension,
 /// quantity and CNY rate per million, and nothing else a stored line may
 /// carry. A stored line's `rate` is the baseline's in micro-USD per million;
@@ -852,24 +924,11 @@ async fn call_items(
     let items: Vec<Call> = rows
         .into_iter()
         .filter_map(|r| {
-            let view = tenant_view(&r.ev, &r.status, r.adjusted.is_some()).or_else(|| {
-                include_hidden.then(|| {
-                    let (status, status_code, error) = tenant_outcome(
-                        r.ev.get("status_code")
-                            .and_then(Value::as_u64)
-                            .and_then(|code| u16::try_from(code).ok()),
-                        &text(&r.ev, "error_class"),
-                        &text(&r.ev, "error_message"),
-                        r.ev.get("is_final_attempt").and_then(Value::as_bool),
-                    );
-                    TenantView {
-                        status,
-                        status_code,
-                        error,
-                        charge_status: tenant_charge_status(&r.status, r.adjusted.is_some()),
-                    }
-                })
-            })?;
+            let view = if include_hidden {
+                grouped_tenant_view(&r.ev, &r.status, r.adjusted.is_some())
+            } else {
+                tenant_view(&r.ev, &r.status, r.adjusted.is_some())?
+            };
             let recorded_error = text(&r.ev, "error_class");
             let public_error = (include_hidden && !recorded_error.is_empty())
                 .then(|| tenant_error(&recorded_error, &text(&r.ev, "error_message")));
@@ -994,56 +1053,21 @@ pub async fn list_calls(
         };
     }
     let anchored = grouped && q.event_id.is_some();
-    let filters = CallFilters {
-        outcome: q.outcome,
-        http_status: q.http_status,
-        error_class: q.error_class,
-        cache_hit: q.cache_hit,
-        service_tier: q.service_tier,
-        operation: q.operation,
-        final_attempt: q.final_attempt,
-    };
-    filters.validate(true)?;
-    let member_filter = uuid_filter(&q.member_id, "/member_id")?;
-    let (from, to) = match (q.from, q.to) {
-        (Some(from), Some(to)) => {
-            let (f, t) = checked_range(from, to, None)?;
-            (Some(f), Some(t))
-        }
-        other => other,
-    };
-    let scope = Scope {
-        tenant: auth.tenant_id,
-        member: (auth.role == MemberRole::Member).then_some(auth.id),
-        from,
-        to,
-        api_key_id: uuid_filter(&q.api_key_id, "/api_key_id")?,
-        model_id: uuid_filter(&q.model_id, "/model_id")?,
-        request_id: q.request_id,
-        before: q.before,
-    };
     let limit = page_limit(q.limit);
+    let before = q.before;
+    let event_id = q.event_id.take();
+    let (scope, filters, member_filter) = q.into_filters(&auth, before)?;
     let mut sql = QueryBuilder::<Postgres>::new(call_select(grouped));
     if grouped {
-        sql.push(crate::request_groups::from_sql(
+        scope.push_grouped(
+            &mut sql,
             anchored,
             &format!(" LEFT JOIN provider_groups g ON g.id = pc.group_id{EFFECTIVE}"),
-        ));
-        sql.push(" AND pc.tenant_id = ")
-            .push_bind(scope.tenant)
-            .push("::text");
-        let filter_scope = Scope {
-            before: None,
-            ..scope
-        };
-        filter_scope.push_filters(&mut sql);
-        if let Some(before) = scope.before {
-            sql.push(" AND pc.seq < ").push_bind(before);
-        }
+        );
     } else {
         scope.push_from(&mut sql);
     }
-    if let Some(event_id) = q.event_id {
+    if let Some(event_id) = event_id {
         sql.push(if grouped {
             " AND pc_anchor.event_id = "
         } else {
@@ -1051,12 +1075,7 @@ pub async fn list_calls(
         })
         .push_bind(event_id);
     }
-    if let Some(member) = member_filter {
-        sql.push(" AND pc.user_id = ")
-            .push_bind(member)
-            .push("::text");
-    }
-    filters.push(&mut sql, EFF_TIER, true);
+    push_call_filters(&mut sql, member_filter, &filters);
     sql.push(" ORDER BY pc.seq DESC LIMIT ")
         .push_bind(limit + 1);
     let mut conn = state.db.pool().begin().await.map_err(DbError::from)?;
@@ -1115,6 +1134,120 @@ pub async fn list_calls(
     }
     conn.commit().await.map_err(DbError::from)?;
     Ok(Json(json!({ "items": items, "next_before": next_before })))
+}
+
+fn push_call_filters(
+    sql: &mut QueryBuilder<'_, Postgres>,
+    member: Option<Uuid>,
+    filters: &CallFilters,
+) {
+    if let Some(member) = member {
+        sql.push(" AND pc.user_id = ")
+            .push_bind(member)
+            .push("::text");
+    }
+    filters.push(sql, EFF_TIER, true);
+}
+
+/// 导出只查询记录列和判定状态所需的信息，不载入明细、成员或上游渠道。
+#[derive(sqlx::FromRow)]
+struct CallExportRow {
+    event_id: String,
+    occurred_at: DateTime<Utc>,
+    api_key_id: String,
+    requested_model_id: String,
+    status: String,
+    adjusted: bool,
+    ev: Value,
+}
+
+pub(super) async fn export_rows(
+    conn: &mut PgConnection,
+    auth: &MemberAuth,
+    selection: CallsQuery,
+) -> Result<super::export::Csv, ApiError> {
+    use super::export::{check_rows, Cell, Csv, MAX_ROWS};
+    let (scope, filters, member) = selection.into_filters(auth, None)?;
+    let mut sql = QueryBuilder::<Postgres>::new(
+        "SELECT pc.event_id, pc.occurred_at, pc.api_key_id, pc.requested_model_id, pc.status,
+         EXISTS (SELECT 1 FROM pricing_adjustments_cny pa WHERE pa.event_id = pc.event_id) AS adjusted,
+         jsonb_build_object(
+             'requested_model', CASE WHEN jsonb_typeof(ue.event->'requested_model') = 'string' THEN
+                 CASE WHEN char_length(ue.event->>'requested_model') > 1024
+                      THEN left(ue.event->>'requested_model', 1024) || '…'
+                      ELSE ue.event->>'requested_model' END END,
+             'operation', CASE WHEN jsonb_typeof(ue.event->'operation') = 'string' THEN left(ue.event->>'operation', 64) END,
+             'status_code', CASE WHEN jsonb_typeof(ue.event->'status_code') = 'number' THEN ue.event->'status_code' END,
+             'error_class', CASE WHEN jsonb_typeof(ue.event->'error_class') = 'string' THEN left(ue.event->>'error_class', 64) END,
+             'error_message', CASE WHEN jsonb_typeof(ue.event->'error_message') = 'string' THEN left(ue.event->>'error_message', 64) END,
+             'is_final_attempt', CASE WHEN jsonb_typeof(ue.event->'is_final_attempt') = 'boolean' THEN ue.event->'is_final_attempt' END,
+             'inference_stage', CASE WHEN jsonb_typeof(ue.event->'inference_stage') = 'string' THEN left(ue.event->>'inference_stage', 16) END,
+             'prompt_tokens', CASE WHEN jsonb_typeof(ue.event->'prompt_tokens') = 'number' THEN ue.event->'prompt_tokens' END,
+             'completion_tokens', CASE WHEN jsonb_typeof(ue.event->'completion_tokens') = 'number' THEN ue.event->'completion_tokens' END,
+             'cached_prompt_tokens', CASE WHEN jsonb_typeof(ue.event->'cached_prompt_tokens') = 'number' THEN ue.event->'cached_prompt_tokens' END,
+             'cache_read_tokens', CASE WHEN jsonb_typeof(ue.event->'cache_read_tokens') = 'number' THEN ue.event->'cache_read_tokens' END,
+             'cache_creation_tokens', CASE WHEN jsonb_typeof(ue.event->'cache_creation_tokens') = 'number' THEN ue.event->'cache_creation_tokens' END,
+             'reasoning_tokens', CASE WHEN jsonb_typeof(ue.event->'reasoning_tokens') = 'number' THEN ue.event->'reasoning_tokens' END
+         ) AS ev",
+    );
+    scope.push_grouped(&mut sql, false, EFFECTIVE);
+    push_call_filters(&mut sql, member, &filters);
+    sql.push(" ORDER BY pc.seq DESC LIMIT ")
+        .push_bind(MAX_ROWS + 1);
+    let rows: Vec<CallExportRow> = sql
+        .build_query_as()
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(super::export::read_error)?;
+    check_rows(rows.len())?;
+
+    let model_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|row| Uuid::parse_str(&row.requested_model_id).ok())
+        .collect();
+    let models = Models::load(conn, auth.tenant_id, &model_ids)
+        .await
+        .map_err(super::export::read_error)?;
+    let ids: Vec<String> = rows.iter().map(|row| row.event_id.clone()).collect();
+    let groups = crate::request_groups::summaries(conn, &ids, true)
+        .await
+        .map_err(super::export::read_error)?;
+    let mut csv = Csv::new(
+        "event_id,occurred_at_utc,model_id,model,api_key_id,operation,status,attempt_count,charge_micro_cny,prompt_tokens,completion_tokens,cached_prompt_tokens,cache_read_tokens,cache_creation_tokens,reasoning_tokens",
+    );
+    for row in rows {
+        let status = grouped_tenant_view(&row.ev, &row.status, row.adjusted).status;
+        let model = call_model(
+            &models,
+            &row.requested_model_id,
+            &text(&row.ev, "requested_model"),
+        );
+        let model_id = model.id.map(|id| id.to_string());
+        let group = groups.get(&row.event_id);
+        let amount = group
+            .and_then(|group| group["charge_micro_cny"].as_str())
+            .and_then(|value| value.parse::<i128>().ok());
+        let attempts = group.and_then(|group| group["attempt_count"].as_u64());
+        let tokens = |field| Cell::number(row.ev[field].as_u64());
+        csv.row([
+            Cell::Text(&row.event_id),
+            Cell::Time(row.occurred_at),
+            Cell::text(model_id.as_deref()),
+            Cell::Text(&model.name),
+            Cell::Text(&row.api_key_id),
+            Cell::text(row.ev["operation"].as_str()),
+            Cell::Text(status.as_str()),
+            Cell::number(attempts),
+            Cell::number(amount),
+            tokens("prompt_tokens"),
+            tokens("completion_tokens"),
+            tokens("cached_prompt_tokens"),
+            tokens("cache_read_tokens"),
+            tokens("cache_creation_tokens"),
+            tokens("reasoning_tokens"),
+        ])?;
+    }
+    Ok(csv)
 }
 
 /// One period and model of a usage summary.

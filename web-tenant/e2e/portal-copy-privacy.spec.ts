@@ -39,7 +39,7 @@ test("真实密钥一次性结果关闭清理，图标复制保持遮罩，系�
   await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: stack.previewUrl });
   const consoleLines: string[] = [];
   page.on("console", (message) => consoleLines.push(message.text()));
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();

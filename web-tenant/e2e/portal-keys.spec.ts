@@ -140,7 +140,7 @@ async function signedIn(email: string, password = PASSWORD): Promise<ApiClient> 
 }
 
 async function login(page: Page, email: string): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();

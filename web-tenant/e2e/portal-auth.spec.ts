@@ -24,7 +24,7 @@ async function togglePasskey(origin: string, enabled: boolean) {
 test("待审核组织的成员可注册 Passkey、登录并移除它", async ({ context, page }) => {
   const origin = new URL(stack.previewUrl);
   origin.hostname = "localhost";
-  await page.goto(origin.href);
+  await page.goto(new URL("/login", origin).href);
   await expect(page.getByRole("button", { name: "登录", exact: true })).toBeEnabled();
   await expect(page.getByRole("button", { name: "使用 Passkey 登录", exact: true })).toHaveCount(0);
   await togglePasskey(origin.origin, true);
@@ -42,7 +42,7 @@ test("待审核组织的成员可注册 Passkey、登录并移除它", async ({ 
     },
   });
 
-  await page.goto(origin.href);
+  await page.goto(new URL("/login", origin).href);
   const email = "passkey-owner@portal-auth.test";
   const password = "portal-auth-test-password";
   await page.getByRole("tab", { name: "注册组织", exact: true }).click();
@@ -109,7 +109,7 @@ test("注册页看到新的 Turnstile 要求后保留已填内容并可重新提
   origin.hostname = "localhost";
   await togglePasskey(origin.origin, false);
   await page.setViewportSize({ width: 390, height: 850 });
-  await page.goto(origin.href);
+  await page.goto(new URL("/login", origin).href);
   await page.getByRole("tab", { name: "注册组织", exact: true }).click();
   const orgName = page.getByLabel("组织名称", { exact: true });
   const email = page.getByLabel("邮箱", { exact: true });

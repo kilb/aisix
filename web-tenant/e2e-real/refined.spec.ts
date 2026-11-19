@@ -45,7 +45,7 @@ async function settle(page: Page): Promise<void> {
 async function login(page: Page, who = app === "tenant" ? auth.metricsOwner : auth.operator, target = baseUrl): Promise<void> {
   if (!["127.0.0.1", "localhost"].includes(new URL(target).hostname)) throw new Error("Only isolated login origins are allowed");
   health.get(page)!.phase = "signed-out";
-  await page.goto(target);
+  await page.goto(app === "tenant" ? `${target.replace(/\/$/, "")}/login` : target);
   await page.getByLabel("邮箱", { exact: true }).fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   const response = page.waitForResponse(r => new URL(r.url()).pathname === (app === "tenant" ? "/api/login" : "/admin/login") && r.request().method() === "POST");

@@ -199,7 +199,7 @@ export function Authentication() {
   const origin = draft ? previewOrigin(draft.portal_origin) : "";
   const dirty = draft && settings && JSON.stringify(draft) !== JSON.stringify(authenticationDraft(settings));
   return <div className="cp-auth-settings">
-    <PageHeader title="认证设置" description="为租户门户配置注册邮箱验证、人机验证和其他登录方式。" />
+    <PageHeader title="认证设置" description="为租户门户配置邮箱验证、口令找回、人机验证和登录方式。" />
     {!settings || !draft ? <Card>
       <CardMessage onRetry={failure ? reloadSettings : undefined}>
         {failure || "载入中…"}
@@ -218,7 +218,7 @@ export function Authentication() {
           </section>
           <section className="auth-section" aria-label="邮件验证码">
             <CardHeader title={<span className="auth-method-title"><Mail aria-hidden="true" />邮件验证码</span>}
-              description="启用后，新用户注册时需先收取并输入邮箱验证码。"
+              description="启用后，注册需要邮箱验证码。口令找回与组织用量提醒共用此发信接口。"
               actions={<MethodSwitch label="启用邮件验证码" checked={draft.email.enabled} error={problem("/email/enabled")}
                 onChange={enabled => change("email", { ...draft.email, enabled, api_key: enabled && draft.email.api_key === "" ? undefined : draft.email.api_key })} />} />
             <div className="auth-fields">
@@ -239,6 +239,12 @@ export function Authentication() {
               <p>请求体为 JSON，包含 <code>from</code>（发件邮箱）、<code>to</code>（一个收件邮箱字符串）、<code>subject</code>（主题）和 <code>text</code>（正文）。接口使用其他字段或认证方式时，可通过自有 HTTP 转接服务转换。</p>
             </Guide>
           </section>
+          {settings.password_recovery_enabled !== undefined && <section className="auth-section" aria-label="口令找回">
+            <CardHeader title={<span className="auth-method-title"><KeyRound aria-hidden="true" />口令找回</span>}
+              description="启用前请核对现有成员的邮箱归属。发信接口启用时，成员可用登记邮箱接收验证码并重设口令。"
+              actions={<MethodSwitch label="启用口令找回" checked={draft.password_recovery_enabled === true}
+                error={problem("/password_recovery_enabled")} onChange={enabled => change("password_recovery_enabled", enabled)} />} />
+          </section>}
           <section className="auth-section" aria-label="Cloudflare Turnstile">
             <CardHeader title={<span className="auth-method-title"><Cloud aria-hidden="true" />Cloudflare Turnstile</span>}
               description="在租户门户登录、注册和发送验证码时进行人机验证。"

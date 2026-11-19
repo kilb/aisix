@@ -27,6 +27,7 @@ test("管理员可以配置门户认证，回调 URL 可见，读取设置时密
   await page.locator('[data-tab="authentication"]').click();
   await expect(page.getByRole("heading", { name: "认证设置" })).toBeVisible();
   await expect(page.getByLabel("启用 Passkey")).not.toBeChecked();
+  await expect(page.getByLabel("启用口令找回")).not.toBeChecked();
   await expect(page.getByLabel("租户门户地址")).toBeEditable();
 
   const portalOrigin = page.getByLabel("租户门户地址");
@@ -75,19 +76,26 @@ test("管理员可以配置门户认证，回调 URL 可见，读取设置时密
   expect(JSON.stringify(settings)).not.toContain("e2e-secret");
   expect(await stack.tenant().get("/api/auth/options")).toEqual({
     email_verification: true,
+    password_recovery: false,
     turnstile_site_key: "0x4AAAAAAABAuthConfigDemo",
     passkey: true,
     github: true,
     google: true,
   });
 
+  await page.getByLabel("启用口令找回").check();
+  await page.getByRole("button", { name: "保存认证设置" }).click();
+  await expect(page.getByRole("status").filter({ hasText: "认证设置已保存" })).toBeVisible();
+  expect(await stack.tenant().get("/api/auth/options")).toMatchObject({ password_recovery: true });
+
   // 关闭登录方式后仍可保留已配置的凭据。
-  for (const label of ["启用邮件验证码", "启用 Turnstile", "启用 Passkey", "启用 GitHub 登录", "启用 Google 登录"]) {
+  for (const label of ["启用邮件验证码", "启用口令找回", "启用 Turnstile", "启用 Passkey", "启用 GitHub 登录", "启用 Google 登录"]) {
     await page.getByLabel(label).uncheck();
   }
   await page.getByRole("button", { name: "保存认证设置" }).click();
   await expect(page.getByRole("status").filter({ hasText: "认证设置已保存" })).toBeVisible();
   expect((await stack.admin.get(SETTINGS)).email).toMatchObject({ enabled: false, api_key_configured: true });
+  expect(await stack.tenant().get("/api/auth/options")).toMatchObject({ password_recovery: false });
 
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("heading", { name: "认证设置" })).toBeVisible();

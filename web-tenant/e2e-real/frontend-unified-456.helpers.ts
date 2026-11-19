@@ -50,7 +50,7 @@ export async function settle(page: Page): Promise<void> {
   await expect(page.locator("vite-error-overlay")).toHaveCount(0);
 }
 export async function login(page: Page, base: string, actor: {email: string; password: string}, prefix: string): Promise<void> {
-  await page.goto(base);
+  await page.goto(prefix === "/api" ? `${base.replace(/\/$/, "")}/login` : base);
   await page.getByLabel("邮箱", { exact: true }).fill(actor.email);
   try { await page.getByLabel("口令", { exact: true }).fill(actor.password); }
   catch { throw new Error("Could not fill the local QA password"); }

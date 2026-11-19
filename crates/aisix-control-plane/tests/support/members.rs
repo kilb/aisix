@@ -116,7 +116,19 @@ pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
         // plaintext is answered and nothing is recorded.
         ("POST", "/api/keys/{id}/reveal") => (format!("/api/keys/{}/reveal", Uuid::new_v4()), None),
         ("GET", "/api/keys/{id}/quota") => (format!("/api/keys/{}/quota", Uuid::new_v4()), None),
+        ("GET", "/api/keys/{id}/quickstart") => {
+            (format!("/api/keys/{}/quickstart", Uuid::new_v4()), None)
+        }
         ("GET", "/api/billing/balance" | "/api/billing/ledger") => (path.to_string(), None),
+        ("GET", "/api/billing/alerts") => (path.to_string(), None),
+        ("PUT", "/api/billing/alerts") => (path.to_string(), Some(json!({}))),
+        (
+            "GET",
+            "/api/billing/ledger/export" | "/api/billing/topups/export" | "/api/usage/calls/export",
+        ) => (
+            format!("{path}?from=2026-01-01T00:00:00Z&to=2026-01-02T00:00:00Z"),
+            None,
+        ),
         // A range of one hour, so the summary answers 200.
         ("GET", "/api/billing/summary") => (
             format!("{path}?group=day&from=2026-01-01T00:00:00Z&to=2026-01-01T01:00:00Z"),

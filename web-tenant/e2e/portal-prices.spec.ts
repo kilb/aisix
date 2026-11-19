@@ -128,7 +128,7 @@ async function joined(id: string, email: string, role: string): Promise<void> {
 }
 
 async function login(page: Page, email: string): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();
@@ -271,7 +271,7 @@ test("基准价单列 1 小时缓存写时，价格页在缓存写下另列这�
     yuanPerMillion(card.input, RATE_A, DISCOUNT_BPS),
     yuanPerMillion(card.output, RATE_A, DISCOUNT_BPS),
     yuanPerMillion(card.cache_read, RATE_A, DISCOUNT_BPS),
-    `${yuanPerMillion(card.cache_write, RATE_A, DISCOUNT_BPS)}1 小时缓存写 ${yuanPerMillion(card.cache_write_1h, RATE_A, DISCOUNT_BPS)}`,
+    `${yuanPerMillion(card.cache_write, RATE_A, DISCOUNT_BPS)}1 小时缓存写${yuanPerMillion(card.cache_write_1h, RATE_A, DISCOUNT_BPS)}`,
   ]);
   // The model without a one-hour rate in the same table keeps its five plain cells.
   await rowPrices(page, "chat-price-3f7", GROUP_A.display, RATE_A);

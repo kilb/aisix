@@ -8,7 +8,7 @@
 .usage-analysis-filters .f-label,
 .usage-analysis-grid .record-table-toolbar .f-label { color: var(--fg-3); font-size: var(--text-caption); line-height: 18px; }
 .usage-analysis-filters input { width: 100%; min-width: 0; }
-.usage-analysis-actions { display: flex; flex: none; align-items: center; flex-wrap: nowrap; gap: 8px 16px; }
+.usage-analysis-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 16px; }
 .usage-analysis-actions > .btn,
 .usage-analysis-actions > a { white-space: nowrap; }
 .usage-analysis-range { display: flex; min-width: 0; flex-wrap: wrap; gap: 4px 16px; color: var(--fg-3); font-size: var(--text-caption); line-height: 1.5; }

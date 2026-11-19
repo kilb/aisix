@@ -146,7 +146,7 @@ async function serves(key: string, name: string): Promise<void> {
 }
 
 async function login(page: import("@playwright/test").Page, email: string): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(email);
   await page.getByLabel("口令", { exact: true }).fill(PASSWORD);
   await page.getByRole("button", { name: "登录", exact: true }).click();

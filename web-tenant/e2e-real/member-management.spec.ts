@@ -79,7 +79,7 @@ async function settle(page: Page): Promise<void> {
 }
 
 async function login(page: Page, who: Credentials = owner): Promise<void> {
-  await page.goto(baseUrl);
+  await page.goto(`${baseUrl}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(who.email);
   await fillSecret(page.getByLabel("口令", { exact: true }), who.password);
   const response = waitForApi(page, "POST", "/api/login");
@@ -135,7 +135,7 @@ async function openDetail(page: Page, member: IsolatedMember): Promise<void> {
   const entry = page.getByRole("link", { name: `${member.email} 的成员详情`, exact: true });
   await expect(entry).toHaveAttribute("href", `#members?member=${encodeURIComponent(member.id)}`);
   await entry.click();
-  await expect(page).toHaveURL(baseUrl + "/#members?member=" + encodeURIComponent(member.id));
+  await expect(page).toHaveURL(baseUrl + "/console#members?member=" + encodeURIComponent(member.id));
   await expect(page.getByRole("heading", { level: 1, name: member.displayName, exact: true })).toBeVisible();
 }
 

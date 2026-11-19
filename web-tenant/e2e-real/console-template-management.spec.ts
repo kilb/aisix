@@ -68,7 +68,7 @@ async function settle(page: Page): Promise<void> {
   await expect(page.locator("vite-error-overlay")).toHaveCount(0);
 }
 async function login(page: Page, actor: Credentials): Promise<void> {
-  await page.goto(base);
+  await page.goto(`${base}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(actor.email);
   await secret(page.getByLabel("口令", { exact: true }), actor.password);
   const loggedIn = responseFor(page, "POST", "/api/login");

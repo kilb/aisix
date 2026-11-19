@@ -1,4 +1,4 @@
-type Action = "login" | "signup" | "email_code" | "passkey_login" | "oauth_login";
+type Action = "login" | "signup" | "email_code" | "passkey_login" | "oauth_login" | "password_recovery";
 
 interface Turnstile {
   render(element: HTMLElement, options: {

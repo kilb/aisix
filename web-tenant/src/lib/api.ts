@@ -104,30 +104,47 @@ export async function call<T>(
   } catch {
     throw new ApiError("无法连接平台", 0, "network", [], null);
   }
-  const text = await r.text();
-  let parsed: unknown = null;
-  // A proxy's 502 page or a transport failure is not JSON. Without this the
-  // caller would see a parse error instead of the failed request.
-  if (text) {
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new ApiError(`服务端返回了非 JSON 响应（HTTP ${r.status}）`, r.status, "bad_response", [], null);
-    }
-  }
-  if (!r.ok) {
-    const e = (parsed ?? {}) as Envelope;
-    const err = new ApiError(
-      e.error ?? `HTTP ${r.status}`,
-      r.status,
-      e.code ?? "bad_response",
-      e.details ?? [],
-      e.current_version ?? null,
-    );
-    if (err.code === "unauthenticated") sessionEnded?.();
-    throw err;
-  }
+  const parsed = parseJson(await r.text(), r.status);
+  if (!r.ok) throw responseError(parsed, r.status);
   return { data: parsed as T, version: etagVersion(r.headers.get("etag")) };
+}
+
+function parseJson(text: string, status: number): unknown {
+  // 代理错误页可能不是 JSON，保留 HTTP 状态。
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new ApiError(`服务端返回了非 JSON 响应（HTTP ${status}）`, status, "bad_response", [], null);
+  }
+}
+
+function responseError(parsed: unknown, status: number): ApiError {
+  const e = (parsed ?? {}) as Envelope;
+  const err = new ApiError(e.error ?? `HTTP ${status}`, status, e.code ?? "bad_response", e.details ?? [], e.current_version ?? null);
+  if (err.code === "unauthenticated") sessionEnded?.();
+  return err;
+}
+
+async function downloadCsv(path: string, filename: string): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, { credentials: "same-origin" });
+  } catch {
+    throw new ApiError("无法连接平台", 0, "network", [], null);
+  }
+  if (!response.ok) throw responseError(parseJson(await response.text(), response.status), response.status);
+  if (!response.headers.get("content-type")?.startsWith("text/csv")) {
+    throw new ApiError("服务端未返回 CSV 文件", response.status, "bad_response", [], null);
+  }
+  const href = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = href;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(href), 1_000);
 }
 
 // ── types (the API's field names) ───────────────────────────────────────────
@@ -568,19 +585,28 @@ function queryOf(q: Record<string, string | number | boolean | undefined>): stri
   return s ? `?${s}` : "";
 }
 
+interface LedgerFilters { from?: string; to?: string; kind?: LedgerKind }
+interface TopupFilters { from?: string; to?: string; status?: Topup["status"] }
+
 export const billing = {
   async balance(): Promise<Balance> {
     return (await call<Balance>("GET", "/billing/balance")).data;
   },
   /** Newest first; `before` is the previous page's `next_before`. `from` and `to` are RFC 3339, half-open. */
-  async ledger(q: { from?: string; to?: string; kind?: LedgerKind; limit?: number; before?: number }): Promise<Page<LedgerItem>> {
-    return (await call<Page<LedgerItem>>("GET", `/billing/ledger${queryOf(q)}`)).data;
+  async ledger(q: LedgerFilters & { limit?: number; before?: number }): Promise<Page<LedgerItem>> {
+    return (await call<Page<LedgerItem>>("GET", `/billing/ledger${queryOf({ ...q })}`)).data;
   },
   async ledgerSummary(q: { group: "day" | "month"; from: string; to: string }): Promise<LedgerSummaryRow[]> {
     return (await call<{ items: LedgerSummaryRow[] }>("GET", `/billing/summary${queryOf(q)}`)).data.items;
   },
-  async topups(q: { status?: Topup["status"]; limit?: number; before?: number } = {}): Promise<Page<Topup>> {
-    return (await call<Page<Topup>>("GET", `/billing/topups${queryOf(q)}`)).data;
+  async topups(q: TopupFilters & { limit?: number; before?: number } = {}): Promise<Page<Topup>> {
+    return (await call<Page<Topup>>("GET", `/billing/topups${queryOf({ ...q })}`)).data;
+  },
+  exportLedger(q: LedgerFilters): Promise<void> {
+    return downloadCsv(`/billing/ledger/export${queryOf({ ...q })}`, "billing-ledger.csv");
+  },
+  exportTopups(q: TopupFilters): Promise<void> {
+    return downloadCsv(`/billing/topups/export${queryOf({ ...q })}`, "billing-topups.csv");
   },
   /** `amount_cny` is yuan with at most two decimals. */
   async requestTopup(body: { amount_cny: string; note?: string; reference?: string }): Promise<Topup> {
@@ -771,6 +797,10 @@ export interface UsageSummaryQuery {
 /** The call log, newest first; `next_before` is the cursor of the next page, null on the last. */
 export async function usageCalls(q: CallsQuery): Promise<{ items: Call[]; next_before: number | null }> {
   return (await call<{ items: Call[]; next_before: number | null }>("GET", `/usage/calls${queryOf({ ...q })}`)).data;
+}
+
+export function exportUsageCalls(q: Omit<CallsQuery, "group_requests" | "include_attempts" | "attempts_after" | "event_id" | "limit" | "before">): Promise<void> {
+  return downloadCsv(`/usage/calls/export${queryOf({ ...q })}`, "usage-calls.csv");
 }
 
 export async function usageSummary(q: UsageSummaryQuery): Promise<UsageSummaryRow[]> {

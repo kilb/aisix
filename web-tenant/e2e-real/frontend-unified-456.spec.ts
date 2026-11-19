@@ -35,7 +35,7 @@ test.beforeEach(({page})=>observe(page));
 test.afterEach(async({page},info)=>{await shot(page,"tenant-"+info.title.replace(/[^a-zA-Z0-9]+/g,"-"));await health(page);});
 
 test("10-login-signup-password-manager-semantics-and-real-DOM-submit",async({page})=>{
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   const form=page.getByRole("form",{name:"登录",exact:true});await expect(form).toHaveAttribute("method","post");
   const email=form.getByLabel("邮箱",{exact:true}),password=form.getByLabel("口令",{exact:true});
   await expect(email).toHaveAttribute("type","email");await expect(email).toHaveAttribute("autocomplete","username");await expect(password).toHaveAttribute("autocomplete","current-password");
@@ -44,7 +44,7 @@ test("10-login-signup-password-manager-semantics-and-real-DOM-submit",async({pag
   await email.evaluate((el,v)=>(el as HTMLInputElement).value=v,world.owner.email);
   await password.evaluate((el,v)=>(el as HTMLInputElement).value=v,world.owner.password);
   const answer=page.waitForResponse(r=>new URL(r.url()).pathname==="/api/login"&&r.request().method()==="POST");await form.getByRole("button",{name:"登录",exact:true}).click();expect((await answer).status()).toBe(200);await expect(form).toHaveCount(0);await expect(page.locator("main")).toBeVisible();
-  const fresh=await page.context().browser()!.newContext();const signup=await fresh.newPage();try{await signup.goto(stack.previewUrl);await signup.getByRole("tab",{name:"注册组织",exact:true}).click();const register=signup.getByRole("form",{name:"注册组织",exact:true});await expect(register).toHaveAttribute("method","post");await expect(register.getByLabel("邮箱",{exact:true})).toHaveAttribute("autocomplete","username");await expect(register.getByLabel("口令",{exact:true})).toHaveAttribute("autocomplete","new-password");await expect(register.getByRole("button",{name:"注册组织",exact:true})).toHaveAttribute("type","submit");await shot(signup,"tenant-signup-standard-autocomplete");}finally{await fresh.close();}
+  const fresh=await page.context().browser()!.newContext();const signup=await fresh.newPage();try{await signup.goto(`${stack.previewUrl}/login`);await signup.getByRole("tab",{name:"注册组织",exact:true}).click();const register=signup.getByRole("form",{name:"注册组织",exact:true});await expect(register).toHaveAttribute("method","post");await expect(register.getByLabel("邮箱",{exact:true})).toHaveAttribute("autocomplete","username");await expect(register.getByLabel("口令",{exact:true})).toHaveAttribute("autocomplete","new-password");await expect(register.getByRole("button",{name:"注册组织",exact:true})).toHaveAttribute("type","submit");await shot(signup,"tenant-signup-standard-autocomplete");}finally{await fresh.close();}
 });
 test("11-portal-has-1440-content-cap-and-usable-mobile-shell",async({page})=>{
   await owner(page);

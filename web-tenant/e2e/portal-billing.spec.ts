@@ -30,24 +30,52 @@ test.afterAll(async () => {
 });
 
 async function login(page: Page, who: Login): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page.getByRole("banner")).toBeVisible();
 }
 
-/** Signs in and opens 账户. */
+function accountLink(page: Page): Locator {
+  return page.getByRole("navigation", { name: "组织门户分区" }).getByRole("link", { name: "账务账户", exact: true });
+}
+
+async function signOut(page: Page): Promise<void> {
+  await page.getByRole("banner").getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("main").getByRole("button", { name: "登出", exact: true }).click();
+  await expect(page.getByRole("form", { name: "登录", exact: true })).toBeVisible();
+}
+
 async function openAccount(page: Page, who: Login): Promise<void> {
   await login(page, who);
-  await page.getByRole("tab", { name: "账户" }).click();
+  await accountLink(page).click();
   await expect(region(page, "余额")).toBeVisible();
 }
 
 const region = (page: Page, name: string): Locator => page.getByRole("region", { name, exact: true });
 
+async function openTopupRequest(page: Page): Promise<Locator> {
+  await page.getByRole("button", { name: "申请充值", exact: true }).click();
+  return page.getByRole("dialog", { name: "申请充值", exact: true });
+}
+
 /** The body rows of a region's table, newest first as shown. */
 const bodyRows = (r: Locator): Locator => r.locator("tbody tr");
+
+const nextLedgerPage = (ledger: Locator): Locator => ledger
+  .getByRole("navigation", { name: "余额流水分页", exact: true })
+  .getByRole("button", { name: "下一页", exact: true });
+
+async function expectLedgerBalances(ledger: Locator, expected: readonly number[]): Promise<void> {
+  const balances = bodyRows(ledger).locator("td:nth-child(4)");
+  const next = nextLedgerPage(ledger);
+  for (let offset = 0; offset < expected.length; offset += 25) {
+    await expect(balances).toHaveText(expected.slice(offset, offset + 25).map(cny));
+    if (offset + 25 < expected.length) await next.click();
+  }
+  await expect(next).toBeDisabled();
+}
 
 async function ownerApi(world: BillingWorld): Promise<ApiClient> {
   const api = stack.tenant();
@@ -78,8 +106,9 @@ function cny(micro: number): string {
   return `${sign}¥${Math.floor(abs / 1_000_000)}.${frac}`;
 }
 
-function utcDay(offsetDays: number): string {
-  return new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
+function billingDay(offsetDays: number): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai" })
+    .format(new Date(Date.now() + offsetDays * 86_400_000));
 }
 
 test("新开通的预付组织余额为零，状态写明调用已停止", async ({ page }) => {
@@ -102,7 +131,7 @@ test.describe.serial("充值与扣费", () => {
 
   test("提交充值申请后显示待审批；运营批准后余额到账，流水多一笔充值", async ({ page }) => {
     await openAccount(page, world.owner);
-    const form = region(page, "申请充值");
+    const form = await openTopupRequest(page);
     await form.getByLabel("充值金额（元）").fill("100.50");
     await form.getByLabel("付款凭证号").fill("wire-ui-7c1");
     await form.getByRole("button", { name: "提交申请" }).click();
@@ -116,7 +145,7 @@ test.describe.serial("充值与扣费", () => {
     await approveTopup(stack, listed.items[0].id);
 
     await page.reload();
-    await page.getByRole("tab", { name: "账户" }).click();
+    await accountLink(page).click();
     const balance = region(page, "余额");
     await expect(balance).toContainText("¥100.50");
     await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "ok");
@@ -137,7 +166,7 @@ test.describe.serial("充值与扣费", () => {
     await expect(rows.nth(0).locator("td").nth(3)).toHaveText("¥100.478");
     await expect(rows.nth(1).locator("td").nth(2)).toHaveText("-¥0.011");
     await expect(rows.nth(1).locator("td").nth(3)).toHaveText("¥100.489");
-    await expect(rows.nth(0).locator("td").nth(4)).toHaveText("chat-ui");
+    await expect(rows.nth(0).getByRole("cell", { name: "chat-ui", exact: true })).toBeVisible();
   });
 
   test("可用额度显示各级剩余，并标出以哪一级为准", async ({ page }) => {
@@ -152,7 +181,7 @@ test.describe.serial("充值与扣费", () => {
     const api = await ownerApi(world);
     await api.post("/api/budgets", { scope: "api_key", scope_ref: world.key.id, kind: "periodic", period: "month", limit_cny: "0.01" });
     await page.reload();
-    await page.getByRole("tab", { name: "账户" }).click();
+    await accountLink(page).click();
     await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.00");
     const key = readout.getByRole("listitem").filter({ hasText: "密钥" });
     await expect(key).toContainText("以此为准");
@@ -160,35 +189,37 @@ test.describe.serial("充值与扣费", () => {
     await expect(readout.getByRole("listitem").filter({ hasText: "组织" })).toContainText("¥100.478");
   });
 
-  test("按天汇总与时间筛选按 UTC 计算", async ({ browser }) => {
+  test("按天汇总与时间筛选按北京时间计算，与浏览器时区无关", async ({ browser }) => {
     await waitClearOfUtcMidnight();
-    // A zone whose calendar date differs from UTC's at this very moment, at any hour:
-    // +14 from 10:00 UTC on (already tomorrow), -11 before that (still yesterday).
-    const timezoneId = new Date().getUTCHours() >= 10 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
+    // 选择日历日期与北京时间不同的浏览器时区。
+    const hour = new Date().getUTCHours();
+    const timezoneId = hour >= 11 && hour < 16 ? "Pacific/Kiritimati" : "Pacific/Pago_Pago";
     const context = await browser.newContext({ timezoneId });
     const page = await context.newPage();
     try {
       await openAccount(page, world.owner);
-      const today = utcDay(0);
+      const today = billingDay(0);
       expect(await page.evaluate(() => new Date().toLocaleDateString("en-CA"))).not.toBe(today);
       const ledger = region(page, "余额流水");
       const summary = region(page, "按期汇总");
-      await ledger.getByLabel("开始日期（UTC）").fill(today);
-      await ledger.getByLabel("结束日期（UTC）").fill(today);
+      const summaryRows = bodyRows(summary.getByRole("table", { name: "按期汇总", exact: true }));
+      await expect(summary).toContainText("UTC+8");
+      await ledger.getByLabel("开始日期", { exact: true }).fill(today);
+      await ledger.getByLabel("结束日期", { exact: true }).fill(today);
       await expect(summary.getByRole("combobox", { name: "汇总方式" })).toHaveAttribute("data-value", "day");
-      await expect(bodyRows(summary)).toHaveCount(1);
-      const row = bodyRows(summary).first().locator("td");
+      await expect(summaryRows).toHaveCount(1);
+      const row = summaryRows.first().locator("td");
       await expect(row.nth(0)).toHaveText(today);
       await expect(row.nth(1)).toHaveText("-¥0.022");
       await expect(row.nth(2)).toHaveText("¥100.50");
       await expect(row.nth(4)).toHaveText("¥100.478");
       await expect(bodyRows(ledger)).toHaveCount(3);
 
-      // By month the same day is one period, labelled by its UTC month.
+      // 月汇总使用同一个北京时间月份。
       await chooseSelect(summary.getByLabel("汇总方式"), "month");
-      await expect(bodyRows(summary)).toHaveCount(1);
-      await expect(bodyRows(summary).first().locator("td").nth(0)).toHaveText(today.slice(0, 7));
-      await expect(bodyRows(summary).first().locator("td").nth(1)).toHaveText("-¥0.022");
+      await expect(summaryRows).toHaveCount(1);
+      await expect(summaryRows.first().locator("td").nth(0)).toHaveText(today.slice(0, 7));
+      await expect(summaryRows.first().locator("td").nth(1)).toHaveText("-¥0.022");
       await chooseSelect(summary.getByLabel("汇总方式"), "day");
 
       // The 类型 filter narrows the ledger to one kind.
@@ -202,17 +233,17 @@ test.describe.serial("充值与扣费", () => {
       await expect(bodyRows(ledger)).toHaveCount(3);
 
       // An end before the start names nothing, and the field says so.
-      await ledger.getByLabel("结束日期（UTC）").fill(utcDay(-1));
+      await ledger.getByLabel("结束日期", { exact: true }).fill(billingDay(-1));
       await expect(ledger.getByText("结束日期不能早于开始日期")).toBeVisible();
       await expect(bodyRows(ledger)).toHaveCount(0);
-      await expect(bodyRows(summary)).toHaveCount(0);
+      await expect(summaryRows).toHaveCount(0);
 
       // Yesterday, as a whole range of its own, holds nothing.
-      await ledger.getByLabel("开始日期（UTC）").fill(utcDay(-1));
+      await ledger.getByLabel("开始日期", { exact: true }).fill(billingDay(-1));
       await expect(ledger.getByText("所选范围内没有流水")).toBeVisible();
       await expect(summary.getByText("所选范围内没有汇总")).toBeVisible();
       await expect(bodyRows(ledger)).toHaveCount(0);
-      await expect(bodyRows(summary)).toHaveCount(0);
+      await expect(summaryRows).toHaveCount(0);
     } finally {
       await context.close();
     }
@@ -228,7 +259,7 @@ test("平台直接入账显示为平台入账并带原因", async ({ page }) => 
   await expect(row.nth(2)).toHaveText("平台入账");
   await expect(row.nth(3)).toHaveText("平台");
   await expect(row.nth(6)).toContainText("线下收款-ui-4b7");
-  await expect(bodyRows(region(page, "余额流水")).first().locator("td").nth(4)).toHaveText("平台入账");
+  await expect(bodyRows(region(page, "余额流水")).first().getByRole("cell", { name: "平台入账", exact: true })).toBeVisible();
 });
 
 test("被驳回的申请显示驳回原因，余额不变", async ({ page }) => {
@@ -249,7 +280,7 @@ test("后付组织显示信用额度与可用额度，用尽后显示已达信�
   await openAccount(page, world.owner);
   const balance = region(page, "余额");
   await expect(balance).toContainText("信用额度");
-  await expect(balance.locator(".entry").filter({ hasText: "信用额度" })).toContainText("¥0.02");
+  await expect(balance.getByText("信用额度", { exact: true }).locator("..")).toContainText("¥0.02");
   // Before any call the whole credit line is open, and the organisation binds.
   await expect(region(page, "可用额度").getByTestId("readout-amount")).toHaveText("¥0.02");
   await expect(region(page, "可用额度").getByRole("listitem").filter({ hasText: "组织" })).toContainText("以此为准");
@@ -257,8 +288,8 @@ test("后付组织显示信用额度与可用额度，用尽后显示已达信�
   await paidChat(world);
   await expect.poll(() => balanceOf(world)).toBe(-2 * CALL_MICRO_CNY);
   await page.reload();
-  await page.getByRole("tab", { name: "账户" }).click();
-  await expect(balance.locator(".entry").filter({ hasText: "可用额度" })).toContainText("-¥0.002");
+  await accountLink(page).click();
+  await expect(balance.getByText("可用额度", { exact: true }).locator("..")).toContainText("-¥0.002");
   await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
   await expect(balance).toContainText("已达信用额度，调用已停止");
 });
@@ -266,14 +297,14 @@ test("后付组织显示信用额度与可用额度，用尽后显示已达信�
 test("金额格式不对时不发送请求并提示", async ({ page }) => {
   const world = await seedBillingWorld(stack, { creditCny: "0" });
   await openAccount(page, world.owner);
-  const form = region(page, "申请充值");
+  const form = await openTopupRequest(page);
   await form.getByLabel("充值金额（元）").fill("0.001");
   await form.getByRole("button", { name: "提交申请" }).click();
   await expect(form.getByText("请输入金额，最多两位小数")).toBeVisible();
   await expect(form.getByLabel("充值金额（元）")).toBeFocused();
   await page.reload();
-  await page.getByRole("tab", { name: "账户" }).click();
-  await expect(region(page, "充值记录").getByText("还没有充值记录")).toBeVisible();
+  await accountLink(page).click();
+  await expect(region(page, "充值记录").getByText("所选范围内没有充值记录", { exact: true })).toBeVisible();
   await expect(bodyRows(region(page, "充值记录"))).toHaveCount(0);
   const api = await ownerApi(world);
   expect((await api.get("/api/billing/topups")).items).toEqual([]);
@@ -285,11 +316,11 @@ test("成员看不到账户页；账单角色能看到余额并提交充值，�
   if (!plain || !billing) throw new Error("the world has both members");
 
   await login(page, plain);
-  await expect(page.getByRole("tab", { name: "账户" })).toHaveCount(0);
-  await page.getByRole("button", { name: "登出" }).click();
+  await expect(accountLink(page)).toHaveCount(0);
+  await signOut(page);
 
   await openAccount(page, billing);
-  await expect(page.getByRole("tab", { name: "密钥" })).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "组织门户分区" }).getByRole("link", { name: "API 密钥", exact: true })).toHaveCount(0);
   await expect(region(page, "余额")).toContainText("¥0.00");
   const readout = region(page, "可用额度");
   await expect(readout.getByRole("listitem")).toHaveCount(1);
@@ -297,7 +328,7 @@ test("成员看不到账户页；账单角色能看到余额并提交充值，�
   await expect(readout.getByLabel("密钥")).toHaveCount(0);
   await expect(readout.getByTestId("readout-amount")).toHaveText("¥0.00");
 
-  const form = region(page, "申请充值");
+  const form = await openTopupRequest(page);
   await form.getByLabel("充值金额（元）").fill("0.01");
   await form.getByRole("button", { name: "提交申请" }).click();
   await expect(bodyRows(region(page, "充值记录")).first()).toContainText("待审批");
@@ -334,7 +365,7 @@ test("组织额度用尽而余额仍为正：状态灯写明调用已停止，�
   await expect(balance.locator("[data-state]")).toHaveAttribute("data-state", "exhausted");
   await expect(balance).toContainText("组织额度已用尽，调用已停止");
   await expect(region(page, "可用额度").getByTestId("readout-amount")).toHaveText("¥0.00");
-  await page.getByRole("button", { name: "登出" }).click();
+  await signOut(page);
 
   // The owner reads the same lamp.
   await openAccount(page, world.owner);
@@ -342,7 +373,7 @@ test("组织额度用尽而余额仍为正：状态灯写明调用已停止，�
   await expect(region(page, "余额")).toContainText("组织额度已用尽，调用已停止");
 });
 
-test("流水分页：加载更多既不重复也不遗漏", async ({ page }) => {
+test("流水分页：逐页查看既不重复也不遗漏", async ({ page }) => {
   test.setTimeout(180_000);
   const world = await seedBillingWorld(stack, { creditCny: "1.00" });
   await paidChat(world);
@@ -351,17 +382,11 @@ test("流水分页：加载更多既不重复也不遗漏", async ({ page }) => 
 
   await openAccount(page, world.owner);
   const ledger = region(page, "余额流水");
-  await expect(bodyRows(ledger)).toHaveCount(50);
-  await ledger.getByRole("button", { name: "加载更多" }).click();
-  await expect(bodyRows(ledger)).toHaveCount(51);
-  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
 
   // Each entry's balance is the one before it less a call: 51 distinct, in order, none missing.
-  const balances = await bodyRows(ledger).locator("td:nth-child(4)").allTextContents();
   const expected = [1_000_000];
   for (let k = 1; k <= 50; k++) expected.unshift(1_000_000 - k * CALL_MICRO_CNY);
-  expect(balances).toEqual(expected.map(cny));
-  expect(new Set(balances).size).toBe(51);
+  await expectLedgerBalances(ledger, expected);
 });
 
 test("密钥选择切换可用额度，成员额度单独成一站", async ({ page }) => {
@@ -427,14 +452,14 @@ test("组织额度读取失败时：不说可正常调用，也不把全部余�
 
 /**
  * A new filter's first page is still on its way: the old filter's cursor must
- * not be offered for it, or 加载更多 continues the new filter from the old
+ * not be offered for it, or 下一页 continues the new filter from the old
  * position and skips the entries in between. The new first page is held at
  * the network and then let through with its real answer.
  */
-test("换筛选后首页未到时不能加载更多；到了之后逐页翻完，每条只出现一次", async ({ page }) => {
+test("换筛选后首页未到时不能翻页；到了之后逐页翻完，每条只出现一次", async ({ page }) => {
   test.setTimeout(150_000);
   // Oldest first: the funding top-up, 50 more top-ups, then two calls. 充值
-  // and 全部 then both run past one page (50), at different positions.
+  // and 全部 then both run past two pages, at different positions.
   const world = await seedBillingWorld(stack, { creditCny: "1.00" });
   for (let i = 0; i < 50; i++) {
     await stack.admin.post(`/admin/tenants/${world.tenantId}/credits`, { amount_cny: "0.01", reason: `翻页-${i}` });
@@ -446,10 +471,11 @@ test("换筛选后首页未到时不能加载更多；到了之后逐页翻完�
   await openAccount(page, world.owner);
   const ledger = region(page, "余额流水");
   const rows = bodyRows(ledger);
-  await expect(rows).toHaveCount(50);
+  await expect(rows).toHaveCount(25);
   await chooseSelect(ledger.getByLabel("类型"), { label: "充值" });
-  await expect(rows.locator("td:nth-child(2)")).toHaveText(Array(50).fill("充值"));
-  await expect(ledger.getByRole("button", { name: "加载更多" })).toBeVisible();
+  await expect(rows.locator("td:nth-child(2)")).toHaveText(Array(25).fill("充值"));
+  const next = nextLedgerPage(ledger);
+  await expect(next).toBeEnabled();
 
   // Back to 全部, whose first page is held.
   const firstOfAll = (url: URL) =>
@@ -465,17 +491,15 @@ test("换筛选后首页未到时不能加载更多；到了之后逐页翻完�
   });
   await chooseSelect(ledger.getByLabel("类型"), { label: "全部" });
   await arrived;
-  // Nothing of 充值's to continue from while 全部's first page is out.
-  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
-  release();
-  await expect(rows).toHaveCount(50);
+  try {
+    await expect(next.and(ledger.locator("button:enabled"))).toHaveCount(0);
+  } finally {
+    release();
+  }
+  await expect(rows).toHaveCount(25);
   await page.unroute(firstOfAll);
-  await ledger.getByRole("button", { name: "加载更多" }).click();
-  await expect(rows).toHaveCount(53);
-  await expect(ledger.getByRole("button", { name: "加载更多" })).toHaveCount(0);
 
   // Every entry once, in order: each balance is the one before it less what it moved.
-  const balances = await rows.locator("td:nth-child(4)").allTextContents();
   const expected: number[] = [];
   let after = 1_500_000 - 2 * CALL_MICRO_CNY;
   for (let k = 0; k < 2; k++) {
@@ -488,5 +512,5 @@ test("换筛选后首页未到时不能加载更多；到了之后逐页翻完�
   }
   expected.push(after);
   expect(after).toBe(1_000_000);
-  expect(balances).toEqual(expected.map(cny));
+  await expectLedgerBalances(ledger, expected);
 });

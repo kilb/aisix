@@ -16,7 +16,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::PgConnection;
+use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use super::accounts;
@@ -32,17 +32,32 @@ const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 500;
 
 /// What a usage entry's model is called when nothing names it.
-const UNKNOWN_MODEL: &str = "未知模型";
+pub(super) const UNKNOWN_MODEL: &str = "未知模型";
 
 #[derive(Deserialize)]
 pub struct LedgerQuery {
-    from: Option<DateTime<Utc>>,
-    to: Option<DateTime<Utc>>,
-    kind: Option<EntryKind>,
+    #[serde(flatten)]
+    filters: LedgerFilters,
     limit: Option<i64>,
     /// Only entries with a smaller `seq`: the `next_before` of the previous
     /// page.
     before: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct LedgerFilters {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    kind: Option<EntryKind>,
+}
+
+impl LedgerFilters {
+    pub(super) fn validate(&self) -> Result<(), ApiError> {
+        if let (Some(from), Some(to)) = (self.from, self.to) {
+            checked_range(from, to, None)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,7 +76,7 @@ fn refused<T>(query: Result<Query<T>, QueryRejection>) -> Result<T, ApiError> {
     })
 }
 
-type Row = (
+pub(super) type LedgerRow = (
     i64,
     DateTime<Utc>,
     String,
@@ -76,40 +91,62 @@ type Row = (
     Option<String>,
 );
 
+pub(super) async fn ledger_rows(
+    conn: &mut PgConnection,
+    tenant: Uuid,
+    filters: LedgerFilters,
+    before: Option<i64>,
+    limit: i64,
+    export: bool,
+) -> Result<Vec<LedgerRow>, sqlx::Error> {
+    let requested_model = if export {
+        // 历史调用没有固定模型名长度，限制导出读取量并标明长值的省略。
+        "CASE WHEN jsonb_typeof(u.event->'requested_model') = 'string' THEN
+            CASE WHEN char_length(u.event->>'requested_model') > 1024
+                 THEN left(u.event->>'requested_model', 1024) || '…'
+                 ELSE u.event->>'requested_model' END
+         END"
+    } else {
+        "u.event->>'requested_model'"
+    };
+    let mut sql = QueryBuilder::<Postgres>::new(format!(
+        "SELECT l.seq, l.posted_at, l.kind, l.amount_micro_cny, l.balance_after_micro_cny, \
+                l.event_id, l.topup_id, l.repricing_run_id, \
+                c.requested_model_id, {requested_model} \
+         FROM billing_ledger_cny l \
+         LEFT JOIN pricing_charges_cny c ON c.event_id = l.event_id \
+         LEFT JOIN usage_events u ON u.event_id = l.event_id \
+         WHERE l.tenant_id = ",
+    ));
+    sql.push_bind(tenant);
+    if let Some(from) = filters.from {
+        sql.push(" AND l.posted_at >= ").push_bind(from);
+    }
+    if let Some(to) = filters.to {
+        sql.push(" AND l.posted_at < ").push_bind(to);
+    }
+    if let Some(kind) = filters.kind {
+        sql.push(" AND l.kind = ").push_bind(kind.as_str());
+    }
+    if let Some(before) = before {
+        sql.push(" AND l.seq < ").push_bind(before);
+    }
+    sql.push(" ORDER BY l.seq DESC LIMIT ").push_bind(limit);
+    sql.build_query_as().fetch_all(conn).await
+}
+
 /// `tenant`'s entries, newest first, as `{items, next_before}`.
 async fn ledger_of(
     conn: &mut PgConnection,
     tenant: Uuid,
     q: LedgerQuery,
 ) -> Result<Json<Value>, ApiError> {
-    if let (Some(from), Some(to)) = (q.from, q.to) {
-        checked_range(from, to, None)?;
-    }
+    q.filters.validate()?;
     let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // One row more than the page, to tell whether another page follows.
-    let mut rows: Vec<Row> = sqlx::query_as(
-        "SELECT l.seq, l.posted_at, l.kind, l.amount_micro_cny, l.balance_after_micro_cny, \
-                l.event_id, l.topup_id, l.repricing_run_id, \
-                c.requested_model_id, u.event->>'requested_model' \
-         FROM billing_ledger_cny l \
-         LEFT JOIN pricing_charges_cny c ON c.event_id = l.event_id \
-         LEFT JOIN usage_events u ON u.event_id = l.event_id \
-         WHERE l.tenant_id = $1 \
-           AND ($2::timestamptz IS NULL OR l.posted_at >= $2) \
-           AND ($3::timestamptz IS NULL OR l.posted_at < $3) \
-           AND ($4::text IS NULL OR l.kind = $4) \
-           AND ($5::bigint IS NULL OR l.seq < $5) \
-         ORDER BY l.seq DESC LIMIT $6",
-    )
-    .bind(tenant)
-    .bind(q.from)
-    .bind(q.to)
-    .bind(q.kind.map(EntryKind::as_str))
-    .bind(q.before)
-    .bind(limit + 1)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(DbError::from)?;
+    let mut rows = ledger_rows(conn, tenant, q.filters, q.before, limit + 1, false)
+        .await
+        .map_err(DbError::from)?;
     let more = rows.len() as i64 > limit;
     rows.truncate(limit as usize);
     let next_before = if more { rows.last().map(|r| r.0) } else { None };

@@ -107,6 +107,9 @@ pub struct AppState {
     pub upstream_models: Arc<upstream_models::Cache>,
     /// 手动模型探测全局有界，不占用数据库连接等待上游。
     pub model_probes: Arc<Semaphore>,
+    /// 导出单独限流和连接，避免慢查询占用用量接收连接。
+    pub(crate) billing_exports: Arc<Semaphore>,
+    pub(crate) billing_export_db: Db,
     /// Where the price library is fetched from ([`pricing::library`]).
     pub library: Arc<pricing::library::Source>,
     /// 首轮密钥追平与已知资源投影完成后保持就绪，后续配置更新不扰动探针。
@@ -338,6 +341,10 @@ where
         db.dedicated_within(native_objects::POOL_SIZE, native_objects::ACQUIRE_TIMEOUT);
     let upstream = upstream_http::Client::new(outbound).map_err(BootError::OutboundPolicy)?;
     let library = pricing::library::Source::new(library).map_err(BootError::LibrarySource)?;
+    let billing_export_db = db.dedicated_within(
+        billing::export::MAX_IN_FLIGHT,
+        std::time::Duration::from_secs(2),
+    );
     let state = AppState {
         db,
         env,
@@ -356,6 +363,8 @@ where
         upstream: Arc::new(upstream),
         upstream_models: Arc::new(upstream_models::Cache::default()),
         model_probes: Arc::new(Semaphore::new(model_probes::MAX_IN_FLIGHT)),
+        billing_exports: Arc::new(Semaphore::new(billing::export::MAX_IN_FLIGHT as usize)),
+        billing_export_db,
         library: Arc::new(library),
         ready: Arc::new(AtomicBool::new(false)),
     };
@@ -395,6 +404,7 @@ where
         state.db.clone(),
         stopping.clone(),
     ));
+    tasks.push(billing::alerts::spawn(state.clone(), stopping.clone()));
     tasks.push(native_objects::spawn(state.clone(), stopping.clone()));
     tasks.push(model_assessments::spawn(state.clone(), stopping.clone()));
     if let Some((listener, tls, _)) = dp {

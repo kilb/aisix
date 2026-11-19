@@ -13,7 +13,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::auth::password::normalize_email;
-use crate::auth::settings::{self, AuthSettings, SecretScope};
+use crate::auth::settings::{self, AuthSettings, Email, SecretScope};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
 use crate::http::ApiJson;
@@ -69,7 +69,7 @@ fn mail_unavailable() -> ApiError {
     }
 }
 
-fn safe_recipient(email: &str) -> bool {
+pub(crate) fn safe_recipient(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
@@ -94,7 +94,7 @@ fn safe_recipient(email: &str) -> bool {
         })
 }
 
-fn generate_code() -> Result<String, ApiError> {
+pub(crate) fn generate_code() -> Result<String, ApiError> {
     // 拒绝高位余数，避免取模造成少数验证码更容易被抽中。
     let limit = u32::MAX - u32::MAX % CODE_SPACE;
     loop {
@@ -290,33 +290,73 @@ pub async fn send_email_code(
     let code_mac = hmac::sign(&key, &code_material(&settings, id, &code));
     let settings =
         reserve_code(&state, settings, id, recipient_mac(&key, &email), code_mac).await?;
-    let api_key = settings
-        .email
-        .api_key
-        .as_deref()
-        .ok_or_else(mail_unavailable)?;
-
-    let response = client
-        .post(endpoint)
-        .bearer_auth(api_key)
-        .json(&json!({
-            "from": settings.email.from,
-            "to": email,
-            "subject": "Routio 注册验证码",
-            "text": format!("您的 Routio 注册验证码为 {code}，10 分钟内有效。")
-        }))
-        .send()
-        .await
-        .map_err(|_| mail_unavailable())?;
-    if !response.status().is_success() {
-        tracing::warn!(
-            status = response.status().as_u16(),
-            "发信接口拒绝了验证码邮件"
-        );
-        return Err(mail_unavailable());
-    }
+    dispatch_email(
+        client,
+        endpoint,
+        &settings.email,
+        &email,
+        "Routio 注册验证码",
+        &format!("您的 Routio 注册验证码为 {code}，10 分钟内有效。"),
+        None,
+    )
+    .await?;
     activate_code(&state, settings, id, recipient_mac(&key, &email)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 通过认证设置里的 HTTPS 发信服务投递，沿用外部地址检查和凭据边界。
+pub(crate) async fn send_configured_email(
+    state: &AppState,
+    email: &Email<String>,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    idempotency_key: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let endpoint = Url::parse(&email.endpoint).map_err(|_| mail_unavailable())?;
+    let client = state.upstream.public_https_client(&endpoint).await?;
+    dispatch_email(
+        client,
+        endpoint,
+        email,
+        recipient,
+        subject,
+        body,
+        idempotency_key,
+    )
+    .await
+}
+
+async fn dispatch_email(
+    client: &reqwest::Client,
+    endpoint: Url,
+    email: &Email<String>,
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    idempotency_key: Option<Uuid>,
+) -> Result<(), ApiError> {
+    if !email.enabled || !safe_recipient(recipient) {
+        return Err(mail_unavailable());
+    }
+    let api_key = email.api_key.as_deref().ok_or_else(mail_unavailable)?;
+
+    let mut request = client.post(endpoint).bearer_auth(api_key).json(&json!({
+        "from": email.from,
+        "to": recipient,
+        "subject": subject,
+        "text": body
+    }));
+    if let Some(key) = idempotency_key {
+        // https://resend.com/docs/dashboard/emails/idempotency-keys
+        request = request.header("Idempotency-Key", key.to_string());
+    }
+    let response = request.send().await.map_err(|_| mail_unavailable())?;
+    if !response.status().is_success() {
+        tracing::warn!(status = response.status().as_u16(), "发信接口拒绝了邮件");
+        return Err(mail_unavailable());
+    }
+    Ok(())
 }
 
 /// 先提交猜测次数，再核对摘要。即使随后的注册事务回滚，猜测也计数。

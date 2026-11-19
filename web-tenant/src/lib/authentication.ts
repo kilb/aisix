@@ -3,6 +3,7 @@ import { ApiError, call, finishPasskeyLogin } from "./api";
 
 export interface AuthenticationOptions {
   email_verification: boolean;
+  password_recovery?: boolean;
   turnstile_site_key: string | null;
   passkey: boolean;
   github: boolean;
@@ -10,7 +11,7 @@ export interface AuthenticationOptions {
 }
 
 const PASSWORD_ONLY: AuthenticationOptions = {
-  email_verification: false, turnstile_site_key: null, passkey: false, github: false, google: false,
+  email_verification: false, password_recovery: false, turnstile_site_key: null, passkey: false, github: false, google: false,
 };
 
 let pendingOptions: Promise<AuthenticationOptions> | undefined;
@@ -57,6 +58,14 @@ export const SOCIAL_NAMES: Record<SocialProvider, string> = { github: "GitHub", 
 
 export async function sendEmailCode(email: string, turnstileToken?: string): Promise<void> {
   await call<null>("POST", "/auth/email-code", { email, turnstile_token: turnstileToken });
+}
+
+export async function requestPasswordRecovery(email: string, turnstileToken?: string): Promise<void> {
+  await call<null>("POST", "/auth/password/forgot", { email, turnstile_token: turnstileToken });
+}
+
+export async function completePasswordRecovery(email: string, emailCode: string, newPassword: string): Promise<void> {
+  await call<null>("POST", "/auth/password/reset", { email, email_code: emailCode, new_password: newPassword });
 }
 
 export async function openSocialAuthorization(

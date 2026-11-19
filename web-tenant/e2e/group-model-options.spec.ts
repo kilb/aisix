@@ -12,7 +12,7 @@ test.beforeAll(async () => {
 test.afterAll(async () => { await stack?.stop(); });
 
 test("租户切组后只可勾选新组中已授权的模型", async ({ page }) => {
-  await loginForGroupModels(page, stack.previewUrl, world.owner);
+  await loginForGroupModels(page, `${stack.previewUrl}/login`, world.owner);
   await page.goto(stack.previewUrl + "/#keys");
   await page.getByRole("button", { name: "新建密钥", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "新建密钥", exact: true });

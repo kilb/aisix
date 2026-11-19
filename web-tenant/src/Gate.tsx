@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Activity, Fingerprint, KeyRound, UsersRound } from "lucide-react";
+import { ArrowRight, Building, Eye, EyeOff, Fingerprint, GitFork, Globe, LockKeyhole, Mail, UserRound } from "lucide-react";
 import { ApiError, MIN_PASSWORD_CHARS, acceptInvite, login, signup, type Session } from "./lib/api";
 import {
   browserAuthenticationError,
@@ -15,11 +15,13 @@ import {
 import { formMessageFor } from "./lib/errors";
 import { loadTurnstile, turnstileToken } from "./lib/turnstile";
 import type { Theme } from "./lib/useTheme";
+import { PasswordRecoveryForm } from "./PasswordRecoveryForm";
 import { Button } from "./ui/Button";
 import { Field } from "./ui/Field";
 import { RouteNav } from "./ui/RouteNav";
 import { ThemeToggle } from "./ui/ThemeToggle";
-import { Card } from "./components/page";
+import "./PublicTheme.css";
+import "./Gate.css";
 
 type Mode = "login" | "signup";
 type Pending = "submit" | "email_code" | "passkey" | SocialProvider;
@@ -30,6 +32,8 @@ const MODES = [
 ] as const satisfies readonly { id: Mode; label: string }[];
 
 const TOO_SHORT = `口令至少需要 ${MIN_PASSWORD_CHARS} 个字符`;
+const HOME_URL = import.meta.env.BASE_URL;
+const SOCIAL_ICONS = { github: GitFork, google: Globe };
 
 /** Whether `password` is long enough, counted in characters as the control plane counts them. */
 function longEnough(password: string): boolean {
@@ -48,6 +52,8 @@ function longEnough(password: string): boolean {
 export function Gate({
   theme,
   onToggleTheme,
+  mode,
+  onModeChange,
   invite,
   signedIn,
   notice,
@@ -56,6 +62,8 @@ export function Gate({
 }: {
   theme: Theme;
   onToggleTheme: () => void;
+  mode: Mode;
+  onModeChange: (mode: Mode) => void;
   /** The invitation token, when the page was opened from an invitation link. */
   invite: string | null;
   /** Whether a session is live behind an invitation form opened over it. */
@@ -65,21 +73,35 @@ export function Gate({
   onIn: (session: Session) => void;
   onLeaveInvite: () => void;
 }) {
-  const [mode, setMode] = useState<Mode>("login");
+  const formId = `tenant-${invite !== null ? "invite" : mode}`;
+  const [previousForm, setPreviousForm] = useState(formId);
   const [orgName, setOrgName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const [displayName, setDisplayName] = useState("");
   const [emailCode, setEmailCode] = useState("");
   const [sentTo, setSentTo] = useState<string | null>(null);
   const [resendBlocked, setResendBlocked] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [pending, setPending] = useState<Pending | null>(null);
+  const [recovering, setRecovering] = useState(false);
+  const [recovered, setRecovered] = useState(false);
   const emailField = useRef<HTMLInputElement>(null);
   const turnstile = useRef<HTMLDivElement>(null);
   const { options, failed, retry } = useAuthenticationOptions(invite === null);
   const siteKey = options?.turnstile_site_key ?? null;
   const busy = pending !== null;
+
+  // 前进和后退也会切换表单。邮箱等草稿保留，口令和提示随表单清除。
+  if (previousForm !== formId) {
+    setPreviousForm(formId);
+    setPassword("");
+    setPasswordVisible(false);
+    setErr(null);
+    setRecovering(false);
+    setRecovered(false);
+  }
 
   useEffect(() => {
     if (siteKey) void loadTurnstile().catch(() => { /* 用户提交时可重试。 */ });
@@ -199,50 +221,82 @@ export function Gate({
 
   function switchMode(next: Mode) {
     if (next === mode || busy) return;
-    setMode(next);
+    onModeChange(next);
+  }
+
+  function openRecovery() {
+    setEmail(emailField.current?.value.trim() ?? email);
     setPassword("");
+    setPasswordVisible(false);
     setErr(null);
+    setRecovered(false);
+    setRecovering(true);
+  }
+
+  function closeRecovery(address: string, completed: boolean) {
+    setEmail(address);
+    setRecovering(false);
+    setRecovered(completed);
   }
 
   function leaveInvite() {
     setErr(null);
     setPassword("");
+    setPasswordVisible(false);
     onLeaveInvite();
   }
 
   const hinted = invite !== null || mode === "signup";
-  const formId = `tenant-${invite !== null ? "invite" : mode}`;
   const canUsePasskey = options?.passkey && supportsPasskeys();
   const socialProviders = SOCIAL_PROVIDERS.filter((provider) => options?.[provider]);
   const sentHere = sentTo !== null && sentTo === email.trim().toLowerCase();
   const passwordField = (
-    <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined}>
-      {(aria) => (
-        <input
-          id={`${formId}-password`}
-          name="password"
-          type="password"
-          autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
-          required
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          {...aria}
-        />
-      )}
-    </Field>
+    <div className="portal-auth__password">
+      <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined}>
+        {(aria) => (
+          <span className="portal-auth__control">
+            <LockKeyhole aria-hidden />
+            <input
+              id={`${formId}-password`}
+              name="password"
+              type={passwordVisible ? "text" : "password"}
+              autoComplete={invite === null && mode === "login" ? "current-password" : "new-password"}
+              placeholder={hinted ? "设置口令" : "请输入口令"}
+              required
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              {...aria}
+            />
+          </span>
+        )}
+      </Field>
+      <Button
+        className="portal-auth__reveal"
+        kind="quiet"
+        iconOnly
+        aria-controls={`${formId}-password`}
+        aria-label={passwordVisible ? "隐藏口令" : "显示口令"}
+        onClick={() => setPasswordVisible((visible) => !visible)}
+      >
+        {passwordVisible ? <EyeOff aria-hidden /> : <Eye aria-hidden />}
+      </Button>
+    </div>
   );
 
   const displayNameField = (
     <Field label="显示名">
-      <input
-        id={`${formId}-display-name`}
-        name="display_name"
-        type="text"
-        autoComplete="name"
-        placeholder="选填"
-        value={displayName}
-        onChange={(e) => setDisplayName(e.target.value)}
-      />
+      <span className="portal-auth__control">
+        <UserRound aria-hidden />
+        <input
+          id={`${formId}-display-name`}
+          name="display_name"
+          type="text"
+          autoComplete="name"
+          placeholder="选填"
+          value={displayName}
+          onChange={(e) => setDisplayName(e.target.value)}
+        />
+      </span>
     </Field>
   );
 
@@ -252,64 +306,51 @@ export function Gate({
     </div>
   );
 
-  const title = invite !== null ? "接受邀请" : mode === "login" ? "登录" : "注册组织";
-  const introduction = invite !== null
-    ? "接受邀请，加入团队的工作空间。用自己的口令管理访问。"
-    : mode === "login"
-      ? "在一个工作空间中管理成员与 API 密钥，核对调用的用量、费用与额度。"
-      : "创建组织与所有者账号。平台审核通过后，即可为团队创建密钥并管理调用。";
+  const title = invite !== null ? "接受邀请" : recovering ? "找回口令" : mode === "login" ? "登录" : "注册组织";
 
   return (
-    <div className="gate-page tenant-gate">
-      <header className="gate-topbar">
-        <span className="brand">
-          <span className="brand-mark" aria-hidden="true" />
-          <span className="brand-name"><span className="mark">Routio</span> <span className="app">组织门户</span></span>
-        </span>
-        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
-      </header>
-      <main id="gate" className="gate-layout">
-        <Card tone="lilac" className="gate-introduction" aria-labelledby="gate-title">
-          <h1 id="gate-title">组织门户</h1>
-          <p className="gate-lead">{introduction}</p>
-          <dl className="gate-guide">
-            <div>
-              <UsersRound aria-hidden="true" />
-              <dt>组织与成员</dt>
-              <dd>按角色管理访问，邀请成员或创建团队账号。</dd>
-            </div>
-            <div>
-              <Activity aria-hidden="true" />
-              <dt>调用与费用</dt>
-              <dd>查看调用记录、用量与计费明细。</dd>
-            </div>
-            <div>
-              <KeyRound aria-hidden="true" />
-              <dt>密钥与额度</dt>
-              <dd>设置密钥的模型范围，查看适用的预算限制。</dd>
-            </div>
-          </dl>
-        </Card>
-        <Card className="gate-panel" aria-labelledby="gate-form-title">
-          <div className="gate-panel-heading">
-            <h2 id="gate-form-title">{title}</h2>
+    <div className="portal-auth">
+      <header className="portal-auth__header">
+        <div className="portal-auth__topbar">
+          <a href={HOME_URL} className="portal-auth__brand" aria-label="Routio 首页">
+            <span className="brand-mark" aria-hidden />
+            Routio
+          </a>
+          <div className="portal-auth__header-actions">
+            <a href={HOME_URL}>返回首页</a>
+            <ThemeToggle theme={theme} onToggle={onToggleTheme} />
           </div>
+        </div>
+      </header>
+      <main id="gate" className="portal-auth__layout">
+        <aside className="portal-auth__art">
+          <p className="portal-auth__wordmark">Routio</p>
+          <p className="portal-auth__descriptor">AI 模型网关</p>
+          <a href={`${HOME_URL}#pricing`}>查看模型价格 <ArrowRight aria-hidden /></a>
+        </aside>
+        <section className="portal-auth__panel" aria-labelledby="gate-form-title">
+          <h1 id="gate-form-title">{title}{title === "登录" ? " Routio" : ""}</h1>
           {notice && <div className="note warn" role="status">{notice}</div>}
+          {recovered && <div className="note" role="status">口令已重置，请用新口令登录。</div>}
           {invite !== null ? (
             <>
               <p className="hint">设置口令后即加入邀请你的组织，之后用受邀的邮箱和这个口令登录。</p>
-              <form id={formId} name={formId} method="post" className="gate-form" aria-label="接受邀请" onSubmit={submit}>
+              <form id={formId} name={formId} method="post" className="portal-auth__form" aria-label="接受邀请" onSubmit={submit}>
                 {passwordField}
                 {displayNameField}
                 <Button kind="primary" block type="submit" busy={pending === "submit"}>
                   接受邀请
                 </Button>
+                {alert}
               </form>
-              {alert}
-              <Button block onClick={leaveInvite}>
+              <Button className="portal-auth__secondary" block onClick={leaveInvite}>
                 {signedIn ? "取消" : "返回登录"}
               </Button>
             </>
+          ) : recovering ? (
+            <PasswordRecoveryForm initialEmail={email} theme={theme} siteKey={siteKey}
+              available={options?.password_recovery === true} onRefresh={retry}
+              onBack={(address) => closeRecovery(address, false)} onComplete={(address) => closeRecovery(address, true)} />
           ) : (
             <>
               <RouteNav
@@ -317,85 +358,103 @@ export function Gate({
                 items={MODES}
                 current={mode}
                 onSelect={switchMode}
-                className="gate-modes"
+                look="underline"
+                className="portal-auth__modes"
               />
-              <div id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
-                <form key={mode} id={formId} name={formId} method="post" className="gate-form" aria-label={title} onSubmit={submit}>
+              <div className="portal-auth__tab" id={`tab-${mode}`} role="tabpanel" aria-labelledby={`stop-${mode}`}>
+                <form key={mode} id={formId} name={formId} method="post" className="portal-auth__form" aria-label={title} onSubmit={submit}>
                   {mode === "signup" && (
                     <Field label="组织名称">
-                      <input
-                        id={`${formId}-organization`}
-                        name="organization"
-                        type="text"
-                        autoComplete="organization"
-                        required
-                        value={orgName}
-                        onChange={(e) => setOrgName(e.target.value)}
-                      />
+                      <span className="portal-auth__control">
+                        <Building aria-hidden />
+                        <input
+                          id={`${formId}-organization`}
+                          name="organization"
+                          type="text"
+                          autoComplete="organization"
+                          placeholder="请输入组织名称"
+                          required
+                          value={orgName}
+                          onChange={(e) => setOrgName(e.target.value)}
+                        />
+                      </span>
                     </Field>
                   )}
                   <Field label="邮箱">
-                    <input
-                      ref={emailField}
-                      id={`${formId}-email`}
-                      name="email"
-                      type="email"
-                      autoComplete="username"
-                      autoCapitalize="none"
-                      spellCheck={false}
-                      required
-                      value={email}
-                      onChange={(e) => {
-                        setEmail(e.target.value);
-                        setEmailCode("");
-                      }}
-                    />
+                    <span className="portal-auth__control">
+                      <Mail aria-hidden />
+                      <input
+                        ref={emailField}
+                        id={`${formId}-email`}
+                        name="email"
+                        type="email"
+                        autoComplete="username"
+                        autoCapitalize="none"
+                        spellCheck={false}
+                        placeholder="请输入邮箱"
+                        required
+                        value={email}
+                        onChange={(e) => {
+                          setEmail(e.target.value);
+                          setEmailCode("");
+                        }}
+                      />
+                    </span>
                   </Field>
                   {mode === "signup" && options?.email_verification && (
-                    <div className="gate-email-code">
+                    <div className="portal-auth__email-code">
                       <Field label="邮箱验证码">
                         <input name="email_code" type="text" autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required
+                          placeholder="六位验证码"
                           value={emailCode} onChange={(event) => setEmailCode(event.target.value)} />
                       </Field>
-                      <Button onClick={requestEmailCode} busy={pending === "email_code"} disabled={busy || (sentHere && resendBlocked)}>
+                      <Button className="portal-auth__secondary" onClick={requestEmailCode} busy={pending === "email_code"} disabled={busy || (sentHere && resendBlocked)}>
                         {sentHere ? "重新发送" : "发送验证码"}
                       </Button>
                       {sentHere && <p role="status" className="hint">验证码已发送，请检查收件箱。{resendBlocked ? "一分钟后可重新发送。" : ""}</p>}
                     </div>
                   )}
                   {passwordField}
+                  {mode === "login" && options?.password_recovery && (
+                    <Button kind="quiet" className="portal-auth__forgot" disabled={busy} onClick={openRecovery}>
+                      忘记口令？
+                    </Button>
+                  )}
                   {mode === "signup" && displayNameField}
-                  {siteKey && <div ref={turnstile} className="gate-turnstile" />}
+                  {siteKey && <div ref={turnstile} className="portal-auth__turnstile" />}
                   <Button kind="primary" block type="submit" busy={pending === "submit" || (!options && !failed)}
                     busyLabel={options ? "正在提交" : "正在读取登录设置"} disabled={busy || !options}>
                     {mode === "login" ? "登录" : "注册组织"}
                   </Button>
+                  {failed && <div className="note crit" role="alert">无法读取登录设置。 <Button size="sm" onClick={retry}>重试</Button></div>}
+                  {alert}
                 </form>
                 {mode === "login" && (canUsePasskey || socialProviders.length > 0) && (
-                  <div className="gate-alternative">
-                    <h3>其他登录方式</h3>
-                    <div className="gate-alternative-actions">
-                      {canUsePasskey && <Button onClick={passkeySignIn} disabled={busy} busy={pending === "passkey"}>
+                  <section className="portal-auth__alternative" aria-labelledby="gate-alternative-title">
+                    <h2 id="gate-alternative-title">其他登录方式</h2>
+                    <div className="portal-auth__alternative-actions">
+                      {canUsePasskey && <Button className="portal-auth__secondary" onClick={passkeySignIn} disabled={busy} busy={pending === "passkey"}>
                         <Fingerprint aria-hidden /> 使用 Passkey 登录
                       </Button>}
-                      {socialProviders.map((provider) => <Button key={provider} onClick={() => socialSignIn(provider)} disabled={busy} busy={pending === provider}>
-                        使用 {SOCIAL_NAMES[provider]} 登录
-                      </Button>)}
+                      {socialProviders.map((provider) => {
+                        const Icon = SOCIAL_ICONS[provider];
+                        return <Button key={provider} className="portal-auth__secondary" onClick={() => socialSignIn(provider)} disabled={busy} busy={pending === provider}>
+                          <Icon aria-hidden /> 使用 {SOCIAL_NAMES[provider]} 登录
+                        </Button>;
+                      })}
                     </div>
                     <p className="hint">首次使用，请先登录并在「账号设置」中添加登录方式。</p>
-                  </div>
+                  </section>
                 )}
               </div>
-              {failed && <div className="note crit" role="alert">无法读取登录设置。 <Button size="sm" onClick={retry}>重试</Button></div>}
-              {alert}
               {mode === "signup" && (
-                <p className="gate-foot">
+                <p className="hint">
                   新注册的组织需要平台审核。审核通过前可以登录查看组织状态、修改口令。
                 </p>
               )}
             </>
           )}
-        </Card>
+        </section>
       </main>
     </div>
   );

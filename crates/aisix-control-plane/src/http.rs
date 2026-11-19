@@ -353,6 +353,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     // The tenant API.
     ("GET", "/api/auth/options", MinRole::Public),
     ("POST", "/api/auth/email-code", MinRole::Public),
+    ("POST", "/api/auth/password/forgot", MinRole::Public),
+    ("POST", "/api/auth/password/reset", MinRole::Public),
     ("POST", "/api/auth/oauth/{provider}/start", MinRole::Public),
     (
         "GET",
@@ -387,6 +389,7 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("POST", "/api/login", MinRole::Public),
     ("POST", "/api/logout", MinRole::Public),
     ("GET", "/api/session", MinRole::Public),
+    ("GET", "/api/public/prices", MinRole::Public),
     ("POST", "/api/invites/accept", MinRole::Public),
     ("POST", "/api/password", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/org", MinRole::Member(EVERY_MEMBER)),
@@ -416,6 +419,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ("GET", "/api/usage/keys", MinRole::Member(KEY_HOLDERS)),
     ("POST", "/api/keys", MinRole::Member(KEY_HOLDERS)),
     ("GET", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
+    (
+        "GET",
+        "/api/keys/{id}/quickstart",
+        MinRole::Member(KEY_HOLDERS),
+    ),
     ("PATCH", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     ("DELETE", "/api/keys/{id}", MinRole::Member(KEY_HOLDERS)),
     // A POST because reading the plaintext is an action: it is audited, and
@@ -565,6 +573,8 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/api/billing/balance",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
+    ("GET", "/api/billing/alerts", MinRole::Member(MANAGERS)),
+    ("PUT", "/api/billing/alerts", MinRole::Member(MANAGERS)),
     // The ledger and its per-period totals.
     (
         "GET",
@@ -583,11 +593,21 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     ),
     (
         "GET",
+        "/api/billing/ledger/export",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "GET",
         "/api/billing/summary",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
     // Call log and usage summaries.
     ("GET", "/api/usage/calls", MinRole::Member(EVERY_MEMBER)),
+    (
+        "GET",
+        "/api/usage/calls/export",
+        MinRole::Member(EVERY_MEMBER),
+    ),
     ("GET", "/api/usage/summary", MinRole::Member(EVERY_MEMBER)),
     ("GET", "/api/usage/metrics", MinRole::Member(EVERY_MEMBER)),
     (
@@ -629,6 +649,11 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
     (
         "GET",
         "/api/billing/topups",
+        MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
+    ),
+    (
+        "GET",
+        "/api/billing/topups/export",
         MinRole::Member(&[MemberRole::Owner, MemberRole::Admin, MemberRole::Billing]),
     ),
     (
@@ -918,7 +943,7 @@ pub(crate) const EVERY_MEMBER: &[MemberRole] = &[
 ];
 
 /// The tenant roles that manage members.
-const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
+pub(crate) const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
 
 /// The member routes a member of a tenant that is not active (pending
 /// approval, or suspended) may still call, to see the tenant's state, keep
@@ -1049,6 +1074,8 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/model-assessments/{id}/export", get(model_assessments::export))
         .route("/api/auth/options", get(auth::settings::options))
         .route("/api/auth/email-code", post(auth::verification::send_email_code))
+        .route("/api/auth/password/forgot", post(auth::recovery::forgot))
+        .route("/api/auth/password/reset", post(auth::recovery::reset))
         .route("/api/auth/oauth/{provider}/start", post(auth::oauth::start))
         .route("/api/auth/oauth/{provider}/callback", get(auth::oauth::callback))
         .route("/api/auth/passkeys/login/start", post(auth::passkey::login_start))
@@ -1063,6 +1090,7 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))
         .route("/api/session", get(members::session))
+        .route("/api/public/prices", get(billing::public_prices::prices))
         .route("/api/invites/accept", post(members::accept_invite))
         .route("/api/password", post(members::change_password))
         .route("/api/org", get(members::org))
@@ -1088,6 +1116,7 @@ pub fn browser_router(state: AppState) -> Router {
             get(keys::get).patch(keys::update).delete(keys::revoke),
         )
         .route("/api/keys/{id}/reveal", post(keys::reveal))
+        .route("/api/keys/{id}/quickstart", get(keys::quickstart::quickstart))
         .route("/admin/usage/events", get(usage::list_events))
         .route("/admin/usage/events/{event_id}", get(usage::get_event))
         .route("/admin/native-metering", get(native_objects::metering_api::list))
@@ -1124,6 +1153,7 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::accounts::get).patch(billing::accounts::set_credit_limit),
         )
         .route("/api/billing/balance", get(billing::accounts::balance))
+        .route("/api/billing/alerts", get(billing::alerts::get).put(billing::alerts::put))
         .route(
             "/admin/tenants/{id}/billing/ledger",
             get(billing::statements::admin_ledger),
@@ -1133,8 +1163,10 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::statements::admin_summary),
         )
         .route("/api/billing/ledger", get(billing::statements::ledger))
+        .route("/api/billing/ledger/export", get(billing::export::ledger))
         .route("/api/billing/summary", get(billing::statements::summary))
         .route("/api/usage/calls", get(billing::calls::list_calls))
+        .route("/api/usage/calls/export", get(billing::export::calls))
         .route("/api/usage/summary", get(billing::calls::tenant_summary))
         .route("/api/usage/metrics", get(usage_metrics::tenant))
         .route("/admin/usage/metrics", get(usage_metrics::admin))
@@ -1158,6 +1190,7 @@ pub fn browser_router(state: AppState) -> Router {
             get(billing::topups::list).post(billing::topups::request),
         )
         .route("/api/billing/topups/{id}", get(billing::topups::get))
+        .route("/api/billing/topups/export", get(billing::export::topups))
         .route(
             "/admin/tenants/{id}/credits",
             post(billing::credits::create),
@@ -1480,13 +1513,16 @@ async fn readyz(
 mod tests {
     use std::path::Path;
 
-    use super::{MinRole, EVERY_MEMBER, INACTIVE_TENANT_ROUTES, ROUTE_ROLES};
+    use super::{MinRole, EVERY_MEMBER, INACTIVE_TENANT_ROUTES, MANAGERS, ROUTE_ROLES};
     use crate::auth::{MemberRole, KEY_HOLDERS};
 
     /// The role lists a handler may name in `.require(..)` instead of
     /// spelling the roles out, by the name it uses.
-    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] =
-        &[("KEY_HOLDERS", KEY_HOLDERS), ("EVERY_MEMBER", EVERY_MEMBER)];
+    const NAMED_ROLE_LISTS: &[(&str, &[MemberRole])] = &[
+        ("KEY_HOLDERS", KEY_HOLDERS),
+        ("EVERY_MEMBER", EVERY_MEMBER),
+        ("MANAGERS", MANAGERS),
+    ];
 
     /// The part of `src` before its test module.
     fn production(src: &str) -> &str {

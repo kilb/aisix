@@ -49,7 +49,7 @@ async function settle(page: Page): Promise<void> {
   await expect(page.getByRole("status").filter({ hasText: "载入中…" })).toHaveCount(0);
 }
 async function login(page: Page, who = auth.metricsOwner): Promise<void> {
-  await page.goto(baseUrl);
+  await page.goto(`${baseUrl.replace(/\/$/, "")}/login`);
   await page.getByLabel("邮箱", { exact: true }).fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   const loggedIn = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/login" && response.request().method() === "POST");
@@ -75,9 +75,9 @@ async function noPageOverflow(page: Page): Promise<void> {
 for (const width of [1440, 390]) {
   test(`template surfaces and navigation at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1000 });
-    await page.goto(baseUrl);
+    await page.goto(`${baseUrl.replace(/\/$/, "")}/login`);
     await settle(page);
-    await expect(page.getByRole("heading", { name: "组织门户", exact: true })).toBeVisible();
+    await expect(page.getByRole("form", { name: "登录", exact: true })).toBeVisible();
     await screenshot(page, `tenant-login-${width}`);
     await login(page);
     for (const [route, title] of ([["org", "概览"], ["usage", "用量分析"], ["calls", "调用记录"], ["keys", "API 密钥"], ["prices", "模型与价格"], ["budgets", /^预算(?:与额度)?$/], ["billing", /^账务(?:账户)?$/], ["members", "成员"], ["account", "账号设置"]] satisfies [string, string | RegExp][])) {

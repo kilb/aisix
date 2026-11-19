@@ -90,7 +90,7 @@ export async function signedIn(stack: Stack, who: Login): Promise<ApiClient> {
   return api;
 }
 export async function login(page: Page, stack: Stack, who: Login): Promise<void> {
-  await page.goto(stack.previewUrl);
+  await page.goto(`${stack.previewUrl}/login`);
   await page.getByLabel("邮箱").fill(who.email);
   await page.getByLabel("口令", { exact: true }).fill(who.password);
   await page.getByRole("button", { name: "登录", exact: true }).click();
