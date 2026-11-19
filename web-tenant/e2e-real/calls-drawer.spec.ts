@@ -7,7 +7,9 @@ const OUTPUT_TPS_TITLE = /^输出 Token（含推理，不含输入）÷ 完整�
 interface Scenario { kind: "positive" | "missing"; event_id: string; request_id: string; tenant_auth: "metricsOwner" }
 interface CallRecord {
   event_id: string; request_id: string; first_token_latency_ms: number | null; attempt_duration_ms: number | null; throughput_tps: number | null;
+  latency_ms: number | null;
   usage_input_tokens: number | null; usage: Record<string, number | null> | null;
+  readonly request_timing?: Readonly<Record<string, unknown>> | null;
   readonly upstream_timing?: Readonly<Record<string, unknown>> | null;
   charge: { status: string; calculation: { final_micro_cny: string | null } };
 }
@@ -160,8 +162,8 @@ test("real-call-list-preserves-measured-performance-token-usage-and-unknowns", a
     }
     const performance = row.getByLabel("响应性能", { exact: true });
     await expect(definition(performance, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
-    await expectDuration(definition(performance, "首字"), call.first_token_latency_ms);
-    await expectDuration(definition(performance, "总用时"), call.attempt_duration_ms);
+    await expectDuration(definition(performance, "请求首内容"), call.first_token_latency_ms);
+    await expectDuration(definition(performance, "本次上游耗时"), call.attempt_duration_ms);
     if (scenario.kind === "positive") {
       expect(call.first_token_latency_ms).not.toBeNull(); expect(call.first_token_latency_ms!).toBeGreaterThanOrEqual(0);
       expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
@@ -211,7 +213,22 @@ test("real-call-drawer-keeps-fee-details-keyboard-focus-and-no-extra-requests", 
   for (const label of ["请求信息", "响应性能", "Token 消耗", "费用计算", "计费明细"]) await expect(dialog.getByRole("heading", { name: label, exact: true })).toBeVisible();
   await expect(dialog.getByText(positive.request_id, { exact: true })).toBeVisible();
   await expectUpstreamTiming(dialog, call.upstream_timing);
-  const performance = dialog.getByRole("region", { name: "响应性能", exact: true }).getByLabel("响应性能", { exact: true });
+  const ingress = dialog.getByRole("region", { name: "请求入口阶段", exact: true });
+  await expect(ingress).toBeVisible();
+  const timing = call.request_timing;
+  expect(timing?.request_body_complete, "实测成功调用已读完整正文").toBe(true);
+  expect(timing?.request_body_bytes).toBeGreaterThan(0);
+  for (const key of ["body_read_ms", "json_decode_ms", "pre_handler_ms"]) {
+    const ms = timing?.[key];
+    expect(typeof ms, `实测调用必须有 ${key}`).toBe("number");
+    await expectDuration(ingress.locator(`[data-request-timing-field="${key}"] dd`), ms as number);
+  }
+  await expect(ingress.locator('[data-request-timing-field="request_body_bytes"] dd')).toHaveText(`已读取 ${new Intl.NumberFormat("en-US").format(timing!.request_body_bytes as number)} 字节`);
+  await expect(ingress.locator('[data-request-timing-field="request_body_complete"] dd')).toHaveText("已读至结束");
+  const section = dialog.getByRole("region", { name: "响应性能", exact: true });
+  expect(Object.hasOwn(call, "latency_ms")).toBe(true);
+  await expectDuration(section.locator("p").filter({ hasText: "下游响应阶段耗时" }).locator("strong"), call.latency_ms);
+  const performance = section.getByLabel("响应性能", { exact: true });
   await expect(definition(performance, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
   expect(call.throughput_tps).not.toBeNull(); expect(call.throughput_tps!).toBeGreaterThan(0);
   expect(Number((await definition(performance, "输出 TPS").innerText()).replaceAll(",", ""))).toBeCloseTo(call.throughput_tps!, 2);

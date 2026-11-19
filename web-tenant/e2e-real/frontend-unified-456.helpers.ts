@@ -91,7 +91,7 @@ export async function performance(table: Locator): Promise<void> {
   const idx=await table.getByRole("columnheader",{name:/响应性能/}).evaluate(el=>(el as HTMLTableCellElement).cellIndex);
   const rows=table.locator("tbody tr").filter({has:table.page().locator("td")});expect(await rows.count()).toBeGreaterThan(0);
   const cell=rows.first().locator("td").nth(idx);
-  for(const label of ["首字","总用时","输出 TPS"]){
+  for(const label of ["请求首内容",/^(本次上游耗时|尝试开始至断开)$/,"输出 TPS"]){
     const title=cell.getByText(label,{exact:true});await expect(title).toBeVisible();
     const pair=title.locator("..");await expect(pair).toContainText(/(?:—|\d)/);
     const box=await pair.boundingBox();expect(box!.height,"one labelled value stays a compact unit").toBeLessThanOrEqual(34);
@@ -105,7 +105,7 @@ export async function performanceValues(table: Locator, calls: any[]): Promise<v
     for (const key of ["request_id", "first_token_latency_ms", "attempt_duration_ms", "throughput_tps"]) expect(Object.hasOwn(call,key), `explicit ${key}`).toBe(true);
     const row=table.getByRole("row").filter({hasText:call.request_id});await expect(row).toHaveCount(1);
     const area=row.getByLabel("响应性能",{exact:true});
-    for(const [label,key] of [["首字","first_token_latency_ms"],["总用时","attempt_duration_ms"]]){
+    for(const [label,key] of [["请求首内容","first_token_latency_ms"],[/^(本次上游耗时|尝试开始至断开)$/,"attempt_duration_ms"]] as const){
       const dd=area.getByText(label,{exact:true}).locator("..").locator("dd");
       if(call[key]===null){await expect(dd).toHaveText("—");continue;}
       const shown=(await dd.innerText()).match(/^([\d,.]+) (ms|s)$/);expect(shown,"duration retains an explicit unit").not.toBeNull();const scale=shown![2]==="s"?1000:1;expect(Math.abs(Number(shown![1].replaceAll(",",""))*scale-call[key])).toBeLessThanOrEqual(scale/200+0.0001);

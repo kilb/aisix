@@ -48,7 +48,7 @@ export function ApiMetricsOverview({ scope, from, to, data, error, onRetry, clas
       <h2 className="text-caption font-medium text-fg-3">首 token 延迟 P50</h2>
       <Metric size="value" className="mt-3">{formatDuration(totals?.first_token_latency_ms.p50)}</Metric>
       <p className="mt-3 text-caption text-fg-3">实测样本 {formatCount(totals?.first_token_latency_ms.sample_count)} · 无实测值 {formatCount(totals?.first_token_latency_ms.missing_count)}</p>
-      <p className="mt-2 text-caption text-fg-3">无值包含非流式与历史记录；P95/P99 见分析。</p>
+      <p className="mt-2 text-caption text-fg-3">首内容前断开、非流式及未采集的请求计入无实测值。P95/P99 见分析。</p>
     </section>
     <section data-metric-kpi="cost" data-tone="lime" className={costText.length > 10 ? "col-span-2 tablet:col-span-1" : undefined}>
       <h2 className="text-caption font-medium text-fg-3">已计价费用</h2>

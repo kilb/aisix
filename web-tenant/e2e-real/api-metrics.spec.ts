@@ -252,7 +252,7 @@ test("真实请求、响应缓存与中断用量完整聚合，统计分母和�
   await definition(card, "实测样本", "2");
   await definition(card, "无实测值", "2");
   await capture("latency");
-  for (const label of ["响应延迟", "上游尝试完整耗时"]) {
+  for (const label of ["响应延迟", "上游尝试耗时"]) {
     await chooseSelect(card.getByRole("combobox", { name: "耗时口径", exact: true }), { label });
     await expect(card.getByText(`${label} · 平均`, { exact: true })).toBeVisible();
   }

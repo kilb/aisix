@@ -172,6 +172,7 @@ async fn overview_only_returns_visible_cards_and_trends_for_the_same_scope() {
         let full_t = totals(&full);
         assert!(full_t.get("tokens").is_some());
         assert!(t.get("tokens").is_none(), "概览不返回完整分析");
+        assert!(t.get("peak_rpm").is_none(), "概览不计算峰值 RPM");
         assert_eq!(overview.body.get("models"), Some(&json!([])));
         for field in [
             "requests",
@@ -225,6 +226,109 @@ async fn overview_only_returns_visible_cards_and_trends_for_the_same_scope() {
         totals(&hidden)["first_token_latency_ms"].get("p50"),
         Some(&Value::Null)
     );
+}
+
+#[tokio::test]
+async fn peak_rpm_counts_final_requests_by_calendar_minute_at_every_chart_grain() {
+    let Some(w) = world().await else { return };
+    let model = seed_model(&w.cp, &w.admin).await;
+    let other_model = seed_model(&w.cp, &w.admin).await;
+    let member = w.cp.member_login_seeded(w.tenant, MemberRole::Member).await;
+    let other_key = seed_key(&w.cp, &w.admin, w.tenant, Some(member.id)).await;
+    let minute = DateTime::from_timestamp(Utc::now().timestamp().div_euclid(3600) * 3600, 0)
+        .expect("整点")
+        - TimeDelta::minutes(55);
+    let mut rows = Vec::new();
+    for (n, (second, model)) in [
+        (9, model), // 范围前，与峰值所在分钟相同。
+        (10, model),
+        (11, other_model),
+        (59, model),
+        (60, model),
+        (69, model),
+        (70, model), // 若包含右边界，这分钟将错误地成为峰值。
+        (70, model),
+        (70, model),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        rows.push(event(
+            &w,
+            &format!("rpm-{n}"),
+            model,
+            json!({"occurred_at": (minute + TimeDelta::seconds(second)).to_rfc3339()}),
+        ));
+    }
+    let burst = (minute + TimeDelta::seconds(11)).to_rfc3339();
+    rows.push(usage(
+        &w,
+        "rpm-legacy",
+        model,
+        json!({"occurred_at": burst}),
+    ));
+    rows.push(usage(
+        &w,
+        "rpm-retry",
+        model,
+        json!({"occurred_at": burst, "is_final_attempt": false}),
+    ));
+    rows.push(event(
+        &w,
+        "rpm-other-member",
+        other_model,
+        json!({"occurred_at": burst, "api_key_id": other_key, "user_id": member.id}),
+    ));
+    intake(&w, rows).await;
+
+    let bounds = |start, end| {
+        format!(
+            "from={}&to={}",
+            (minute + TimeDelta::seconds(start)).to_rfc3339_opts(SecondsFormat::Secs, true),
+            (minute + TimeDelta::seconds(end)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        )
+    };
+    let range = bounds(10, 70);
+    for bucket in ["minute", "hour", "day"] {
+        let response =
+            w.cp.send(
+                "GET",
+                &format!(
+                    "/admin/usage/metrics?{range}&bucket={bucket}&tenant_id={}",
+                    w.tenant
+                ),
+                Some(w.admin.cookie()),
+                None,
+            )
+            .await;
+        assert_eq!(totals(&response)["requests"], 6);
+        assert_eq!(totals(&response)["peak_rpm"], 4, "{bucket}: {response:?}");
+    }
+
+    for (path, cookie, expected_requests, expected_peak) in [
+        (
+            format!("/admin/usage/metrics?{range}&bucket=hour&model_id={model}"),
+            w.admin.cookie(),
+            4,
+            2,
+        ),
+        (
+            format!("/api/usage/metrics?{range}&bucket=day"),
+            member.cookie(),
+            1,
+            1,
+        ),
+        (
+            format!("/admin/usage/metrics?{}&bucket=day", bounds(71, 72)),
+            w.admin.cookie(),
+            0,
+            0,
+        ),
+    ] {
+        let response = w.cp.send("GET", &path, Some(cookie), None).await;
+        assert_eq!(totals(&response)["requests"], expected_requests, "{path}");
+        assert_eq!(totals(&response)["peak_rpm"], expected_peak, "{path}");
+    }
 }
 
 async fn intake(w: &World, events: Vec<Value>) {

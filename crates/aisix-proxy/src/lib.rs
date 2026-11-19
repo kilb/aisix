@@ -1464,6 +1464,8 @@ impl ClientCancelGuard {
         if matches!(phase, cancel::Phase::BeforeHead) && !self.attribution.has_pending_access_log()
         {
             let target = attribution::AccessLogTarget::from_resolved(resolved.clone());
+            let (routing_attempt_count, routing_fallback_count) =
+                cancel::routing_counts(&cancel_ctx);
             let line = AccessLog {
                 method: self.method.as_str(),
                 path: self.uri.path(),
@@ -1488,8 +1490,8 @@ impl ClientCancelGuard {
                 request_id: &self.request_id,
                 provider_request_id: None,
                 served_by_model: None,
-                routing_attempt_count: None,
-                routing_fallback_count: None,
+                routing_attempt_count,
+                routing_fallback_count,
                 error_kind: Some(CLIENT_DISCONNECTED_KIND),
                 error: Some(phase.message()),
                 mcp: None,
@@ -10160,7 +10162,7 @@ data: [DONE]\n\n";
             .mount(&bad)
             .await;
         let slow = MockServer::builder().start().await;
-        Mock::given(method("POST"))
+        let fallback = Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(
                 ResponseTemplate::new(200)
@@ -10169,7 +10171,8 @@ data: [DONE]\n\n";
                         "id": "cmpl-never", "model": "gpt-4o", "choices": []
                     })),
             )
-            .mount(&slow)
+            .expect(1)
+            .mount_as_scoped(&slow)
             .await;
 
         let hub = Arc::new(Hub::new());
@@ -10185,7 +10188,19 @@ data: [DONE]\n\n";
         let state = build_state(snap, hub).with_usage_sink(UsageSink::new(tx));
         let app = build_router(state);
 
-        cancel_in_flight(app, cancellable_chat_request("smart")).await;
+        let capture = crate::test_log::Capture::install();
+        let wait = std::time::Duration::from_millis(40);
+        tokio::select! {
+            result = app.oneshot(cancellable_chat_request("smart")) => panic!("unexpected response: {result:?}"),
+            () = async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), fallback.wait_until_satisfied())
+                    .await.expect("fallback must receive the request");
+                tokio::time::sleep(wait).await;
+            } => {}
+        }
+        let line = capture.only("cancelled fallback");
+        assert_eq!(line.field("routing_attempt_count").as_deref(), Some("2"));
+        assert_eq!(line.field("routing_fallback_count").as_deref(), Some("1"));
 
         // The failed attempt first, then the request's terminal event —
         // the order the handler's own emitters produce.
@@ -10199,6 +10214,8 @@ data: [DONE]\n\n";
 
         let terminal = next_event(&mut rx).await;
         assert_head_phase_cancel(&terminal);
+        assert_eq!(terminal.upstream_dispatched, Some(true));
+        assert!(terminal.upstream_latency_ms >= wait.as_millis() as u32);
         assert_eq!(terminal.attempt_index, 1);
         assert_eq!(terminal.attempt_kind, "fallback");
         assert_eq!(terminal.attempt_model, "secondary");

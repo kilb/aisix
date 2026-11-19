@@ -205,3 +205,15 @@ test("请求详情按尝试编号展示迟到日志", () => {
     request_group: { attempt_count: 3, failover_count: 1, retry_count: 1, charge_micro_cny: "3000", adjusted_micro_cny: "0", complete: true } } }));
   assert.deepEqual([...markup.matchAll(/data-attempt-event="([^"]+)"/g)].map(match => match[1]), ["attempt-0", "attempt-1", "attempt-2"]);
 });
+
+test("响应性能分开标出下游首协议输出、请求首内容及单次尝试时间", () => {
+  const call = { ...base, latency_ms: 8474, first_token_latency_ms: 307059, attempt_duration_ms: 306471 };
+  const render = (latency_ms: number | null) => {
+    const html = renderToStaticMarkup(createElement(DetailsUnderTest, { call: { ...call, latency_ms } }));
+    return text(html.match(/<section[^>]*aria-label="响应性能"[^>]*>(.*?)<\/section>/s)![1]!);
+  };
+  assert.match(render(8474), /下游响应阶段耗时\s*8\.47 s/);
+  assert.match(render(null), /下游响应阶段耗时\s*—/);
+  assert.match(render(8474), /请求首内容307\.06 s/);
+  assert.match(render(8474), /本次上游耗时306\.47 s/);
+});

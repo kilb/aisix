@@ -48,3 +48,16 @@ test("输出 TPS 明示完整上游耗时口径，独立于输入和首帧时钟
   assert.equal(values({ ...data, throughput_tps: 7.125 })[2], "7.13");
   assert.equal(values({ ...data, throughput_tps: null })[2], "—");
 });
+
+test("请求与尝试的时钟分别命名，未完成的上游发送显示等到断开时的观测", () => {
+  const timings = { first_token_latency_ms: 307_059, attempt_duration_ms: 306_471 };
+  assert.match(markup(timings), /<dt>请求首内容<\/dt><dd>307\.06 s<\/dd>/);
+  assert.match(markup(timings), /<dt>本次上游耗时<\/dt><dd>306\.47 s<\/dd>/);
+  const cancelled = { error_class: "client_disconnected", upstream_timing: { http_send_started_ms: 0 }, attempt_duration_ms: 32_359 };
+  assert.match(markup(cancelled), /<dt>尝试开始至断开<\/dt><dd>32\.36 s<\/dd>/);
+  assert.equal(values({ ...cancelled, attempt_duration_ms: 0 })[1], "—");
+  for (const upstream_timing of [undefined, {}, { http_send_started_ms: 0, response_headers_ms: 0 }, { http_send_started_ms: 0, first_protocol_frame_ms: 100 }]) {
+    assert.match(markup({ ...cancelled, upstream_timing }), /<dt>本次上游耗时<\/dt>/);
+  }
+  assert.match(markup({ ...cancelled, error_class: "upstream_status" }), /<dt>本次上游耗时<\/dt>/);
+});

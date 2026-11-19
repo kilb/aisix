@@ -43,6 +43,14 @@ async fn measured_zero_partial_and_unknown_offsets_survive_intake_and_scoped_cal
     let cases = [
         ("timing-full", Some(full)),
         (
+            "timing-different-content",
+            Some(json!({
+                "http_send_started_ms":0,"response_headers_ms":9,"first_response_byte_ms":10,
+                "first_protocol_frame_ms":11,"first_canonical_chunk_ms":12,
+                "first_content_ms":13,"upstream_first_content_ms":20
+            })),
+        ),
+        (
             "timing-zero",
             Some(json!({
                 "http_send_started_ms":0,"response_headers_ms":0,"first_response_byte_ms":0,
@@ -81,7 +89,7 @@ async fn measured_zero_partial_and_unknown_offsets_survive_intake_and_scoped_cal
     assert_eq!(accepted.status, 200, "{accepted:?}");
     assert_eq!(
         accepted.body,
-        json!({"accepted":5,"rejected":0,"duplicates":0})
+        json!({"accepted":cases.len(),"rejected":0,"duplicates":0})
     );
 
     for (path, cookie) in [

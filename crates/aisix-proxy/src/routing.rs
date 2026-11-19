@@ -79,15 +79,27 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// `fallback_on_statuses` (#1012) is the routing model's
 /// explicit opt-in list for providers that use 4xx codes for transient
 /// conditions (overload, queue full, quota): a status in the list is
-/// retryable regardless of the default classification. Empty by default,
-/// which preserves the historical behavior exactly.
+/// retryable regardless of the default classification, except for a known
+/// terminal session refusal. Empty by default.
 pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses: &[u16]) -> bool {
     match err {
         // 本地归属服务故障不能触发已接受调用的重复派发。
         BridgeError::DependencyUnavailable => false,
-        BridgeError::UpstreamStatus { status, .. } => {
+        BridgeError::UpstreamStatus {
+            status,
+            message,
+            wire,
+            ..
+        } => {
             if fallback_on_statuses.contains(status) {
-                return true;
+                // 这两种实际观测到的 403 要求新会话；重放或换上游都不能继续原会话。
+                return !(*status == 403
+                    && *wire == aisix_gateway::UpstreamWire::Anthropic
+                    && matches!(
+                        message.as_str(),
+                        "This session is blocked after a refusal or fallback. Start a new session to continue."
+                            | "This session is blocked after a Claude refusal or fallback. Start a new session to continue."
+                    ));
             }
             if *status == 429 {
                 return retry_on_429;

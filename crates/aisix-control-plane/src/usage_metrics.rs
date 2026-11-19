@@ -169,6 +169,14 @@ pub struct MetricsPeriod<T = Metrics> {
 }
 
 #[derive(Serialize)]
+struct MetricsTotals {
+    #[serde(flatten)]
+    metrics: Metrics,
+    /// 查询范围内单个自然分钟的最高最终请求数。
+    peak_rpm: i64,
+}
+
+#[derive(Serialize)]
 pub struct MetricsModel {
     pub model: ModelRef,
     #[serde(flatten)]
@@ -320,6 +328,7 @@ struct AggregateRow {
     period_start: Option<DateTime<Utc>>,
     model_id: Option<String>,
     metrics: sqlx::types::Json<Metrics>,
+    peak_rpm: Option<i64>,
 }
 
 async fn metric_model_names(
@@ -403,13 +412,14 @@ async fn summarize(
          GROUP BY pa.event_id), raw AS NOT MATERIALIZED (SELECT ",
     );
     let visible = VISIBLE.replace("ue.event->'is_final_attempt'", "ep.json_is_final_attempt");
+    let final_request = "ep.json_is_final_attempt = 'true'::jsonb";
     sql.push("date_trunc(")
         .push_bind(bucket.unit())
         .push(", pc.occurred_at, 'Asia/Shanghai') AS period_start, ");
     sql.push("CASE WHEN pc.requested_model_id = ANY(")
         .push_bind(ids)
         .push(") THEN pc.requested_model_id ELSE '' END AS model_id, ");
-    sql.push(format!("ep.json_is_final_attempt = 'true'::jsonb AS final, \
+    sql.push(format!("{final_request} AS final, \
         (ep.json_is_final_attempt IS NULL OR jsonb_typeof(ep.json_is_final_attempt) <> 'boolean') AS unknown_final, \
         {visible} AS visible, pc.status AS charge_status, pc.charge_micro_cny, \
         adjusted.adjusted, \
@@ -476,7 +486,29 @@ async fn summarize(
     }
     sql.push(" SELECT \
         CASE WHEN GROUPING(period_start) = 0 THEN 1 WHEN GROUPING(model_id) = 0 THEN 2 ELSE 0 END AS grouping, \
-        period_start, model_id, ").push(aggregates()).push(" AS metrics FROM scoped \
+        period_start, model_id, ")
+        .push(aggregates())
+        .push(" AS metrics, ");
+    let minute_bucket = matches!(bucket, Bucket::Minute);
+    if minute_bucket {
+        sql.push("NULL::bigint");
+    } else {
+        // 粗粒度图仍按分钟计算峰值；复用范围和最终事件投影，仅读取峰值需要的列。
+        sql.push(
+            "CASE WHEN GROUPING(period_start, model_id) = 3 THEN (\
+            SELECT COALESCE(max(requests), 0) FROM (\
+                SELECT count(*) AS requests FROM charge_scope pc",
+        )
+        .push(CHARGE_METRIC_INPUT)
+        .push(METRIC_FIELDS)
+        .push(" WHERE ")
+        .push(final_request)
+        .push(
+            " GROUP BY date_trunc('minute', pc.occurred_at, 'Asia/Shanghai')\
+            ) AS minute_counts) END",
+        );
+    }
+    sql.push(" AS peak_rpm FROM scoped \
         GROUP BY GROUPING SETS ((), (period_start), (model_id)) ORDER BY grouping, period_start, model_id");
     let rows: Vec<AggregateRow> = sql
         .build_query_as()
@@ -487,11 +519,15 @@ async fn summarize(
         .map_err(DbError::from)?;
     tx.commit().await.map_err(DbError::from)?;
     let mut totals = Metrics::default();
+    let mut peak_rpm = None;
     let mut periods = BTreeMap::new();
     let mut models = Vec::new();
     for row in rows {
         match row.grouping {
-            0 => totals = row.metrics.0,
+            0 => {
+                totals = row.metrics.0;
+                peak_rpm = row.peak_rpm;
+            }
             1 => {
                 if let Some(period) = row.period_start {
                     periods.insert(period, row.metrics.0);
@@ -510,11 +546,21 @@ async fn summarize(
             _ => {}
         }
     }
+    let peak_rpm = peak_rpm.unwrap_or_else(|| {
+        periods
+            .values()
+            .map(|metrics| metrics.requests)
+            .max()
+            .unwrap_or_default()
+    });
     Ok(Json(MetricsResponse {
         from,
         to,
         bucket,
-        totals,
+        totals: MetricsTotals {
+            metrics: totals,
+            peak_rpm,
+        },
         series: fill_periods(from, to, bucket, periods, Metrics::default)?,
         models,
     })
@@ -841,7 +887,7 @@ fn direct_aggregates() -> String {
         count("NOT dispatched AND NOT excluded"),
         count("dispatched AND outcome = 'unknown'"),
         latency("upstream_ttft", "dispatched"),
-        latency("ttft", "dispatched"),
+        latency("ttft", "dispatched AND request_final_or_legacy"),
         latency("attempt_duration", "dispatched"),
         tokens.join(", ")
     )
@@ -925,6 +971,7 @@ async fn summarize_direct_models(
           ep.text_cache_status AS cache_status, \
           ep.text_inference_stage AS inference_stage, \
           ep.text_native_terminal_status AS native_terminal_status, \
+          ep.json_is_final_attempt IS DISTINCT FROM 'false'::jsonb AS request_final_or_legacy, \
           CASE WHEN jsonb_typeof(ep.json_upstream_dispatched) = 'boolean' \
             THEN (ep.text_upstream_dispatched)::boolean END AS explicit_dispatch, \
           COALESCE(ready.usage_estimated, ue.event->'usage_estimated' = 'true'::jsonb, FALSE) AS usage_estimated, ",

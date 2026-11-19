@@ -137,11 +137,18 @@ test("peak period compares original exact values before geometry truncation", ()
   assert.equal(maximumMetricIndex([null, Number.NaN]), -1);
 });
 
-// 比率为空不能用0补齐，周期平均也不能取当前分页行数或把毫秒当秒。
-test("failure and average request rates retain unknown and use the complete UTC interval", () => {
-  assert.deepEqual(requestRateSummary(60, 0.75, "2026-11-01T00:00:00Z", "2026-11-01T00:02:00Z"), { failureRate: 0.25, averageRps: 0.5 });
-  assert.deepEqual(requestRateSummary(0, null, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z"), { failureRate: null, averageRps: 0 });
-  assert.deepEqual(requestRateSummary(null, 1, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z"), { failureRate: 0, averageRps: null });
-  assert.equal(requestRateSummary(9007199254740992, null, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z").averageRps, null);
-  assert.equal(requestRateSummary(1, 0, "invalid", "2026-11-01T00:01:00Z").averageRps, null);
+// 周期平均包括空闲时间和不足一分钟的边界。
+test("failure rate and average RPM retain unknown and use the complete UTC interval", () => {
+  assert.deepEqual(requestRateSummary(60, 0.75, "2026-11-01T00:00:00Z", "2026-11-01T00:02:30Z"), { failureRate: 0.25, averageRpm: 24 });
+  assert.deepEqual(requestRateSummary(0, null, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z"), { failureRate: null, averageRpm: 0 });
+  assert.deepEqual(requestRateSummary(null, 1, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z"), { failureRate: 0, averageRpm: null });
+  assert.equal(requestRateSummary(9007199254740992, null, "2026-11-01T00:00:00Z", "2026-11-01T00:01:00Z").averageRpm, null);
+  assert.equal(requestRateSummary(1, 0, "invalid", "2026-11-01T00:01:00Z").averageRpm, null);
+});
+
+test("peak RPM preserves exact counts and tolerates a server without the field", () => {
+  assert.equal(decodeApiMetrics(payload({ peak_rpm: 4207 })).totals.peak_rpm, 4207);
+  assert.equal(decodeApiMetrics(payload({ peak_rpm: 0 })).totals.peak_rpm, 0);
+  assert.equal(decodeApiMetrics(payload()).totals.peak_rpm, null);
+  assert.equal(decodeApiMetrics(payload({ peak_rpm: 1.2 })).totals.peak_rpm, null);
 });

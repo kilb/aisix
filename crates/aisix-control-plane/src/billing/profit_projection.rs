@@ -9,6 +9,7 @@ use tokio::task::JoinHandle;
 use crate::db::{Db, DbError};
 
 const PROJECT_SQL: &str = include_str!("profit_project.sql");
+const REPLAY_ACCOUNTS_SQL: &str = include_str!("profit_replay_accounts.sql");
 const BACKFILL_BATCH: i64 = 512;
 
 /// 无可用连接或另一个实例正在投影时直接跳过，不扩张控制面连接池。
@@ -103,15 +104,58 @@ pub async fn project_once(db: &Db) -> Result<usize, DbError> {
     }
 }
 
+/// 每个账号回放短批与旧版投影共用写入锁，读取全站结果不等待回放。
+async fn replay_accounts_once(db: &Db) -> Result<bool, DbError> {
+    let Some(mut conn) = db.pool().try_acquire() else {
+        return Ok(false);
+    };
+    let work = async {
+        let mut tx = conn.begin().await?;
+        sqlx::query("SET LOCAL lock_timeout = '25ms'")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '150ms'")
+            .execute(&mut *tx)
+            .await?;
+        // 快照 upsert 分别触发 INSERT 与 UPDATE，两种汇总的账号顺序可能交错。
+        let write_gate: Option<i32> = sqlx::query_scalar(
+            "SELECT version FROM billing_profit_backfill WHERE version = 1 FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if write_gate.is_none() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let complete = sqlx::query_scalar(REPLAY_ACCOUNTS_SQL)
+            .persistent(false)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(complete)
+    };
+    match tokio::time::timeout(Duration::from_millis(250), work).await {
+        Ok(Err(DbError::LockTimeout)) | Err(_) => Ok(false),
+        Ok(result) => result,
+    }
+}
+
 /// 与普通 housekeeping 独立运行；繁忙时让出共享连接，停止后回滚未提交批次。
 pub fn spawn(db: Db, mut stop: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_millis(100));
         every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut replay_accounts = true;
         loop {
             tokio::select! {
                 () = crate::stopped(&mut stop) => return,
                 _ = every.tick() => {
+                    if replay_accounts {
+                        match replay_accounts_once(&db).await {
+                            Ok(complete) => replay_accounts = !complete,
+                            Err(error) => tracing::warn!(error = %error, "billing profit account replay will retry"),
+                        }
+                    }
                     match project_once(&db).await {
                         Ok(256) => every.reset_immediately(),
                         Ok(_) => {},

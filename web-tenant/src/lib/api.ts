@@ -711,6 +711,15 @@ export interface CallCharge {
   lines: ChargeLine[] | null;
 }
 
+/** 网关在请求入口记录的独立窗口；历史事件可能缺少整个对象或个别字段。 */
+export interface RequestTiming {
+  body_read_ms?: number | null;
+  json_decode_ms?: number | null;
+  pre_handler_ms?: number | null;
+  request_body_bytes?: number | null;
+  request_body_complete: boolean;
+}
+
 /** 同一次上游尝试起点的观测偏移（毫秒）；缺失不表示零。 */
 export interface UpstreamTiming {
   http_send_started_ms?: number | null;
@@ -743,6 +752,7 @@ export interface Call extends UsageAuditData {
   error_message?: string | null;
   /** 明确采集的客户端流式意图；旧记录缺失时保持未知。 */
   stream?: boolean | null;
+  request_timing?: RequestTiming | null;
   upstream_timing?: UpstreamTiming | null;
   first_token_latency_ms?: number | null;
   attempt_duration_ms?: number | null;

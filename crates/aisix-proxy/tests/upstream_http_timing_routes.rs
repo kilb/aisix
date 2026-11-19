@@ -459,6 +459,70 @@ async fn token_route_families_publish_all_six_http_stages_from_the_attempt_origi
     Ok(())
 }
 
+#[tokio::test]
+async fn transcript_tool_input_and_bridged_thinking_are_timed_before_the_terminal_frame(
+) -> TestResult {
+    let chat = |delta| json!({"id":"chat-clock","choices":[{"index":0,"delta":delta}]});
+    let cases = [
+        (
+            Family::Chat,
+            chat(json!({"audio":{"transcript":"clock-output"}})),
+        ),
+        (
+            Family::Chat,
+            chat(
+                json!({"tool_calls":[{"index":0,"type":"custom","id":"call_1","custom":{"name":"run","input":"clock-output"}}]}),
+            ),
+        ),
+        (
+            Family::Messages,
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"lookup","input":{"q":"clock-output"}}}),
+        ),
+        (
+            Family::ResponsesNative,
+            json!({"type":"response.audio.transcript.delta","delta":"clock-output","sequence_number":1}),
+        ),
+        (
+            Family::ResponsesChatBridge,
+            chat(
+                json!({"content":[{"type":"thinking","thinking":[{"type":"text","text":"clock-output"}]}]}),
+            ),
+        ),
+    ];
+    futures::future::try_join_all(cases.into_iter().map(|(family, content)| async move {
+        let (metadata, _, end) = family.streaming_parts();
+        let reply = Reply {
+            status: StatusCode::OK,
+            content_type: "text/event-stream",
+            header_delay: Duration::ZERO,
+            parts: vec![
+                (Duration::ZERO, Bytes::from(metadata)),
+                (GAP, Bytes::from(sse(content))),
+                (GAP, Bytes::from(end)),
+            ],
+        };
+        let server = upstream(vec![reply]).await?;
+        let (router, mut events) = app(&server.base, family, 0)?;
+        call(router, family, true, Duration::ZERO).await?;
+        let event = event(&mut events).await?;
+        let timing = event.upstream_timing.ok_or("missing attempt timing")?;
+        let metadata = measured(timing.first_protocol_frame_ms, "metadata")?;
+        for observed in [
+            measured(timing.upstream_first_content_ms, "upstream content")?,
+            measured(timing.first_content_ms, "delivered content")?,
+        ] {
+            assert!(observed >= metadata + 45, "{family:?}: {timing:?}");
+            assert!(
+                event.upstream_latency_ms >= observed + 45,
+                "{family:?}: {timing:?}"
+            );
+        }
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    }))
+    .await?;
+    Ok(())
+}
+
 struct GatewaySocket(tokio::task::JoinHandle<std::io::Result<()>>);
 
 impl Drop for GatewaySocket {

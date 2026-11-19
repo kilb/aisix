@@ -125,6 +125,8 @@ async fn direct_attempts_keep_failed_retries_cache_shapes_and_measured_throughpu
     assert_eq!(first_row["upstream_ttft_ms"]["missing_count"], 2);
     near(&first_row["upstream_ttft_ms"]["p95"], 195.0);
     assert_eq!(first_row["first_token_latency_ms"]["sample_count"], 2);
+    // 未终结的失败尝试没有请求级时点，也不占请求级的缺失样本。
+    assert_eq!(first_row["first_token_latency_ms"]["missing_count"], 1);
     near(&first_row["first_token_latency_ms"]["p50"], 150.0);
     assert_eq!(first_row["tokens"]["input_tokens"], 200);
     assert_eq!(first_row["tokens"]["cache_hit_tokens"], 105);

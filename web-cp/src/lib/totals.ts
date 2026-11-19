@@ -46,7 +46,7 @@ export async function fetchCostTotals(from: string, to: string): Promise<CostTot
   return decodeCostTotals((await call<unknown>("GET", `/admin/pricing/margin?${query}`)).data);
 }
 
-export interface ProfitSummary {
+interface ProfitAmounts {
   revenueMicroCny: bigint;
   adjustedMicroCny: bigint;
   knownCostMicroCny: bigint;
@@ -62,6 +62,15 @@ export interface ProfitSummary {
   knownMarginPct: string | null;
 }
 
+export interface AccountProfit extends ProfitAmounts {
+  id: string;
+  displayName: string | null;
+}
+
+export interface ProfitSummary extends ProfitAmounts {
+  accounts: AccountProfit[] | "catching-up" | "unsupported";
+}
+
 /** 利润除以同一总体的收入，以整数计算百分数并按半远离零舍入。 */
 function percent(profit: bigint, revenue: bigint): string | null {
   if (revenue <= 0n) return null;
@@ -71,8 +80,8 @@ function percent(profit: bigint, revenue: bigint): string | null {
 }
 
 /** 金额和计数在传输时也是字符串；缺字段绝不当成零。 */
-export function decodeProfitSummary(input: unknown): ProfitSummary {
-  const row = record(record(input)?.totals);
+function decodeProfitAmounts(input: unknown): ProfitAmounts {
+  const row = record(input);
   function integer(name: string, nonnegative = false): bigint {
     const value = row?.[name];
     if (typeof value !== "string" || !/^-?\d+$/.test(value)) throw new Error("本利汇算统计响应不完整，请重试或升级控制面。");
@@ -98,6 +107,26 @@ export function decodeProfitSummary(input: unknown): ProfitSummary {
     profitMicroCny, marginPct: profitMicroCny === null ? null : percent(profitMicroCny, revenueMicroCny),
     knownProfitMicroCny, knownMarginPct: knownProfitMicroCny === null ? null : percent(knownProfitMicroCny, revenueWithCostMicroCny),
   };
+}
+
+export function decodeProfitSummary(input: unknown): ProfitSummary {
+  const response = record(input);
+  const totals = decodeProfitAmounts(response?.totals);
+  const items = response?.accounts;
+  if (items === undefined) return { ...totals, accounts: "unsupported" };
+  if (items === null) return { ...totals, accounts: "catching-up" };
+  const invalidAccounts = "上游账号汇算响应不完整，请重试或升级控制面。";
+  if (!Array.isArray(items)) throw new Error(invalidAccounts);
+  const accounts = items.map((item): AccountProfit => {
+    const row = record(item);
+    const id = row?.provider_key_id;
+    const displayName = row?.provider_key_display_name;
+    if (typeof id !== "string" || !id || (displayName !== null && typeof displayName !== "string")) {
+      throw new Error(invalidAccounts);
+    }
+    return { ...decodeProfitAmounts(row?.totals), id, displayName };
+  });
+  return { ...totals, accounts };
 }
 
 /** 只查总额无需限制时间桶数；没有边界表示全部时间。 */

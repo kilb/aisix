@@ -30,11 +30,12 @@ import { useHashQuery } from "./lib/useHashQuery";
 import { usageRange, usageDateValue, usageRequestKey, metricViewOf } from "./lib/usageNavigation";
 import { ApiMetricsPanel } from "./components/ApiMetricsPanel";
 import { UsagePerformance } from "./components/UsagePerformance";
+import { RequestTimingDetails } from "./components/RequestTimingDetails";
 import { UpstreamTimingDetails } from "./components/UpstreamTimingDetails";
 import { UsageIoAuditDetails, UsageTokenEstimate } from "./components/UsageIoAuditDetails";
 import { UsageRecordFilters } from "./components/UsageRecordFilters";
 import { usageRecordFilterParams, usageRecordFilterValues } from "./lib/usageRecordFilters";
-import { formatCount } from "./lib/chartFormat";
+import { formatCount, formatDuration } from "./lib/chartFormat";
 import { CallLogDrawer } from "./CallLogDrawer";
 import "./UsageAnalytics.css";
 import "./components/CallRecordSearch.css";
@@ -171,8 +172,6 @@ function FeeCalculation({ call }: { call: Call }) {
           )}
         </>
       )}
-      <p className="hint">首 token 延迟从请求接收到首次交付文本、推理或工具内容；无内容、非流式和旧记录未采集时显示 —。模型处理耗时为本次模型请求开始至结束，包含网络传输，不是整次请求总耗时。</p>
-      {call.latency_ms !== null && <p className="hint">响应延迟（旧采集口径）：{call.latency_ms} ms；不同调用协议的计时终点可能不同。</p>}
       <UsageIoAuditDetails data={call} />
     </section>
   );
@@ -261,8 +260,11 @@ function CallLogDetails({ call: c, loadingAttempts = false, attemptError = null,
     <section className="tenant-call-section" aria-label="响应性能">
       <h3>响应性能</h3>
       <UsagePerformance data={c} />
-      <p className="hint">首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
+      <p>下游响应阶段耗时 <strong className="tabular-nums">{formatDuration(c.latency_ms)}</strong></p>
+      <p className="hint">流式文本接口的下游响应阶段可止于元数据首帧，其他接口可计至完整响应。请求首内容计至网关交付文本、推理、拒绝文本或工具参数。</p>
+      <p className="hint">输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
     </section>
+    <RequestTimingDetails data={c.request_timing} />
     <UpstreamTimingDetails data={c.upstream_timing} />
     <section className="tenant-call-section" aria-label="Token 消耗">
       <h3>Token 消耗</h3>
@@ -771,7 +773,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
         <details className="usage-summary-notes usage-call-notes">
           <summary>筛选、性能与计费口径</summary>
           <p>文字搜索仅筛选已加载记录；CSV 按日期与服务端筛选下载。</p>
-          <p>首字仅显示实测值；输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时。含估算用量时标为 ≈，仅供参考；用量标记无法区分输入或输出估算。无有效指标或旧记录未采集时显示 —，不以其它指标代替。</p>
+          <p>请求首内容从网关收到请求开始计时，本次上游耗时从对应尝试开始计时。输出 TPS 为输出 Token（含推理，不含输入）÷ 完整上游耗时；含估算用量时标为 ≈，仅供参考。</p>
           <p>同一请求合并一行，优先展示最终成功结果；费用汇总全部实际计费尝试。详情保留故障转移、同目标重试与每次已保存日志。缺少有效追踪信息的旧记录无法可靠合并，保留单条展示。</p>
         </details>
         {rows !== null && <p className="hint">已加载 {rows.length.toLocaleString("en-US")} 条{next !== null ? "，还有更多记录" : ""}</p>}
@@ -784,6 +786,7 @@ function CallLog({ keys, showKeys, models }: { keys: TenantKey[]; showKeys: bool
       )}
       {rows === null && <ChartSkeleton />}
       {rows !== null && rows.length === 0 && !err && <CardMessage>所选条件下没有调用记录</CardMessage>}
+      {table.rows.some(row => row.first_token_latency_ms == null || row.attempt_duration_ms == null || row.throughput_tps == null) && <p className="hint">性能栏的 — 表示该项没有实测值，例如首内容前断开或旧记录未采集。</p>}
       {rows !== null && rows.length > 0 && (
         <DataTable label="调用记录" className="tenant-call-table">
           <colgroup><col className="usage-column-time" /><col className="usage-column-type" /><col className="usage-column-request" /><col className="usage-column-state" /><col className="usage-column-timing" /><col className="usage-column-tokens" /><col className="usage-column-charge" /><col className="usage-column-action" /></colgroup>

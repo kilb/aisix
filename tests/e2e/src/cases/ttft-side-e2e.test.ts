@@ -32,6 +32,8 @@ const D = GUARDRAIL_DELAY_MS / 1000;
 
 const REQUEST_TTFT = "aisix_request_ttft_seconds";
 const DETAILED_TTFT = "aisix_llm_time_to_first_token_seconds";
+const FIRST_CONTENT = "aisix_request_first_content_seconds";
+const EVENT_DELAY_MS = 150;
 
 /** green-cip stand-in that passes everything, GUARDRAIL_DELAY_MS late. */
 async function startSlowAliyun(): Promise<{ baseUrl: string; close(): Promise<void> }> {
@@ -153,7 +155,10 @@ describe("TTFT metrics split the wait by side", () => {
     const seed = new SeedClient(etcd, app.etcdPrefix);
 
     for (const c of CASES) {
-      const up = await startOpenAiUpstream({ streamEvents: [...c.events] });
+      const up = await startOpenAiUpstream({
+        streamEvents: [...c.events],
+        eventDelayMs: EVENT_DELAY_MS,
+      });
       upstreams.push(up);
       const pk = await seed.createProviderKey({
         display_name: `${c.model}-pk`,
@@ -241,6 +246,16 @@ describe("TTFT metrics split the wait by side", () => {
         expect(downstream, `${name} downstream includes the guardrail`).toBeGreaterThanOrEqual(D);
         expect(upstream, `${name} upstream excludes the guardrail`).toBeLessThan(D);
       }
+      const upstreamLabels = { endpoint: c.endpoint, side: "upstream" };
+      const downstreamLabels = { endpoint: c.endpoint, side: "downstream" };
+      expect(delta(before, after, `${FIRST_CONTENT}_count`, upstreamLabels)).toBe(1);
+      expect(delta(before, after, `${FIRST_CONTENT}_count`, downstreamLabels)).toBe(1);
+      const sourceContent = delta(before, after, `${FIRST_CONTENT}_sum`, upstreamLabels);
+      const deliveredContent = delta(before, after, `${FIRST_CONTENT}_sum`, downstreamLabels);
+      const sourceFrame = delta(before, after, `${REQUEST_TTFT}_sum`, { ...labels, side: "upstream" });
+      // 首帧只有元数据，数据源在下一帧（或更晚）才发生成内容。
+      expect(sourceContent - sourceFrame).toBeGreaterThanOrEqual((EVENT_DELAY_MS - 20) / 1000);
+      expect(deliveredContent).toBeGreaterThanOrEqual(D);
     });
   }
 });

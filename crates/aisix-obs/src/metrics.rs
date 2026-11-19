@@ -88,7 +88,7 @@ pub const M_LLM_CACHE_CREATION_INPUT_TOKENS_TOTAL: &str =
     "aisix_llm_cache_creation_input_tokens_total";
 pub const M_LLM_REQUESTS_TOTAL: &str = "aisix_llm_requests_total";
 pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
-/// Time-to-first-token for streaming requests, sliced by the per-key
+/// Legacy time to first frame for streaming requests, sliced by the per-key
 /// `aisix_llm_*` label set (summary).
 ///
 /// `side` (always emitted, not removable by label selection) splits each
@@ -104,13 +104,8 @@ pub const M_LLM_REQUEST_DURATION: &str = "aisix_llm_request_duration_seconds";
 ///   stream refused by an output guardrail, or abandoned by the client,
 ///   before that point observes `upstream` only.
 ///
-/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
-/// upstream and `/v1/responses` to a chat-protocol upstream — the
-/// client's first frame is the first content-bearing event, so
-/// `downstream` there also contains the wait for it (for a reasoning
-/// upstream, its thinking time); `downstream - upstream` is not pure
-/// gateway overhead on those paths. A query that does not filter on
-/// `side` blends both measurements.
+/// The first frame can be a lifecycle event or metadata on both native and
+/// bridged streams. A query that does not filter on `side` blends the clocks.
 pub const M_LLM_TTFT: &str = "aisix_llm_time_to_first_token_seconds";
 /// Issue #890 req-4: token volume sliced by inbound client type — a
 /// DEDICATED low-cardinality series so the client dimension never multiplies
@@ -440,14 +435,13 @@ pub const M_REQUEST_E2E_LATENCY_SECONDS: &str = "aisix_request_e2e_latency_secon
 ///   stream refused by an output guardrail, or abandoned by the client,
 ///   before that point observes `upstream` only.
 ///
-/// On the two protocol bridges — `/v1/messages` to a non-Anthropic
-/// upstream and `/v1/responses` to a chat-protocol upstream — the
-/// client's first frame is the first content-bearing event, so
-/// `downstream` there also contains the wait for it (for a reasoning
-/// upstream, its thinking time); `downstream - upstream` is not pure
-/// gateway overhead on those paths. A query that does not filter on
-/// `side` blends both measurements.
+/// The first frame can be a lifecycle event or metadata on both native and
+/// bridged streams. A query that does not filter on `side` blends the clocks.
 pub const M_REQUEST_TTFT_SECONDS: &str = "aisix_request_ttft_seconds";
+
+/// 流式请求首个生成内容时延。源端从最终尝试开始计时，交付端从网关入口开始计时。
+/// 两个观测独立，首帧、心跳和空元数据不计作内容。
+pub const M_REQUEST_FIRST_CONTENT_SECONDS: &str = "aisix_request_first_content_seconds";
 
 /// The `side` label value of the TTFT metrics and of
 /// [`M_REQUEST_E2E_LATENCY_SECONDS`].
@@ -1319,6 +1313,10 @@ impl Metrics {
                 ),
                 (
                     Matcher::Full(M_REQUEST_TTFT_SECONDS.to_string()),
+                    buckets.request_ttft.clone(),
+                ),
+                (
+                    Matcher::Full(M_REQUEST_FIRST_CONTENT_SECONDS.to_string()),
                     buckets.request_ttft.clone(),
                 ),
                 (
@@ -2734,6 +2732,37 @@ impl Metrics {
             self.record_request_ttft(labels, side, ttft);
             if let Some(ttft) = ttft {
                 self.record_time_to_first_token(labels.details, side, ttft);
+            }
+        }
+    }
+
+    /// 复用用量记录的同一对时点，只用协议入口与方向作为标签。
+    pub fn record_first_content(
+        &self,
+        endpoint: &'static str,
+        upstream_ms: Option<u32>,
+        downstream_ms: Option<u32>,
+    ) {
+        for (side, sample) in [
+            (LatencySide::Upstream, upstream_ms),
+            (LatencySide::Downstream, downstream_ms),
+        ] {
+            if let Some(ms) = sample {
+                self.cached_histogram(
+                    M_REQUEST_FIRST_CONTENT_SECONDS,
+                    f64::from(ms) / 1000.0,
+                    |key| {
+                        key.label(endpoint);
+                        key.label(side.as_str());
+                    },
+                    || {
+                        metrics::histogram!(
+                            M_REQUEST_FIRST_CONTENT_SECONDS,
+                            "endpoint" => endpoint,
+                            "side" => side.as_str(),
+                        )
+                    },
+                );
             }
         }
     }

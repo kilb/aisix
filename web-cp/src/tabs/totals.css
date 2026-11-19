@@ -11,6 +11,10 @@
 .totals-page .totals-window { margin: 0; color: var(--color-fg-3); font-size: var(--text-caption); overflow-wrap: anywhere; }
 .totals-page .totals-visuals { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 16px; min-width: 0; }
 .totals-page .totals-visuals > .panel { min-width: 0; margin: 0; }
+.totals-page .totals-accounts { min-width: 0; margin: 0; }
+.totals-accounts .dt-wrap { overscroll-behavior-x: contain; }
+.totals-accounts .dt { min-width: 30rem; }
+.totals-accounts .dt .num { white-space: nowrap; }
 .totals-page .totals-visuals .bento-card-header { margin-bottom: 24px; }
 .totals-page .totals-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; min-width: 0; padding-block: 24px 4px; border-top: 1px solid var(--color-hairline); }
 .totals-page .totals-metric { display: flex; flex-direction: column; min-width: 0; gap: 16px; }

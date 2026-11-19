@@ -63,7 +63,7 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("layer", "The layer of the rate-limit decision."),
     variable!("policy_id", "The rate-limit policy identifier, or the metric's missing-policy value."),
     variable!("policy_name", "The name of that same rate-limit policy, or the same missing-policy value as policy_id."),
-    variable!("reason", "The bounded reason code defined by the emitting authentication, guardrail, configuration, or exporter metric."),
+    variable!("reason", "The bounded reason code defined by the emitting authentication, guardrail, configuration, exporter, or usage-spool metric."),
     variable!("method", "The authentication method used for the credential decision."),
     variable!("result", "The authentication, guardrail execution, or heap-profile dump result, as defined by the metric."),
     variable!("guardrail", "The configured guardrail name."),
@@ -77,12 +77,12 @@ pub static METRIC_VARIABLES: &[MetricVariable] = &[
     variable!("operation", "The Redis operation or A2A operation, as defined by the metric."),
     variable!("exporter", "The configured observability exporter name. Empty on component metrics other than the exporter queue."),
     variable!("agent", "The registered A2A agent name."),
-    variable!("state", "The A2A task state reported by the upstream agent."),
+    variable!("state", "The A2A task state reported by the upstream agent, or the local usage-spool state (pending or reconciliation)."),
     variable!("hash", "The hash of the applied gateway resource configuration."),
     variable!("stat", "The allocator statistic: allocated, active, resident, mapped, retained, or metadata."),
     variable!("runtime", "The async runtime: control, or tpc-N for thread-per-core proxy worker N."),
     variable!("component", "The in-process store being measured, from a fixed set such as response_cache or log_queue."),
-    variable!("side", "Which interval a latency observation measures. On the time-to-first-token metrics: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). On the end-to-end latency metric: upstream (the upstream duration of the attempt that produced the response) or downstream (the whole request as the client experienced it). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
+    variable!("side", "Which interval a latency observation measures. On the legacy TTFT metrics: upstream (attempt start to the upstream's first frame) or downstream (request received to the first frame handed to the client). On the first-content metric, the same respective clocks stop on nonempty generated content. On the end-to-end latency metric: upstream (the upstream duration of the attempt that produced the response) or downstream (the whole request as the client experienced it). Always emitted on the metrics that carry it; it cannot be removed by a label selection."),
 ];
 
 #[derive(Debug)]
@@ -444,6 +444,9 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
             "user_name"
         ]
     ),
+    metric!(M_USAGE_SPOOL_BATCHES, &["state"], required = &["state"]),
+    metric!(M_USAGE_SPOOL_BYTES, &[]),
+    metric!(M_USAGE_SPOOL_FAILURES_TOTAL, &["reason"]),
     metric!(M_CACHE_REQUESTS_TOTAL, &["policy", "outcome"]),
     metric!(M_CACHE_SEMANTIC_EMBED_SECONDS, &["policy"]),
     metric!(M_CACHE_SEMANTIC_EMBED_FAILURES_TOTAL, &["policy", "cause"]),
@@ -460,6 +463,11 @@ pub static METRIC_DEFINITIONS: &[MetricDefinition] = &[
         M_REQUEST_TTFT_SECONDS,
         LATENCY,
         extra = USAGE_EXTRA,
+        always = SIDE_ALWAYS
+    ),
+    metric!(
+        M_REQUEST_FIRST_CONTENT_SECONDS,
+        &["endpoint"],
         always = SIDE_ALWAYS
     ),
     metric!(M_A2A_REQUESTS_TOTAL, &["agent", "operation", "status"]),

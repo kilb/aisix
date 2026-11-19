@@ -83,7 +83,7 @@ const CHAT_TOOL_CALL_REPLY = {
   usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 },
 };
 
-/** The same call, streamed: id + name first, arguments in two fragments. */
+/** 工具名称与参数均分片，ID 先于完整名称到达。 */
 const CHAT_TOOL_CALL_STREAM_EVENTS = [
   JSON.stringify({
     id: "chatcmpl-custom-tool-stream",
@@ -99,7 +99,7 @@ const CHAT_TOOL_CALL_STREAM_EVENTS = [
               index: 0,
               id: "call_ct1",
               type: "function",
-              function: { name: "apply_patch", arguments: "" },
+              function: { name: "apply_", arguments: "" },
             },
           ],
         },
@@ -115,10 +115,12 @@ const CHAT_TOOL_CALL_STREAM_EVENTS = [
       {
         index: 0,
         delta: {
+          content: "Preparing patch.",
           tool_calls: [
             {
               index: 0,
               function: {
+                name: "patch",
                 arguments: JSON.stringify({ content: PATCH_INPUT }).slice(0, 20),
               },
             },
@@ -207,6 +209,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
   let sls: MockSls | undefined;
   let toolUpstream: OpenAiUpstream | undefined;
   let toolStreamUpstream: OpenAiUpstream | undefined;
+  let rawToolUpstream: OpenAiUpstream | undefined;
   let noUsageUpstream: OpenAiUpstream | undefined;
   let etcdReachable = false;
 
@@ -221,6 +224,18 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     });
     toolStreamUpstream = await startOpenAiUpstream({
       streamEvents: CHAT_TOOL_CALL_STREAM_EVENTS,
+    });
+    rawToolUpstream = await startOpenAiUpstream({
+      streamEvents: [
+        JSON.stringify({
+          id: "chatcmpl-raw-input", model: "relay-mini",
+          choices: [{ index: 0, delta: { tool_calls: [{
+            index: 0, id: "call_raw", type: "function",
+            function: { name: "apply_patch", arguments: "*** Begin Patch" },
+          }] } }],
+        }),
+        JSON.stringify({ error: { type: "server_error", message: "stream interrupted" } }),
+      ],
     });
     noUsageUpstream = await startOpenAiUpstream({
       nonStreamBody: CHAT_REPLY_NO_USAGE,
@@ -249,6 +264,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     for (const [model, upstream] of [
       ["custom-tool-chat", toolUpstream],
       ["custom-tool-chat-stream", toolStreamUpstream],
+      ["custom-tool-raw-input", rawToolUpstream],
     ] as const) {
       const pk = await seed.createProviderKey({
         display_name: `${model}-pk`,
@@ -292,6 +308,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
       allowed_models: [
         "custom-tool-chat",
         "custom-tool-chat-stream",
+        "custom-tool-raw-input",
         "custom-tool-no-usage",
         "custom-tool-no-usage-cached",
       ],
@@ -302,6 +319,7 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     await app?.exit();
     await toolUpstream?.close();
     await toolStreamUpstream?.close();
+    await rawToolUpstream?.close();
     await noUsageUpstream?.close();
   });
 
@@ -411,18 +429,24 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
 
     const completed = frames.at(-1)!;
     expect(completed.data.type).toBe("response.completed");
-    expect(completed.data.response.output[0].type).toBe("custom_tool_call");
-    expect(completed.data.response.output[0].input).toBe(PATCH_INPUT);
+    const published: string[] = [];
+    for (const { data } of frames) {
+      if (data.type === "response.output_item.added") {
+        expect(data.output_index).toBe(published.length);
+        published.push(data.item.id);
+      } else if (data.output_index !== undefined) {
+        expect(data.item_id ?? data.item?.id).toBe(published[data.output_index]);
+      }
+    }
+    expect(completed.data.response.output.map((item: { id: string }) => item.id)).toEqual(published);
+    expect(completed.data.response.output[0].content[0].text).toBe("Preparing patch.");
+    expect(completed.data.response.output[1].type).toBe("custom_tool_call");
+    expect(completed.data.response.output[1].input).toBe(PATCH_INPUT);
 
     // The event order for the one item, and unbroken sequence numbers.
-    const own = types.filter((t: string) =>
-      [
-        "response.output_item.added",
-        "response.custom_tool_call_input.delta",
-        "response.custom_tool_call_input.done",
-        "response.output_item.done",
-      ].includes(t),
-    );
+    const own = frames
+      .filter(({ data }) => (data.item_id ?? data.item?.id) === itemId)
+      .map(({ data }) => data.type);
     expect(own).toEqual([
       "response.output_item.added",
       "response.custom_tool_call_input.delta",
@@ -432,6 +456,25 @@ describe("bridged custom tool calls come back as custom_tool_call items", () => 
     expect(frames.map((f) => f.data.sequence_number)).toEqual(
       frames.map((_, i) => i),
     );
+  });
+
+  test("a raw custom input fragment reaches the client before an upstream failure", async (ctx) => {
+    if (!etcdReachable) { ctx.skip(); return; }
+    await ready();
+    const res = await fetch(`${app!.proxyUrl}/v1/responses`, {
+      method: "POST",
+      headers: HEADERS,
+      body: JSON.stringify({
+        model: "custom-tool-raw-input", input: "Edit the file", stream: true, tools: [CUSTOM_TOOL],
+      }),
+    });
+    expect(res.status).toBe(200);
+    const frames = parseSse(await res.text()).map((frame) => frame.data);
+    expect(frames.at(-1)?.type).toBe("response.failed");
+    const item = frames.find((frame) => frame.type === "response.output_item.added")?.item;
+    expect(item).toMatchObject({type: "custom_tool_call", name: "apply_patch"});
+    const deltas = frames.slice(0, -1).filter((frame) => frame.type === "response.custom_tool_call_input.delta");
+    expect(deltas).toMatchObject([{item_id: item.id, delta: "*** Begin Patch"}]);
   });
 
   test("/v1/chat/completions non-streaming: the client usage block equals the usage record", async (ctx) => {

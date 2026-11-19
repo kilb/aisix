@@ -223,6 +223,8 @@ pub(crate) struct CancelContext {
     pub native_operation_id: Option<uuid::Uuid>,
     /// 当前交换已交给真实 HTTP 发送入口；每次 attempt 的 tap 独立保存。
     pub http_dispatched: bool,
+    /// 未经过路由循环的请求，只计仍在进行的真实上游等待。
+    pub unrouted_wait_ms: u32,
     /// Set by a route that files no usage row at ANY outcome but shares a
     /// normalized endpoint label with a metering sibling — the A2A agent
     /// card, which normalizes to `/a2a` like the calls do. The guard has
@@ -1182,6 +1184,15 @@ impl RequestAttribution {
         let mut cell = self.lock();
         let mut ctx = std::mem::take(&mut cell.cancel);
         ctx.http_dispatched = self.response_tap.http_dispatched();
+        if ctx.http_dispatched
+            && ctx.in_flight.is_none()
+            && ctx.won.is_none()
+            && !cell.upstream_unmeasured
+        {
+            if let Some(started) = cell.upstream_clock.open {
+                ctx.unrouted_wait_ms = crate::attempt::measured_ms(started.elapsed());
+            }
+        }
         // 当前重试的 capture 尚未结算；取消先按其 index 保存，不能借用前次 settled 标志。
         if let Some(attempt) = ctx.in_flight.as_ref() {
             let response = self.response_tap.take();

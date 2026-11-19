@@ -112,6 +112,26 @@ impl Phase {
     }
 }
 
+/// 使用路由尝试计数口径，重试间隙不会额外算作一次尝试。
+pub(crate) fn routing_counts(ctx: &CancelContext) -> (Option<u32>, Option<u32>) {
+    let active = ctx
+        .in_flight
+        .as_ref()
+        .map(|attempt| attempt.kind)
+        .or_else(|| ctx.won.as_ref().map(|attempt| attempt.kind));
+    let kinds = ctx
+        .failed_attempts
+        .iter()
+        .map(|attempt| attempt.kind)
+        .chain(active);
+    let attempts = kinds.clone().count() as u32;
+    let fallbacks = kinds.filter(|kind| *kind == "fallback").count() as u32;
+    (
+        (attempts > 0).then_some(attempts),
+        (fallbacks > 0).then_some(fallbacks),
+    )
+}
+
 /// Emit a cancelled request's usage events. Called once, from
 /// `ClientCancelGuard::drop`.
 ///
@@ -208,6 +228,8 @@ pub(crate) fn emit(
             cost_usd: served.cost_usd,
             ..base_event(request_id, resolved, &ctx, &client, inbound_protocol, &pk)
         };
+        let target = snap.models.get_by_id(&rec.target_model_id);
+        let model = target.as_ref().map(|entry| &entry.value);
         emit_one(
             state,
             &snap,
@@ -218,7 +240,10 @@ pub(crate) fn emit(
             trace,
             false,
             rec.dispatched,
-            resolved,
+            model
+                .and_then(|m| m.provider.as_deref())
+                .unwrap_or("unknown"),
+            model.and_then(|m| m.upstream_model()).unwrap_or("unknown"),
             endpoint,
             client_type,
         );
@@ -256,8 +281,8 @@ pub(crate) fn emit(
                 || a.served_input_tokens.is_some(),
             latency_ms: match (&a.answered, a.served_input_tokens) {
                 (Some(answered), _) => answered.latency_ms,
-                (None, Some(_)) => crate::attempt::measured_ms(a.started.elapsed()),
-                (None, None) => 0,
+                (None, None) if !ctx.http_dispatched => 0,
+                (None, _) => crate::attempt::measured_ms(a.started.elapsed()),
             },
             usage: a.answered.as_ref().map(|answered| &answered.usage),
             served_input_tokens: a.served_input_tokens.filter(|_| a.answered.is_none()),
@@ -299,7 +324,9 @@ pub(crate) fn emit(
             .or_else(|| Some(ctx.last_settled_model_id.clone()).filter(|id| !id.is_empty()))
             .unwrap_or_else(|| ctx.entry_model_id.clone()),
         status_code: crate::CLIENT_CLOSED_REQUEST,
-        upstream_latency_ms: attempt.as_ref().map(|a| a.latency_ms).unwrap_or(0),
+        upstream_latency_ms: attempt
+            .as_ref()
+            .map_or(ctx.unrouted_wait_ms, |a| a.latency_ms),
         // With no attempt of its own (the cancel landed in the retry
         // backoff), it follows the rows already out — the handler's, and
         // the failed attempts replayed above — rather than repeating
@@ -353,7 +380,8 @@ pub(crate) fn emit(
         trace,
         true,
         dispatched,
-        resolved,
+        &resolved.provider,
+        &resolved.upstream_model,
         endpoint,
         client_type,
     );
@@ -471,11 +499,9 @@ fn emit_one(
     trace: Option<&std::sync::Arc<aisix_obs::RequestTraceBundle>>,
     terminal: bool,
     dispatched: bool,
-    // What the request resolved, for the token series' upstream labels — it
-    // names the target the event speaks for, which the event's own fields do
-    // not carry — plus the route label the request families use and the
-    // by-client dimension classified from the request's user agent.
-    resolved: &Resolved,
+    // 回放失败行时取那一次的目标，不能使用取消时正在等待的目标。
+    provider: &str,
+    upstream_model: &str,
     endpoint: &'static str,
     client_type: &str,
 ) {
@@ -486,7 +512,14 @@ fn emit_one(
     // tokens its row bills exist in the log and nowhere in `/metrics`. Both
     // emitters read ONE event, so they cannot disagree about the dimensions,
     // and the zeros a cancelled-before-serving request carries emit no series.
-    emit_token_metrics(state, snap, endpoint, &event, pk, resolved, client_type);
+    let upstream = crate::request_metrics::Upstream {
+        provider,
+        model: &event.requested_model,
+        upstream_model,
+        pk: pk.labels(),
+        ..Default::default()
+    };
+    emit_token_metrics(state, snap, endpoint, &event, upstream, client_type);
     usage_attr::emit_usage(
         state,
         snap,
@@ -508,8 +541,7 @@ fn emit_token_metrics(
     snap: &aisix_core::AisixSnapshot,
     endpoint: &'static str,
     event: &UsageEvent,
-    pk: &ResolvedPk<'_>,
-    resolved: &Resolved,
+    upstream: crate::request_metrics::Upstream<'_>,
     client_type: &str,
 ) {
     let completion = event.folded_completion_tokens();
@@ -529,13 +561,7 @@ fn emit_token_metrics(
         state,
         endpoint,
         caller.as_caller(),
-        crate::request_metrics::Upstream {
-            provider: &resolved.provider,
-            model: &event.requested_model,
-            upstream_model: &resolved.upstream_model,
-            pk: pk.labels(),
-            ..Default::default()
-        },
+        upstream,
         crate::request_metrics::Tokens {
             input: event.prompt_tokens,
             output: completion,
@@ -609,6 +635,7 @@ mod tests {
                     ctx.surface = Some(surface);
                     ctx.inference_stage = Some(aisix_core::native_objects::InferenceStage::Management);
                 });
+                crate::attribution::note_upstream_wait_begin();
                 let request = aisix_gateway::upstream_io::send(
                     reqwest::Client::new().delete(format!("http://{address}/owned-object")),
                     protocol,
@@ -635,6 +662,7 @@ mod tests {
                 Some(aisix_core::native_objects::InferenceStage::Management)
             );
             assert_eq!(event.upstream_dispatched, Some(true), "{endpoint}");
+            assert!(event.upstream_latency_ms > 0, "{endpoint}");
             assert_eq!((event.prompt_tokens, event.completion_tokens), (0, 0));
             assert!(rx.try_recv().is_err());
             release.notify_one();
@@ -693,6 +721,7 @@ mod tests {
             );
             let event = rx.try_recv().unwrap();
             assert_eq!(event.upstream_dispatched, Some(false));
+            assert_eq!(event.upstream_latency_ms, 0);
             assert_eq!(
                 event.inference_stage,
                 Some(aisix_core::native_objects::InferenceStage::Accepted)
@@ -703,13 +732,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_active_retry_preserves_its_priced_capture_after_a_failed_attempt() {
+    async fn cancelled_fallback_preserves_pricing_and_token_labels_for_each_attempt() {
         // A 已结算使 attempts_settled 为 true；若不保存当前 B capture，其价格与头仍会丢失。
         let models = aisix_core::snapshot::ResourceTable::default();
         let model: aisix_core::Model = serde_json::from_value(serde_json::json!({
             "display_name":"m","provider":"anthropic","model_name":"upstream","provider_key_id":"pk",
             "cost":{"input_per_1k":1.0,"output_per_1k":10.0,"cached_input_per_1k":0.5,"cache_write_per_1k":2.0}
         })).unwrap();
+        let mut fallback = model.clone();
+        fallback.provider = Some("openai".into());
+        fallback.model_name = Some("upstream-fallback".into());
+        fallback.display_name = "fallback".into();
+        models.insert(aisix_core::resource::ResourceEntry::new(
+            "fallback", fallback, 1,
+        ));
         models.insert(aisix_core::resource::ResourceEntry::new("model", model, 1));
         let snapshot = aisix_core::AisixSnapshot {
             models,
@@ -731,12 +767,12 @@ mod tests {
             ),
         );
         crate::attribution::scope(cell.clone(), async {
-            let start = |index, kind| {
+            let start = |index, kind, id: &str| {
                 crate::attribution::note_attempt_started(crate::attribution::InFlightAttempt {
                     index,
                     kind,
                     target_model: String::new(),
-                    model_id: "model".into(),
+                    model_id: id.into(),
                     started: std::time::Instant::now(),
                     answered: None,
                     served_input_tokens: None,
@@ -758,7 +794,7 @@ mod tests {
                 );
                 headers
             };
-            start(0, "initial");
+            start(0, "initial", "model");
             aisix_gateway::note_upstream_response(&headers("req-a", "A"));
             aisix_gateway::response_tap::stream_usage_observer()
                 .unwrap()
@@ -776,7 +812,7 @@ mod tests {
                 latency_ms: 5,
                 dispatched: true,
             });
-            start(1, "retry");
+            start(1, "fallback", "fallback");
             aisix_gateway::note_upstream_response(&headers("req-b", "B"));
             aisix_gateway::response_tap::stream_usage_observer()
                 .unwrap()
@@ -796,8 +832,8 @@ mod tests {
                 "request",
                 &Resolved {
                     requested_model: "m".into(),
-                    provider: "anthropic".into(),
-                    upstream_model: "upstream".into(),
+                    provider: "openai".into(),
+                    upstream_model: "upstream-fallback".into(),
                     provider_key_id: "pk".into(),
                     ..Default::default()
                 },
@@ -848,6 +884,25 @@ mod tests {
         assert_eq!(retry.requested_service_tier.as_deref(), Some("auto"));
         assert_eq!(retry.status_code, 499);
         assert!(rx.try_recv().is_err());
+        let scrape = state.metrics.render();
+        let input: Vec<_> = scrape
+            .lines()
+            .filter(|line| line.starts_with("aisix_llm_input_tokens_total{"))
+            .collect();
+        assert_eq!(input.len(), 2, "{input:?}");
+        for (provider, model, tokens) in [
+            ("anthropic", "upstream", 13),
+            ("openai", "upstream-fallback", 37),
+        ] {
+            assert!(
+                input
+                    .iter()
+                    .any(|line| line.contains(&format!("provider=\"{provider}\""))
+                        && line.contains(&format!("upstream_model=\"{model}\""))
+                        && line.ends_with(&format!(" {tokens}"))),
+                "{input:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -901,6 +956,7 @@ mod tests {
             let ctx = cell.take_cancel_context();
             assert!(ctx.in_flight.is_none() && ctx.won.is_none());
             assert_eq!(ctx.failed_attempts.len(), 1);
+            assert_eq!(routing_counts(&ctx), (Some(1), None));
             emit(
                 &state,
                 "/v1/chat/completions",
@@ -926,6 +982,8 @@ mod tests {
         );
         assert_eq!(failed.service_tier.as_deref(), Some("fast"));
         assert_eq!((terminal.attempt_index, terminal.prompt_tokens), (1, 0));
+        assert_eq!(terminal.upstream_dispatched, Some(false));
+        assert_eq!(terminal.upstream_latency_ms, 0);
         assert_eq!(terminal.status_code, 499);
         assert!(rx.try_recv().is_err(), "每条失败记录与逻辑终态各发一次");
         let scrape = state.metrics.render();

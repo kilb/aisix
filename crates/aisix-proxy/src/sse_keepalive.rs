@@ -17,10 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 
-/// An SSE comment line. Valid mid-stream, ignored by every conforming
-/// client, and the same bytes axum's `Sse` keep-alive writes by default,
-/// so a bridged and a passthrough stream heartbeat identically.
+/// A comment and a blank line, safe to insert between SSE events.
 const HEARTBEAT: &[u8] = b":\n\n";
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 static INTERVAL: OnceLock<Option<Duration>> = OnceLock::new();
 
@@ -37,8 +36,8 @@ pub(crate) fn interval() -> Option<Duration> {
     *INTERVAL.get_or_init(|| Some(Duration::from_secs(15)))
 }
 
-/// Wrap an SSE byte stream so a silence longer than `interval` emits a
-/// heartbeat comment instead of nothing. `None` returns a pass-through.
+/// Emit a comment after an idle interval at the start of the stream or
+/// between events. `None` returns a pass-through.
 ///
 /// Only for streams the client parses as `text/event-stream`; injecting a
 /// comment into an opaque binary passthrough (audio, images) would corrupt
@@ -65,20 +64,60 @@ where
 {
     async_stream::stream! {
         let mut upstream = std::pin::pin!(upstream);
+        // 开头允许发心跳。之后只看末尾三个字节，就能区分两个行尾和单个 CRLF。
+        let mut tail = [b'\n'; 3];
+        let mut bom_prefix_len = interval.map(|_| 0);
+        let mut heartbeat_before_bom = false;
         loop {
-            let item = match interval {
-                None => match upstream.next().await {
-                    Some(item) => item,
-                    None => break,
-                },
+            let [a, b, c] = tail;
+            let newline = |v| matches!(v, b'\r' | b'\n');
+            let between_events = if (b, c) == (b'\r', b'\n') {
+                newline(a)
+            } else {
+                newline(b) && newline(c)
+            };
+            let mut next = match interval.filter(|_| between_events) {
+                None => upstream.next().await,
                 Some(d) => match tokio::time::timeout(d, upstream.next()).await {
-                    Ok(Some(item)) => item,
-                    Ok(None) => break,
-                    Err(_) => Ok(Bytes::from_static(HEARTBEAT)),
+                    Ok(item) => item,
+                    Err(_) => {
+                        heartbeat_before_bom |= bom_prefix_len.is_some();
+                        yield Ok(Bytes::from_static(HEARTBEAT));
+                        continue;
+                    }
                 },
             };
-            if item.is_err() {
-                tokio::task::yield_now().await;
+            // UTF-8 解码器只忽略流首 BOM。若已发过心跳，代客户端剥掉这一个
+            // BOM；否则原样放行。最多暂存两个已知字节，正文始终零拷贝。
+            if let Some(matched) = bom_prefix_len.take() {
+                let remaining = &UTF8_BOM[matched..];
+                match &mut next {
+                    Some(Ok(bytes)) if bytes.len() < remaining.len() && remaining.starts_with(bytes) => {
+                        bom_prefix_len = Some(matched + bytes.len());
+                        continue;
+                    }
+                    Some(Ok(bytes)) if bytes.starts_with(remaining) => {
+                        if !heartbeat_before_bom {
+                            yield Ok(Bytes::from_static(UTF8_BOM));
+                        }
+                        *bytes = bytes.slice(remaining.len()..);
+                    }
+                    _ if matched > 0 => {
+                        tail = [0; 3];
+                        yield Ok(Bytes::from_static(&UTF8_BOM[..matched]));
+                    }
+                    _ => {}
+                }
+            }
+            let Some(item) = next else { break };
+            match &item {
+                Ok(bytes) if interval.is_some() => {
+                    let n = bytes.len().min(tail.len());
+                    tail.copy_within(n.., 0);
+                    tail[3 - n..].copy_from_slice(&bytes[bytes.len() - n..]);
+                }
+                Err(_) => tokio::task::yield_now().await,
+                _ => {}
             }
             yield item;
         }
@@ -88,6 +127,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeats_wait_for_the_blank_line_across_transport_chunks() {
+        for ending in ["\n", "\r", "\r\n"] {
+            let event = format!("event: image_generation.completed{ending}data: {{\"b64_json\":\"YQ==\"}}{ending}{ending}");
+            // 每个偏移都可能是 HTTP 读取的边界，包括字段内、相邻字段间、CRLF 中间。
+            for cut in 1..event.len() {
+                let first = Bytes::copy_from_slice(&event.as_bytes()[..cut]);
+                let rest = Bytes::copy_from_slice(&event.as_bytes()[cut..]);
+                let upstream = async_stream::stream! {
+                    yield Ok::<_, std::convert::Infallible>(first);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    yield Ok(rest);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                };
+                let output = with_heartbeat(upstream, Some(Duration::from_millis(100)))
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>()
+                    .await
+                    .concat();
+                // 末尾空行的 CR 已经能分发事件；紧随的 LF 单独到达仍是空行。
+                let mut expected = event.as_bytes().to_vec();
+                if ending == "\r\n" && cut == event.len() - 1 {
+                    expected.splice(cut..cut, HEARTBEAT.iter().copied());
+                }
+                expected.extend_from_slice(HEARTBEAT);
+                assert_eq!(output, expected, "ending={ending:?}, cut={cut}");
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn early_heartbeat_preserves_the_first_field_after_a_split_bom() {
+        for (pause, last, expected_start) in [
+            (150, b'\xbf', &b":\n\n"[..]),
+            (0, b'\xbf', &b"\xef\xbb\xbf"[..]),
+            (150, b'\xbe', &b":\n\n\xef\xbb\xbe"[..]),
+        ] {
+            let upstream = async_stream::stream! {
+                tokio::time::sleep(Duration::from_millis(pause)).await;
+                yield Ok::<_, std::convert::Infallible>(Bytes::from_static(b"\xef"));
+                yield Ok(Bytes::from_static(b"\xbb"));
+                yield Ok(Bytes::copy_from_slice(&[last]));
+                yield Ok(Bytes::from_static(b"data: first\n\n"));
+            };
+            let output = with_heartbeat(upstream, Some(Duration::from_millis(100)))
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .await
+                .concat();
+            assert_eq!(output, [expected_start, b"data: first\n\n"].concat());
+        }
+    }
 
     /// The point of the module: an upstream that says nothing for longer
     /// than the interval still puts bytes on the wire.

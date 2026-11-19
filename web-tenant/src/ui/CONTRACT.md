@@ -62,6 +62,8 @@ note/ok/warn/crit 以相应语义边框、浅色底与文字呈现；失败 role
 
 ## 上游 HTTP 阶段
 
-调用详情的“上游 HTTP 阶段”只展示 `upstream_timing` 的六个原始观测偏移，单位为毫秒、起点为同一次上游尝试；不计算相邻差值，不与入口阶段或客户端首 Token 时钟相减。HTTP 客户端开始发送记录交给 HTTP 客户端的时点，不表示操作系统实际写包；首次内容交付记录网关交给 HTTP server 的时点，不表示客户端收到或确认。
+调用记录中的“请求首内容”从网关收到请求计至首次交付生成内容，包含请求体读取和先前尝试。“本次上游耗时”从该次尝试开始计时。调用方断开且只观察到发起上游 HTTP 时，标签为“尝试开始至断开”。旧尝试耗时的零哨兵显示为 —，请求首内容的实际零值显示为 0 ms。
 
-六字段均可选：`http_send_started_ms`、`response_headers_ms`、`first_response_byte_ms`、`first_protocol_frame_ms`、`first_canonical_chunk_ms`、`first_content_ms`。只有整数且位于 u32 范围的值显示为原始毫秒；零保留，缺失、null 或非法值显示 —，不从 TTFT、完整耗时或其它阶段补算。协议帧与规范化片段可以未采集，非流式记录不拿完整响应补填。历史事件不补写，也不引入逐帧 JSON。
+调用详情的“上游 HTTP 阶段”只展示 `upstream_timing` 的七个原始观测偏移，单位为毫秒、起点为同一次上游尝试；不计算相邻差值，不与入口阶段或客户端首 Token 时钟相减。HTTP 客户端开始发送记录交给 HTTP 客户端的时点，不表示操作系统实际写包；首次内容交付记录网关交给 HTTP server 的时点，不表示客户端收到或确认。
+
+七字段均可选：`http_send_started_ms`、`response_headers_ms`、`first_response_byte_ms`、`first_protocol_frame_ms`、`first_canonical_chunk_ms`、`upstream_first_content_ms`、`first_content_ms`。只有整数且位于 u32 范围的值显示为原始毫秒；零保留，缺失、null 或非法值显示 —，不从 TTFT、完整耗时或其它阶段补算。协议帧与规范化片段可以未采集，非流式记录不拿完整响应补填。历史事件不补写，也不引入逐帧 JSON。

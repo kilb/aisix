@@ -18,7 +18,7 @@ pub struct UpstreamTiming {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_canonical_chunk_ms: Option<u32>,
     /// 上游正文被既有解析器消费为完整非空生成内容帧的时点，不是 socket 到达。
-    /// 与首 canonical 片段无先后约束；该片段可能只是元数据。
+    /// 转译可能改变内容的载体；两端各自识别的首内容与首 canonical 片段独立计时。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_first_content_ms: Option<u32>,
     /// 既有首内容观察器把非空内容交给 HTTP server 的时点，不是客户端 ACK。
@@ -55,7 +55,6 @@ impl UpstreamTiming {
             .into_iter()
             .flatten()
             .any(|before| before > content)
-                || self.first_content_ms.is_some_and(|after| after < content)
             {
                 return false;
             }
@@ -161,12 +160,14 @@ mod tests {
         assert!(serde_json::from_value::<UpstreamTiming>(wire.clone())
             .unwrap()
             .validate());
-        for reversed in [2, 9] {
-            wire["upstream_first_content_ms"] = serde_json::json!(reversed);
-            assert!(!serde_json::from_value::<UpstreamTiming>(wire.clone())
-                .unwrap()
-                .validate());
-        }
+        wire["upstream_first_content_ms"] = serde_json::json!(2);
+        assert!(!serde_json::from_value::<UpstreamTiming>(wire.clone())
+            .unwrap()
+            .validate());
+        wire["upstream_first_content_ms"] = serde_json::json!(9);
+        assert!(serde_json::from_value::<UpstreamTiming>(wire)
+            .unwrap()
+            .validate());
         let old: UpstreamTiming =
             serde_json::from_value(serde_json::json!({"first_content_ms":8})).unwrap();
         assert!(serde_json::to_value(old)
