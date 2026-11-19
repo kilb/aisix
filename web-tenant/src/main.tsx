@@ -30,12 +30,23 @@ function takeInviteToken(): string | null {
 
 const inviteToken = takeInviteToken();
 
+function takeOAuthResult(): "success" | "linked" | "error" | null {
+  const url = new URL(window.location.href);
+  const result = url.searchParams.get("auth");
+  if (result !== "success" && result !== "linked" && result !== "error") return null;
+  url.searchParams.delete("auth");
+  if (result === "linked" || result === "error") url.hash = "account";
+  window.history.replaceState(null, "", url);
+  return result;
+}
+
+const oauthResult = takeOAuthResult();
 const root = document.getElementById("root");
 if (!root) throw new Error("#root missing from the HTML shell");
 createRoot(root).render(
   <StrictMode>
     <ToastProvider>
-      <App inviteToken={inviteToken} />
+      <App inviteToken={inviteToken} oauthResult={oauthResult} />
     </ToastProvider>
   </StrictMode>,
 );

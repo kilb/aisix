@@ -45,7 +45,7 @@ function signedIn(s: Session): SignedIn | null {
   return s.authed && s.member && s.tenant ? { member: s.member, tenant: s.tenant } : null;
 }
 
-export function App({ inviteToken }: { inviteToken: string | null }) {
+export function App({ inviteToken, oauthResult = null }: { inviteToken: string | null; oauthResult?: "success" | "linked" | "error" | null }) {
   // null until the session is read: defaulting to signed-out would flash
   // the gate on every reload, and most reloads are signed in.
   const [apiContract, setApiContract] = useState<number | null>(null);
@@ -54,7 +54,8 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
   const [bootError, setBootError] = useState<string | null>(null);
   const [signOutError, setSignOutError] = useState<string | null>(null);
   /** Why the gate is showing again, when a session ended under the member. */
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(oauthResult === "error" ? "第三方授权未完成。请重试，或使用口令登录。" : null);
+  const [accountNotice, setAccountNotice] = useState(oauthResult === "linked" ? "第三方账号已绑定。" : null);
   const [tab, setTab] = useState<TabId>("org");
   /** The group a `#prices?group=<id>` link named, read when that page opens. */
   const [priceGroup, setPriceGroup] = useState<string | null>(null);
@@ -123,11 +124,13 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     try {
       const s = await session();
       setApiContract(s.apiContract);
-      setMe(signedIn(s));
+      const signed = signedIn(s);
+      setMe(signed);
+      if (oauthResult === "success" && !signed) setNotice("第三方登录未建立会话，请重新登录。");
     } catch (e) {
       setBootError(e instanceof ApiError ? messageFor(e) : String(e));
     }
-  }, []);
+  }, [oauthResult]);
 
   useEffect(() => {
     void boot();
@@ -138,6 +141,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
     setInvite(null);
     setSignOutError(null);
     setNotice(null);
+    setAccountNotice(null);
     // 更新地址并卸载认证表单，让密码管理器识别异步登录已成功。
     window.history.replaceState(null, "", "#org");
     openSection("org");
@@ -157,6 +161,7 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
       }
     }
     setMe(null);
+    setAccountNotice(null);
   }, []);
 
   const visible = me ? TABS.filter((t) => canSeePortalTab(t.id, me.member.role, me.tenant.status)) : [];
@@ -282,6 +287,13 @@ export function App({ inviteToken }: { inviteToken: string | null }) {
         <div className="route-bar-in shell-note">
           <div className="note crit signout-err" role="alert">
             {signOutError}
+          </div>
+        </div>
+      )}
+      {current === "account" && (accountNotice || notice) && (
+        <div className="route-bar-in shell-note">
+          <div className={`note ${accountNotice ? "ok" : "warn"}`} role="status">
+            {accountNotice ?? notice}
           </div>
         </div>
       )}

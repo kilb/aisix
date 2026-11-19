@@ -13,6 +13,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::db::{Db, DbError};
+use crate::error::ApiError;
 
 /// The operators' session cookie. The admin API reads only this one.
 pub const ADMIN_COOKIE: &str = "aisix_cp_admin";
@@ -113,6 +114,24 @@ pub async fn resolve(db: &Db, token: &str, kind: PrincipalKind) -> Result<Option
     .bind(kind.as_str())
     .fetch_optional(db.pool())
     .await?)
+}
+
+/// 事务中复检发起凭据修改的成员会话。调用方先锁定对应成员，再锁会话。
+pub(crate) async fn require_live_member(
+    conn: &mut PgConnection,
+    id: Uuid,
+    token_sha256: &[u8],
+) -> Result<(), ApiError> {
+    let live: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM sessions WHERE token_sha256 = $1 \
+         AND principal_kind = 'member' AND principal_id = $2 AND expires_at > now() FOR SHARE",
+    )
+    .bind(token_sha256)
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .map_err(DbError::from)?;
+    live.map(|_| ()).ok_or_else(ApiError::unauthenticated)
 }
 
 /// Ends the session `token`, if there is one of `kind`, with `executor`

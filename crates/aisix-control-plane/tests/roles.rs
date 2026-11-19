@@ -87,6 +87,7 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         // without If-Match 428, so nothing is written.
         ("GET", "/admin/tenants")
         | ("GET", "/admin/settings/tenant-defaults")
+        | ("GET", "/admin/settings/authentication")
         | ("GET", "/admin/provider-groups") => (path.to_string(), None),
         // Groups as data. The id matches nothing: past the role check, a read
         // answers 404 and a write 404 too, so nothing is written.
@@ -123,6 +124,18 @@ fn fixture(method: &str, path: &str, target: &SeededOperator) -> (String, Option
         | ("POST", "/admin/tenants/{id}/reactivate") => {
             (path.replace("{id}", &Uuid::nil().to_string()), None)
         }
+        ("PUT", "/admin/settings/authentication") => (
+            path.to_string(),
+            Some(json!({
+                "version": 0,
+                "email": {"enabled": true, "endpoint": "", "from": ""},
+                "turnstile": {"enabled": false, "site_key": ""},
+                "passkey": {"enabled": false},
+                "github": {"enabled": false, "client_id": ""},
+                "google": {"enabled": false, "client_id": ""},
+                "portal_origin": "https://portal.example.com",
+            })),
+        ),
         ("PUT", "/admin/settings/tenant-defaults") => (
             path.to_string(),
             Some(json!({"concurrency": 20, "default_provider_groups": ["shared"]})),

@@ -35,6 +35,7 @@ import {
   Plug,
   ScrollText,
   Server,
+  ShieldCheck,
   ShieldUser,
   Sun,
   UserRound,
@@ -51,6 +52,7 @@ const Calls = lazy(() => import("./tabs/Calls").then(module => ({ default: modul
 const ModelTests = lazy(() => import("./tabs/ModelTests").then(module => ({ default: module.ModelTests })));
 const PublicRoutes = lazy(() => import("./tabs/PublicRoutes").then(module => ({ default: module.PublicRoutes })));
 import { Gate } from "./Gate";
+const Authentication = lazy(() => import("./tabs/Authentication").then(module => ({ default: module.Authentication })));
 const Audit = lazy(() => import("./tabs/Audit").then(module => ({ default: module.Audit })));
 const Cache = lazy(() => import("./tabs/Cache").then(module => ({ default: module.Cache })));
 const Gateways = lazy(() => import("./tabs/Gateways").then(module => ({ default: module.Gateways })));
@@ -81,6 +83,7 @@ const TABS = [
   { id: "keys", label: "密钥", icon: KeyRound, group: "组织与账务" },
   { id: "gateways", label: "网关", icon: Server, group: "平台管理" },
   { id: "resources", label: "全部资源", icon: Braces, group: "平台管理" },
+  { id: "authentication", label: "认证设置", icon: ShieldCheck, group: "平台管理", adminOnly: true },
   { id: "operators", label: "运维账号", icon: ShieldUser, group: "平台管理", adminOnly: true },
   { id: "audit", label: "审计日志", icon: ScrollText, group: "平台管理" },
   { id: "account", label: "账号设置", icon: UserRound, group: "个人" },
@@ -250,6 +253,8 @@ function Page({ tab, ...props }: TabProps & { tab: TabId }) {
       return <Cache {...props} />;
     case "resources":
       return <Resources {...props} />;
+    case "authentication":
+      return <Authentication />;
     case "operators":
       return <Operators {...props} />;
     case "audit":

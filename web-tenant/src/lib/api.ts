@@ -195,13 +195,21 @@ export async function signup(
   email: string,
   password: string,
   displayName?: string,
+  verification?: { email_code?: string; turnstile_token?: string },
 ): Promise<Session> {
-  const body = { org_name: org, email, password, display_name: displayName };
+  const body = { org_name: org, email, password, display_name: displayName, ...verification };
   return toSession((await call<SessionBody>("POST", "/signup", body)).data);
 }
 
-export async function login(email: string, password: string): Promise<Session> {
-  return toSession((await call<SessionBody>("POST", "/login", { email, password })).data);
+export async function login(email: string, password: string, turnstileToken?: string): Promise<Session> {
+  return toSession((await call<SessionBody>("POST", "/login", { email, password, turnstile_token: turnstileToken })).data);
+}
+
+export async function finishPasskeyLogin(challengeId: string, credential: unknown): Promise<Session> {
+  const { data } = await call<SessionBody>("POST", "/auth/passkeys/login/finish", {
+    challenge_id: challengeId, credential,
+  });
+  return toSession(data);
 }
 
 export async function logout(): Promise<void> {

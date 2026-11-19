@@ -40,6 +40,7 @@ use uuid::Uuid;
 use crate::audit::{self, Actor, AuditEntry};
 use crate::auth::password::{self, normalize_email, LoginThrottle, MIN_PASSWORD_LEN};
 use crate::auth::session::{self, Principal, PrincipalKind, MEMBER_SESSION_TTL, PORTAL_COOKIE};
+use crate::auth::{settings as auth_settings, verification};
 use crate::auth::{MemberAuth, MemberRole, OperatorAuth, OperatorRole, KEY_HOLDERS};
 use crate::db::DbError;
 use crate::error::{ApiError, Detail};
@@ -57,7 +58,7 @@ use crate::AppState;
 pub const INVITE_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// Signups accepted per minute across the site. Signup is unauthenticated
-/// and verifies no email, and each one creates a tenant and a member, so it
+/// and each one creates a tenant and a member, so it
 /// is bounded as a whole: counted in the database
 /// (the `tenant.signup` audit rows of the last minute), whichever instance
 /// took them, and first in this process, which turns a flood away before
@@ -497,7 +498,7 @@ fn well_formed(token: &str) -> bool {
 }
 
 /// `Session` in the API, for member `id`, who is logged in.
-async fn session_view(conn: &mut PgConnection, id: Uuid) -> Result<Value, ApiError> {
+pub(crate) async fn session_view(conn: &mut PgConnection, id: Uuid) -> Result<Value, ApiError> {
     type Raw = (String, Option<String>, String, Uuid, String, String);
     let (email, display_name, role, tenant_id, tenant_name, status): Raw = sqlx::query_as(
         "SELECT m.email, m.display_name, m.role, t.id, t.name, t.status \
@@ -518,7 +519,7 @@ async fn session_view(conn: &mut PgConnection, id: Uuid) -> Result<Value, ApiErr
 /// Starts member `id`'s session in place of the one the request carried,
 /// if any: a session planted in the browser beforehand does not outlive a
 /// login.
-async fn start_session(
+pub(crate) async fn start_session(
     conn: &mut PgConnection,
     id: Uuid,
     carried: Option<&str>,
@@ -530,12 +531,12 @@ async fn start_session(
 }
 
 /// The answer that sets the session cookie for `token`.
-fn with_cookie(status: StatusCode, token: &str, body: Value) -> Response {
+pub(crate) fn with_cookie(status: StatusCode, token: &str, body: Value) -> Response {
     let cookie = session::cookie(PORTAL_COOKIE, token, MEMBER_SESSION_TTL);
     (status, [(header::SET_COOKIE, cookie)], Json(body)).into_response()
 }
 
-fn carried_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn carried_token(headers: &HeaderMap) -> Option<String> {
     session::token_from_headers(headers, PORTAL_COOKIE).map(str::to_string)
 }
 
@@ -570,6 +571,8 @@ pub struct SignupRequest {
     email: String,
     password: String,
     display_name: Option<String>,
+    email_code: Option<String>,
+    turnstile_token: Option<String>,
 }
 
 /// `POST /api/signup` → `201 Session` and the session cookie: a pending
@@ -608,7 +611,17 @@ pub async fn signup(
     let Some(slot) = state.portal.signups.try_take() else {
         return Err(signups_busy());
     };
-    let signed_up = sign_up(&state, &headers, org, email, &req.password, name).await;
+    let signed_up = async {
+        let proof = verification::verify_signup(
+            &state,
+            &email,
+            req.email_code.as_deref(),
+            req.turnstile_token.as_deref(),
+        )
+        .await?;
+        sign_up(&state, &headers, org, email, &req.password, name, proof).await
+    }
+    .await;
     if signed_up.is_err() {
         state.portal.signups.give_back(slot);
     }
@@ -629,10 +642,12 @@ async fn sign_up(
     email: String,
     password: &str,
     name: Option<String>,
+    proof: verification::SignupProof,
 ) -> Result<Response, ApiError> {
     let hash = state.passwords.hash(password).await?;
     let ctx = WriteCtx::of(state);
     let carried = carried_token(headers);
+    let auth_state = state.clone();
     let (token, view) = state
         .db
         .tx(move |conn| {
@@ -666,6 +681,7 @@ async fn sign_up(
                     );
                     return Err(signups_busy());
                 }
+                proof.consume(&auth_state, conn).await?;
                 let tenant = tenants::create(
                     &mut *conn,
                     &ctx,
@@ -714,6 +730,7 @@ async fn sign_up(
 pub struct LoginRequest {
     email: String,
     password: String,
+    turnstile_token: Option<String>,
 }
 
 /// `POST /api/login` → `200 Session` and the session cookie. A wrong
@@ -733,6 +750,9 @@ pub async fn login(
     let Some(email) = normalize_email(&req.email) else {
         return Err(ApiError::invalid_credentials());
     };
+    let settings = auth_settings::load(&state, auth_settings::SecretScope::Turnstile).await?;
+    verification::verify_turnstile(&state, &settings, req.turnstile_token.as_deref(), "login")
+        .await?;
     // Before any argon2 work.
     if state.portal.logins.in_cooldown(&email) {
         return Ok(cooling_down());
@@ -754,10 +774,12 @@ pub async fn login(
     };
     state.portal.logins.clear(&email);
     let carried = carried_token(&headers);
+    let auth_state = state.clone();
     let (token, view) = state
         .db
         .tx(move |conn| {
             async move {
+                verification::ensure_turnstile_current(&auth_state, conn, &settings).await?;
                 // The member was read and verified outside this transaction,
                 // which can take seconds. A password change, a disable or a
                 // removal that committed meanwhile has already ended the
@@ -829,6 +851,38 @@ fn wrong_current_password() -> ApiError {
     }
 }
 
+/// 二次验证和登录共用密码验证资源与限流。写入凭据时在事务内重新确认已核对的哈希。
+pub(crate) async fn verify_member_password(
+    state: &AppState,
+    id: Uuid,
+    current_password: &str,
+) -> Result<String, ApiError> {
+    let stored: Option<(String, String)> = sqlx::query_as(
+        "SELECT email, password_hash FROM members \
+         WHERE id = $1 AND NOT disabled AND removed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(state.db.pool())
+    .await
+    .map_err(DbError::from)?;
+    let Some((email, hash)) = stored else {
+        return Err(ApiError::unauthenticated());
+    };
+    if state.portal.logins.in_cooldown(&email) {
+        return Err(ApiError::busy());
+    }
+    if !state
+        .passwords
+        .verify(Some(&hash), current_password)
+        .await?
+    {
+        state.portal.logins.note_failure(&email);
+        return Err(wrong_current_password());
+    }
+    state.portal.logins.clear(&email);
+    Ok(hash)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChangePassword {
@@ -858,26 +912,10 @@ pub async fn change_password(
             "/new_password",
         )]));
     }
-    // A stolen session must not make guessing the password any easier than
-    // the login does: the same cooldown applies.
-    if state.portal.logins.in_cooldown(&auth.email) {
-        return Ok(cooling_down());
-    }
-    let stored: Option<String> =
-        sqlx::query_scalar("SELECT password_hash FROM members WHERE id = $1")
-            .bind(auth.id)
-            .fetch_optional(state.db.pool())
-            .await
-            .map_err(DbError::from)?;
-    let matched = state
-        .passwords
-        .verify(stored.as_deref(), &req.current_password)
-        .await?;
-    let (true, Some(verified)) = (matched, stored) else {
-        state.portal.logins.note_failure(&auth.email);
-        return Err(wrong_current_password());
+    let verified = match verify_member_password(&state, auth.id, &req.current_password).await {
+        Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Ok(cooling_down()),
+        checked => checked?,
     };
-    state.portal.logins.clear(&auth.email);
     let hash = state.passwords.hash(&req.new_password).await?;
     let current = carried_token(&headers);
     state
@@ -1640,6 +1678,16 @@ pub async fn remove(
                     .await
                     .map_err(DbError::from)?;
                 session::revoke_all(&mut *conn, Principal::Member(id), None).await?;
+                sqlx::query("DELETE FROM member_oauth_identities WHERE member_id = $1")
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
+                sqlx::query("DELETE FROM portal_passkeys WHERE member_id = $1")
+                    .bind(id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(DbError::from)?;
                 let revoked = revoke_issued_invites(&mut *conn, auth.tenant_id, id, true).await?;
                 // Before their `users` document goes: a key document names
                 // its user. A pending tenant's member has none yet.

@@ -63,3 +63,9 @@ test("旧租户计费与方案链接进入同一个租户页", () => {
   }
   assert.equal(adminRouteOf("#billing?section=topups&tenant=t1").tab, "billing");
 });
+
+test("认证设置有可分享的管理员专用入口", () => {
+  assert.equal(adminRouteOf("#authentication").tab, "authentication");
+  assert.equal(canSeeAdminTab(adminRouteOf("#authentication").tab, "admin"), true);
+  for (const role of ["operator", "viewer"]) assert.equal(canSeeAdminTab(adminRouteOf("#authentication").tab, role), false);
+});

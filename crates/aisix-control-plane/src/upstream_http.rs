@@ -103,6 +103,7 @@ pub struct Client {
     /// the unguarded client is the right one for every URL.
     guarded: bool,
     ssrf: SsrfProtection,
+    public_only: SsrfProtection,
     /// Direct, through the resolver that refuses a non-public address and
     /// connects only to the addresses it checked.
     pinned: reqwest::Client,
@@ -116,6 +117,8 @@ impl Client {
     /// [`SsrfProtectionConfig::default`] — on, with no allowed hosts.
     pub fn new(cfg: &SsrfProtectionConfig) -> Result<Client, String> {
         let ssrf = SsrfProtection::from_config(cfg)?.without_proxies();
+        let public_only =
+            SsrfProtection::from_config(&SsrfProtectionConfig::default())?.without_proxies();
         let pinned = Self::builder()
             .dns_resolver(aisix_gateway::ssrf::direct_resolver(true))
             .build()
@@ -127,6 +130,7 @@ impl Client {
         Ok(Client {
             guarded: cfg.enabled,
             ssrf,
+            public_only,
             pinned,
             direct,
         })
@@ -149,6 +153,22 @@ impl Client {
             Route::Direct => Ok(&self.direct),
             Route::Pinned | Route::Proxied => Ok(&self.pinned),
         }
+    }
+
+    /// 认证服务固定使用 HTTPS 和公网地址，不继承模型探测的地址豁免。
+    pub(crate) async fn public_https_client(
+        &self,
+        url: &Url,
+    ) -> Result<&reqwest::Client, ApiError> {
+        if url.scheme() != "https" {
+            return Err(ApiError::unavailable());
+        }
+        // 字面 IP 不经过解析器，必须在选出加固客户端前检查。
+        self.public_only
+            .route(url)
+            .await
+            .map_err(|_| ApiError::unavailable())?;
+        Ok(&self.pinned)
     }
 
     /// 为模型探测复用同一地址策略；独立时限不改变模型列表的五秒界限。
@@ -212,9 +232,6 @@ impl Client {
         pk: Option<&ProviderKey>,
     ) -> Result<BTreeMap<String, Vec<SocketAddr>>, ApiError> {
         let connection = pk.and_then(ProviderKey::upstream_connection);
-        let public_only = SsrfProtection::from_config(&SsrfProtectionConfig::default())
-            .map_err(ApiError::internal)?
-            .without_proxies();
         let mut pins = BTreeMap::<String, Vec<SocketAddr>>::new();
         for url in urls {
             if !matches!(url.scheme(), "http" | "https") {
@@ -267,7 +284,7 @@ impl Client {
                     literal
                         .set_ip_host(address.ip())
                         .map_err(|_| ApiError::upstream_unreachable("上游地址的主机名无法读取"))?;
-                    if public_only.route(&literal).await.is_err() {
+                    if self.public_only.route(&literal).await.is_err() {
                         return Err(ApiError::upstream_unreachable(Refusal::blocked_hint(Some(
                             url,
                         ))));
@@ -618,6 +635,27 @@ fn transport_text(error: &reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn authentication_only_uses_public_https_even_when_probing_allows_private_networks() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::new(&SsrfProtectionConfig {
+            enabled: false,
+            ..SsrfProtectionConfig::default()
+        })
+        .expect("a control-plane client");
+        for target in [
+            "http://example.com/send",
+            "https://127.0.0.1/send",
+            "https://[::1]/send",
+            "https://169.254.169.254/send",
+        ] {
+            let url = Url::parse(target).expect("a target URL");
+            assert!(client.public_https_client(&url).await.is_err(), "{target}");
+        }
+        let url = Url::parse("https://example.com/send").expect("a public HTTPS URL");
+        assert!(client.public_https_client(&url).await.is_ok());
+    }
 
     /// The body of `fn <signature>` in this file, without its comment
     /// lines: an explanation survives deleting the call it explains, and a

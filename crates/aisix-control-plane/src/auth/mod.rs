@@ -2,8 +2,12 @@
 //! turn a session cookie into an identity with a role.
 
 pub mod extract;
+pub(crate) mod oauth;
+pub(crate) mod passkey;
 pub mod password;
 pub mod session;
+pub(crate) mod settings;
+pub(crate) mod verification;
 
 use std::fmt;
 use std::str::FromStr;

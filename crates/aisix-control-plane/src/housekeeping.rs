@@ -49,6 +49,14 @@ pub async fn run_once(db: &Db) -> Result<Pruned, DbError> {
         .execute(db.pool())
         .await?
         .rows_affected();
+    // 保留邮件发送记录到滚动限流窗口结束，避免失效验证码绕过发送限额。
+    for statement in [
+        "DELETE FROM portal_email_codes WHERE issued_at <= now() - interval '1 hour'",
+        "DELETE FROM portal_oauth_flows WHERE expires_at <= now()",
+        "DELETE FROM portal_passkey_challenges WHERE expires_at <= now()",
+    ] {
+        sqlx::query(statement).execute(db.pool()).await?;
+    }
     let instances =
         sqlx::query("DELETE FROM dp_instances WHERE last_seen_at < now() - interval '7 days'")
             .execute(db.pool())

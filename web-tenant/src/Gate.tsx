@@ -1,7 +1,19 @@
-import { useState } from "react";
-import { Activity, KeyRound, UsersRound } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Activity, Fingerprint, KeyRound, UsersRound } from "lucide-react";
 import { ApiError, MIN_PASSWORD_CHARS, acceptInvite, login, signup, type Session } from "./lib/api";
-import { formMessageFor, messageFor } from "./lib/errors";
+import {
+  browserAuthenticationError,
+  loginWithPasskey,
+  openSocialAuthorization,
+  sendEmailCode,
+  SOCIAL_NAMES,
+  SOCIAL_PROVIDERS,
+  supportsPasskeys,
+  useAuthenticationOptions,
+  type SocialProvider,
+} from "./lib/authentication";
+import { formMessageFor } from "./lib/errors";
+import { loadTurnstile, turnstileToken } from "./lib/turnstile";
 import type { Theme } from "./lib/useTheme";
 import { Button } from "./ui/Button";
 import { Field } from "./ui/Field";
@@ -10,6 +22,7 @@ import { ThemeToggle } from "./ui/ThemeToggle";
 import { Card } from "./components/page";
 
 type Mode = "login" | "signup";
+type Pending = "submit" | "email_code" | "passkey" | SocialProvider;
 
 const MODES = [
   { id: "login", label: "登录" },
@@ -57,26 +70,81 @@ export function Gate({
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [emailCode, setEmailCode] = useState("");
+  const [sentTo, setSentTo] = useState<string | null>(null);
+  const [resendBlocked, setResendBlocked] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const emailField = useRef<HTMLInputElement>(null);
+  const turnstile = useRef<HTMLDivElement>(null);
+  const { options, failed, retry } = useAuthenticationOptions(invite === null);
+  const siteKey = options?.turnstile_site_key ?? null;
+  const busy = pending !== null;
+
+  useEffect(() => {
+    if (siteKey) void loadTurnstile().catch(() => { /* 用户提交时可重试。 */ });
+  }, [siteKey]);
+
+  useEffect(() => {
+    if (!resendBlocked) return;
+    const timeout = window.setTimeout(() => setResendBlocked(false), 60_000);
+    return () => window.clearTimeout(timeout);
+  }, [resendBlocked]);
+
+  function challenge(action: Parameters<typeof turnstileToken>[2]) {
+    return turnstileToken(turnstile.current, siteKey, action, theme);
+  }
 
   /** Sends one sign-in request; a refusal is shown as `describe` words it. */
-  async function attempt(request: () => Promise<Session>, describe: (e: ApiError) => string) {
+  async function attempt(
+    activity: Pending,
+    request: () => Promise<Session | void>,
+    describe: (e: ApiError) => string,
+  ) {
     setErr(null);
-    setBusy(true);
+    setPending(activity);
     try {
       const session = await request();
-      onIn(session);
+      if (session) onIn(session);
     } catch (e) {
-      setErr(e instanceof ApiError ? describe(e) : "请求失败");
+      setErr(e instanceof ApiError ? describe(e) : browserAuthenticationError(e));
     } finally {
-      setBusy(false);
+      setPending(null);
     }
+  }
+
+  function requestEmailCode() {
+    const input = emailField.current;
+    if (busy || !options || !input?.reportValidity()) return;
+    const address = input.value.trim();
+    setEmail(address);
+    void attempt("email_code", async () => {
+      await sendEmailCode(address, await challenge("email_code"));
+      setSentTo(address.toLowerCase());
+      setResendBlocked(true);
+    }, formMessageFor);
+  }
+
+  function passkeySignIn() {
+    const input = emailField.current;
+    if (busy || !options || !input?.reportValidity()) return;
+    const address = input.value.trim();
+    setEmail(address);
+    void attempt("passkey", async () => loginWithPasskey(address, await challenge("passkey_login")), (error) =>
+      error.code === "invalid_passkey" ? "无法使用 Passkey 登录，请确认邮箱或改用口令。" : formMessageFor(error),
+    );
+  }
+
+  function socialSignIn(provider: SocialProvider) {
+    if (busy || !options) return;
+    void attempt(provider, async () => openSocialAuthorization(provider, {
+      mode: "login", turnstile_token: await challenge("oauth_login"),
+    }), formMessageFor);
   }
 
   function submit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (busy) return;
+    if (busy || (invite === null && !options)) return;
     // 自动填充可直接更新控件；提交读取表单，避免依赖它是否触发 React 的 change。
     const data = new FormData(e.currentTarget);
     const enteredPassword = String(data.get("password") ?? "");
@@ -88,7 +156,7 @@ export function Gate({
     if (data.has("organization")) setOrgName(enteredOrgName);
     if (data.has("display_name")) setDisplayName(name ?? "");
     if (invite === null && mode === "login") {
-      void attempt(() => login(enteredEmail, enteredPassword), messageFor);
+      void attempt("submit", async () => login(enteredEmail, enteredPassword, await challenge("login")), formMessageFor);
       return;
     }
     if (!longEnough(enteredPassword)) {
@@ -101,6 +169,7 @@ export function Gate({
       // `email_taken`, which only the inviter can sort out; the text does not
       // say why.
       void attempt(
+        "submit",
         () => acceptInvite(invite, enteredPassword, name),
         (e) =>
           e.code === "not_found"
@@ -110,12 +179,16 @@ export function Gate({
               : formMessageFor(e),
       );
     } else {
-      void attempt(() => signup(enteredOrgName, enteredEmail, enteredPassword, name), formMessageFor);
+      const code = String(data.get("email_code") ?? "").trim();
+      void attempt("submit", async () => signup(enteredOrgName, enteredEmail, enteredPassword, name, {
+        email_code: options?.email_verification ? code : undefined,
+        turnstile_token: await challenge("signup"),
+      }), formMessageFor);
     }
   }
 
   function switchMode(next: Mode) {
-    if (next === mode) return;
+    if (next === mode || busy) return;
     setMode(next);
     setPassword("");
     setErr(null);
@@ -129,6 +202,9 @@ export function Gate({
 
   const hinted = invite !== null || mode === "signup";
   const formId = `tenant-${invite !== null ? "invite" : mode}`;
+  const canUsePasskey = options?.passkey && supportsPasskeys();
+  const socialProviders = SOCIAL_PROVIDERS.filter((provider) => options?.[provider]);
+  const sentHere = sentTo !== null && sentTo === email.trim().toLowerCase();
   const passwordField = (
     <Field label="口令" hint={hinted ? <>至少 {MIN_PASSWORD_CHARS} 个字符</> : undefined}>
       {(aria) => (
@@ -215,7 +291,7 @@ export function Gate({
               <form id={formId} name={formId} method="post" className="gate-form" aria-label="接受邀请" onSubmit={submit}>
                 {passwordField}
                 {displayNameField}
-                <Button kind="primary" block type="submit" busy={busy}>
+                <Button kind="primary" block type="submit" busy={pending === "submit"}>
                   接受邀请
                 </Button>
               </form>
@@ -250,6 +326,7 @@ export function Gate({
                   )}
                   <Field label="邮箱">
                     <input
+                      ref={emailField}
                       id={`${formId}-email`}
                       name="email"
                       type="email"
@@ -258,16 +335,48 @@ export function Gate({
                       spellCheck={false}
                       required
                       value={email}
-                      onChange={(e) => setEmail(e.target.value)}
+                      onChange={(e) => {
+                        setEmail(e.target.value);
+                        setEmailCode("");
+                      }}
                     />
                   </Field>
+                  {mode === "signup" && options?.email_verification && (
+                    <div className="gate-email-code">
+                      <Field label="邮箱验证码">
+                        <input name="email_code" type="text" autoComplete="one-time-code" inputMode="numeric" pattern="[0-9]{6}" maxLength={6} required
+                          value={emailCode} onChange={(event) => setEmailCode(event.target.value)} />
+                      </Field>
+                      <Button onClick={requestEmailCode} busy={pending === "email_code"} disabled={busy || (sentHere && resendBlocked)}>
+                        {sentHere ? "重新发送" : "发送验证码"}
+                      </Button>
+                      {sentHere && <p role="status" className="hint">验证码已发送，请检查收件箱。{resendBlocked ? "一分钟后可重新发送。" : ""}</p>}
+                    </div>
+                  )}
                   {passwordField}
                   {mode === "signup" && displayNameField}
-                  <Button kind="primary" block type="submit" busy={busy}>
+                  {siteKey && <div ref={turnstile} className="gate-turnstile" />}
+                  <Button kind="primary" block type="submit" busy={pending === "submit" || (!options && !failed)}
+                    busyLabel={options ? "正在提交" : "正在读取登录设置"} disabled={busy || !options}>
                     {mode === "login" ? "登录" : "注册组织"}
                   </Button>
                 </form>
+                {mode === "login" && (canUsePasskey || socialProviders.length > 0) && (
+                  <div className="gate-alternative">
+                    <h3>其他登录方式</h3>
+                    <div className="gate-alternative-actions">
+                      {canUsePasskey && <Button onClick={passkeySignIn} disabled={busy} busy={pending === "passkey"}>
+                        <Fingerprint aria-hidden /> 使用 Passkey 登录
+                      </Button>}
+                      {socialProviders.map((provider) => <Button key={provider} onClick={() => socialSignIn(provider)} disabled={busy} busy={pending === provider}>
+                        使用 {SOCIAL_NAMES[provider]} 登录
+                      </Button>)}
+                    </div>
+                    <p className="hint">首次使用，请先登录并在「账号设置」中添加登录方式。</p>
+                  </div>
+                )}
               </div>
+              {failed && <div className="note crit" role="alert">无法读取登录设置。 <Button size="sm" onClick={retry}>重试</Button></div>}
               {alert}
               {mode === "signup" && (
                 <p className="gate-foot">

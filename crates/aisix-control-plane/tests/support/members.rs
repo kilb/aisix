@@ -50,6 +50,20 @@ impl MemberSession {
 /// once per attempt.
 pub fn tenant_fixture(method: &str, path: &str) -> (String, Option<Value>) {
     match (method, path) {
+        ("GET", "/api/auth/oauth" | "/api/auth/passkeys") => (path.to_string(), None),
+        ("DELETE", "/api/auth/oauth/{provider}") => (
+            "/api/auth/oauth/github".to_string(),
+            Some(json!({"password": TEST_PASSWORD})),
+        ),
+        ("POST", "/api/auth/passkeys/register/start") => (
+            path.to_string(),
+            Some(json!({"name": "fixture-passkey", "password": TEST_PASSWORD})),
+        ),
+        ("POST", "/api/auth/passkeys/register/finish") => (path.to_string(), Some(json!({}))),
+        ("DELETE", "/api/auth/passkeys/{id}") => (
+            path.replace("{id}", &Uuid::nil().to_string()),
+            Some(json!({"password": TEST_PASSWORD})),
+        ),
         // Rejected as too short, after the identity checks.
         ("POST", "/api/password") => (
             path.to_string(),

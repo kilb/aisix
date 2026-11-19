@@ -57,6 +57,9 @@ argon2 = "0.5.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
 # Session tokens are stored as their SHA-256.
 sha2 = "0.10"
+# 门户 Google OIDC 校验签名，Passkey 认证状态只在服务端数据库短时保存。
+jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+webauthn-rs = { version = "0.6.2", default-features = false, features = ["danger-allow-state-serialisation"] }
 # The control plane's CA: EC P-256 certificates signed with ring (rcgen
 # 0.13.2). `x509-parser` loads the stored CA certificate back for signing
 # (`CertificateParams::from_ca_cert_pem`, rcgen 0.13.2 `certificate.rs:196-198`).

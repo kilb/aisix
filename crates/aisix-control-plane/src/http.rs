@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use crate::auth::{MemberRole, OperatorRole, KEY_HOLDERS};
+use crate::auth::{self, MemberRole, OperatorRole, KEY_HOLDERS};
 use crate::error::{ApiError, Detail};
 use crate::{
     audit, billing, channels, dp, gateways, groups, key_usage, keys, member_usage, members,
@@ -240,6 +240,16 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         "/admin/provider-groups",
         MinRole::Op(OperatorRole::Viewer),
     ),
+    (
+        "GET",
+        "/admin/settings/authentication",
+        MinRole::Op(OperatorRole::Admin),
+    ),
+    (
+        "PUT",
+        "/admin/settings/authentication",
+        MinRole::Op(OperatorRole::Admin),
+    ),
     // Groups as data: the routing name, what tenants see, its rates, and the
     // one designated default.
     (
@@ -341,6 +351,38 @@ pub const ROUTE_ROLES: &[(&str, &str, MinRole)] = &[
         MinRole::Op(OperatorRole::Viewer),
     ),
     // The tenant API.
+    ("GET", "/api/auth/options", MinRole::Public),
+    ("POST", "/api/auth/email-code", MinRole::Public),
+    ("POST", "/api/auth/oauth/{provider}/start", MinRole::Public),
+    (
+        "GET",
+        "/api/auth/oauth/{provider}/callback",
+        MinRole::Public,
+    ),
+    ("POST", "/api/auth/passkeys/login/start", MinRole::Public),
+    ("POST", "/api/auth/passkeys/login/finish", MinRole::Public),
+    ("GET", "/api/auth/oauth", MinRole::Member(EVERY_MEMBER)),
+    (
+        "DELETE",
+        "/api/auth/oauth/{provider}",
+        MinRole::Member(EVERY_MEMBER),
+    ),
+    ("GET", "/api/auth/passkeys", MinRole::Member(EVERY_MEMBER)),
+    (
+        "POST",
+        "/api/auth/passkeys/register/start",
+        MinRole::Member(EVERY_MEMBER),
+    ),
+    (
+        "POST",
+        "/api/auth/passkeys/register/finish",
+        MinRole::Member(EVERY_MEMBER),
+    ),
+    (
+        "DELETE",
+        "/api/auth/passkeys/{id}",
+        MinRole::Member(EVERY_MEMBER),
+    ),
     ("POST", "/api/signup", MinRole::Public),
     ("POST", "/api/login", MinRole::Public),
     ("POST", "/api/logout", MinRole::Public),
@@ -885,6 +927,12 @@ const MANAGERS: &[MemberRole] = &[MemberRole::Owner, MemberRole::Admin];
 /// route they get `403 tenant_not_active`. `every_route_checks_identity`
 /// holds each handler to this list.
 pub const INACTIVE_TENANT_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/api/auth/oauth"),
+    ("DELETE", "/api/auth/oauth/{provider}"),
+    ("GET", "/api/auth/passkeys"),
+    ("POST", "/api/auth/passkeys/register/start"),
+    ("POST", "/api/auth/passkeys/register/finish"),
+    ("DELETE", "/api/auth/passkeys/{id}"),
     ("POST", "/api/password"),
     ("GET", "/api/org"),
     ("GET", "/api/keys"),
@@ -949,6 +997,10 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/tenants/{id}/suspend", post(tenants::suspend))
         .route("/admin/tenants/{id}/reactivate", post(tenants::reactivate))
         .route(
+            "/admin/settings/authentication",
+            get(auth::settings::get).put(auth::settings::put),
+        )
+        .route(
             "/admin/settings/tenant-defaults",
             get(tenants::get_defaults).put(tenants::put_defaults),
         )
@@ -995,6 +1047,18 @@ pub fn browser_router(state: AppState) -> Router {
         .route("/admin/model-assessments/{id}/samples", get(model_assessments::samples))
         .route("/admin/model-assessments/{id}/cancel", post(model_assessments::cancel))
         .route("/admin/model-assessments/{id}/export", get(model_assessments::export))
+        .route("/api/auth/options", get(auth::settings::options))
+        .route("/api/auth/email-code", post(auth::verification::send_email_code))
+        .route("/api/auth/oauth/{provider}/start", post(auth::oauth::start))
+        .route("/api/auth/oauth/{provider}/callback", get(auth::oauth::callback))
+        .route("/api/auth/passkeys/login/start", post(auth::passkey::login_start))
+        .route("/api/auth/passkeys/login/finish", post(auth::passkey::login_finish))
+        .route("/api/auth/oauth", get(auth::oauth::list))
+        .route("/api/auth/oauth/{provider}", delete(auth::oauth::unlink))
+        .route("/api/auth/passkeys", get(auth::passkey::list))
+        .route("/api/auth/passkeys/register/start", post(auth::passkey::register_start))
+        .route("/api/auth/passkeys/register/finish", post(auth::passkey::register_finish))
+        .route("/api/auth/passkeys/{id}", delete(auth::passkey::remove))
         .route("/api/signup", post(members::signup))
         .route("/api/login", post(members::login))
         .route("/api/logout", post(members::logout))
