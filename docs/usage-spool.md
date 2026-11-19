@@ -54,3 +54,20 @@ batch. The gateway retains existing records at the limit and counts new
 losses in `aisix_usage_event_drops_total` with reason `spool_full` or
 `spool_write_failed`. Observe `aisix_usage_spool_batches` by state,
 `aisix_usage_spool_bytes`, and `aisix_usage_spool_failures_total` by reason.
+
+## Retire a gateway after draining
+
+For a managed rolling deployment, stop and disable a replaced service after
+traffic has moved and the old process's outstanding usage has been confirmed.
+Use the exact credential and instance IDs from that process's receipts to
+register retirement with `POST /admin/gateways/instances/{dp_id}/{instance_id}/retire`.
+The control plane still considers a recently heard-from instance online, so
+wait for its offline status before registering the retirement. A subsequent
+heartbeat from the same instance clears its retirement.
+
+The [systemd rollout helper](../scripts/gateway_rollout_retirement.py)
+checks stop receipts, registers retirement through the admin API, and reads
+back the current inventory before accepting a single-version rollout. It
+checks for unretired older instances across the control plane's 24-hour
+window and for incomplete inventory. Only use the helper for a rollout
+whose target is one online gateway of the expected build.

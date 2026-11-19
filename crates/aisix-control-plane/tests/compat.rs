@@ -167,12 +167,41 @@ async fn disabling_an_account_requires_a_capable_fleet_but_restoring_it_does_not
             .send_conditional("PUT", &path, admin.cookie(), 1, turn_off.clone())
             .await;
         refused_at(&refused, "/disabled");
-        gw.beat("account-toggle", capable).await;
+        gw.beat("current-account-gateway", capable).await;
+        age_instance(&cp, "account-toggle", "23 hours").await;
+        let offline = cp
+            .send_conditional("PUT", &path, admin.cookie(), 1, turn_off.clone())
+            .await;
+        refused_at(&offline, "/disabled");
+        let retired = cp
+            .send(
+                "POST",
+                &format!(
+                    "/admin/gateways/instances/{}/account-toggle/retire",
+                    gw.dp_id
+                ),
+                Some(admin.cookie()),
+                Some(json!({"confirmed_stopped": true})),
+            )
+            .await;
+        assert_eq!(retired.status, 200, "{retired:?}");
+        assert!(retired.body["retired_at"].is_string(), "{retired:?}");
         let off = cp
             .send_conditional("PUT", &path, admin.cookie(), 1, turn_off.clone())
             .await;
         assert_eq!(off.status, 200, "{off:?}");
+        let saved = cp.send("GET", &path, Some(admin.cookie()), None).await;
+        assert_eq!(saved.status, 200, "{saved:?}");
+        assert_eq!(saved.body["doc"]["disabled"], true, "{saved:?}");
         gw.beat("account-toggle", old).await;
+        let returned: bool = sqlx::query_scalar(
+            "SELECT retired_at IS NULL FROM dp_instances WHERE dp_id=$1::uuid AND instance_id='account-toggle'",
+        )
+        .bind(&gw.dp_id)
+        .fetch_one(cp.db().pool())
+        .await
+        .expect("read the returning gateway");
+        assert!(returned, "the returning old instance must rejoin the fleet");
         let on = cp
             .send_conditional(
                 "PUT",
@@ -187,6 +216,10 @@ async fn disabling_an_account_requires_a_capable_fleet_but_restoring_it_does_not
             .send_conditional("PUT", &path, admin.cookie(), 3, turn_off)
             .await;
         refused_at(&refused, "/disabled");
+        let saved = cp.send("GET", &path, Some(admin.cookie()), None).await;
+        assert_eq!(saved.status, 200, "{saved:?}");
+        assert_eq!(saved.body["version"], 3, "{saved:?}");
+        assert_eq!(saved.body["doc"], created.body["doc"], "{saved:?}");
     }
 }
 

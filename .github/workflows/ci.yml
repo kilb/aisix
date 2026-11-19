@@ -721,6 +721,8 @@ jobs:
           version: 11
       - name: control-plane stack port tests
         run: node --test scripts/cp-dev-ports.test.mjs
+      - name: gateway rollout retirement tests
+        run: python3 -B -m unittest discover -s scripts -p test_gateway_rollout_retirement.py
       - name: tsc --noEmit
         run: |
           # tests/e2e locks with pnpm, so `npm ci` cannot install it. It installs
