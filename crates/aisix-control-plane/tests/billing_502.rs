@@ -1,4 +1,4 @@
-//! 中断的 Messages 流保留用量证据，账本只记录可计费的尝试。
+//! 失败的 Messages 流保留用量证据，账本只记录可计费的尝试。
 mod support;
 
 use aisix_pricing::RateCard;
@@ -22,7 +22,7 @@ async fn resource(w: &World, collection: &str, doc: Value) -> Uuid {
 }
 
 #[tokio::test]
-async fn interrupted_502_messages_keep_usage_without_posting_a_debit() {
+async fn failed_messages_keep_usage_and_only_bill_chargeable_attempts() {
     let Some(w) = world().await else { return };
     let account = resource(
         &w,
@@ -120,6 +120,42 @@ async fn interrupted_502_messages_keep_usage_without_posting_a_debit() {
         }
         events.push((event, money));
     }
+    for (id, counts, money) in [
+        (
+            "estimated-429",
+            json!({"usage_estimated":true,"prompt_tokens":681_522,"completion_tokens":0}),
+            free,
+        ),
+        (
+            "reported-429",
+            json!({"prompt_tokens":681_522,"completion_tokens":0}),
+            (681_522, Some(1_363_044)),
+        ),
+        (
+            "partial-429",
+            json!({"usage_estimated":true,"prompt_tokens":681_522,"completion_tokens":2}),
+            (681_526, Some(1_363_052)),
+        ),
+        (
+            "cache-429",
+            json!({"usage_estimated":true,"prompt_tokens":28,"completion_tokens":0,
+                   "cache_read_tokens":10}),
+            (58, Some(116)),
+        ),
+    ] {
+        let mut event = usage(
+            &w,
+            id,
+            model,
+            json!({"operation":"messages","stream":true,"status_code":429,
+                   "error_class":"upstream_in_band","provider_key_id":account,"is_final_attempt":true}),
+        );
+        event
+            .as_object_mut()
+            .expect("用量事件")
+            .extend(counts.as_object().expect("测试用量").clone());
+        events.push((event, money));
+    }
     let delivered = deliver(
         &w.dp,
         Uuid::new_v4(),
@@ -129,7 +165,7 @@ async fn interrupted_502_messages_keep_usage_without_posting_a_debit() {
     assert_eq!(delivered.status, 200, "{delivered:?}");
     assert_eq!(
         delivered.body,
-        json!({"accepted":8,"rejected":0,"duplicates":0})
+        json!({"accepted":12,"rejected":0,"duplicates":0})
     );
 
     for (event, (charge, cost)) in events {
@@ -206,5 +242,5 @@ async fn interrupted_502_messages_keep_usage_without_posting_a_debit() {
             .fetch_one(w.cp.db().pool())
             .await
             .expect("读取租户余额");
-    assert_eq!(balance, -2_709_111, "只有三次可计费用量扣减余额");
+    assert_eq!(balance, -4_072_217, "只有可计费用量扣减余额");
 }

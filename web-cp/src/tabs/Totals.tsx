@@ -3,9 +3,10 @@ import type { TabProps } from "../App";
 import { Card, CardHeader, CardMessage, Metric, MetricSkeleton, PageHeader } from "../components/page";
 import { formatCount } from "../lib/chartFormat";
 import { CostCoverage, ProfitComparison } from "../components/ProfitSummaryCharts";
+import { ProfitAccounts } from "../components/ProfitAccounts";
 import { errorText } from "../lib/fmt";
 import { fmtMicroCny } from "../lib/money";
-import { beijingInputValue, fmtBeijing, parseBeijingInput } from "../lib/time";
+import { beijingInputValue, beijingRange, fmtBeijing, parseBeijingInput, todayBeijing } from "../lib/time";
 import { fetchProfitSummary, profitRangeError, type ProfitSummary } from "../lib/totals";
 import { useHashQuery } from "../lib/useHashQuery";
 import { Button } from "../ui/Button";
@@ -49,6 +50,10 @@ export function Totals(_props: TabProps) {
     const end = new Date();
     update({ from: new Date(end.getTime() - days * 86_400_000).toISOString(), to: end.toISOString() });
   }
+  function selectDay(daysAgo: number) {
+    const day = todayBeijing(new Date(Date.now() - daysAgo * 86_400_000));
+    update(beijingRange(day, day));
+  }
   const complete = data !== null && data.rowsWithoutCost === 0n && data.unpricedRows === 0n;
   const costKnown = data !== null && (data.rowsWithCost > 0n || complete);
   const pending = error ? <CardMessage onRetry={rangeError ? undefined : retry}>{error}</CardMessage> : <MetricSkeleton className="totals-skeleton" />;
@@ -63,6 +68,8 @@ export function Totals(_props: TabProps) {
         <div className="totals-presets" aria-label="快捷时间范围">
           <Button size="sm" kind="quiet" aria-pressed={allTime} onClick={() => update({ from: undefined, to: undefined })}>全部时间</Button>
           <Button size="sm" kind="quiet" aria-pressed={!allTime} onClick={() => update({ from: from ?? fallback.from, to: to ?? fallback.to })}>指定时间段</Button>
+          <Button size="sm" kind="quiet" onClick={() => selectDay(0)}>今天</Button>
+          <Button size="sm" kind="quiet" onClick={() => selectDay(1)}>昨天</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(1)}>最近 24 小时</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(7)}>最近 7 天</Button>
           <Button size="sm" kind="quiet" onClick={() => selectRange(30)}>最近 30 天</Button>
@@ -125,6 +132,7 @@ export function Totals(_props: TabProps) {
         <p className="totals-note">利润率按收入加权汇算，不平均各模型的百分比；亏损保留负值。</p>
       </section>
     </div>
+    {data && <ProfitAccounts accounts={data.accounts} />}
     <section className="totals-method" aria-label="统计口径">
       <h2>统计口径</h2>
       <p>本页仅汇总人民币会计历史。总售价汇总已计价调用收费与净费用调整，以原调用的用量发生时间归期；费用调整的入账时间不改变归期。成本采用同范围内当笔已计费记录的历史上游成本。</p>

@@ -40,8 +40,8 @@ function field(markup: string, label: string): string {
 test("响应阶段与首字、完整上游尝试保持独立字段和准确语义", () => {
   const markup = render({ downstream_latency_ms: 3780, first_token_latency_ms: 132821, upstream_latency_ms: 115539 });
   assert.equal(field(markup, "下游响应阶段耗时"), "3.78 s");
-  assert.equal(field(markup, "首 Token 延迟"), "132.82 s");
-  assert.equal(field(markup, "上游尝试耗时"), "115.54 s");
+  assert.equal(field(markup, "请求首内容"), "132.82 s");
+  assert.equal(field(markup, "本次上游耗时"), "115.54 s");
   assert.doesNotMatch(markup, /<dt[^>]*>客户端总耗时<\/dt>/);
   assert.match(markup, /title="[^"]*处理起点[^"]*"/);
   assert.match(markup, /title="[^"]*首次下游协议输出[^"]*元数据[^"]*"/);
@@ -54,7 +54,14 @@ test("响应阶段的实测零与缺失明确分开且不借其他字段补齐",
   for (const downstream_latency_ms of [undefined, null, NaN, "17"]) {
     const markup = render({ downstream_latency_ms, first_token_latency_ms: 990, upstream_latency_ms: 2500 }, { latency_ms: 123, attempt_duration_ms: 345 });
     assert.equal(field(markup, "下游响应阶段耗时"), "—");
-    assert.equal(field(markup, "首 Token 延迟"), "990 ms");
+    assert.equal(field(markup, "请求首内容"), "990 ms");
   }
   assert.equal(field(render(undefined, { first_token_latency_ms: 0, attempt_duration_ms: 2531, latency_ms: 999 }), "下游响应阶段耗时"), "—");
+});
+
+test("客户端断开保留未测耗时的零哨兵，已知观测显示尝试开始至断开", () => {
+  const event = { error_class: "client_disconnected", upstream_timing: { http_send_started_ms: 1 } };
+  assert.equal(field(render({ ...event, upstream_latency_ms: 0 }), "尝试开始至断开"), "—");
+  assert.equal(field(render({ ...event, upstream_latency_ms: 301_149 }), "尝试开始至断开"), "301.15 s");
+  assert.equal(field(render({ upstream_latency_ms: 0 }), "本次上游耗时"), "—");
 });

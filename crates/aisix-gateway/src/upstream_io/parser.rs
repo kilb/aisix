@@ -50,13 +50,25 @@ enum Target {
     Content,
 }
 
+// 同一对象可能先写内容再写 type。每种载体占一位，不缓存正文。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentSlot {
+    Other = 0,
+    Thinking = 1,
+    Summary = 2,
+    ToolSearch = 4,
+    Patch = 8,
+    PatchDiff = 16,
+    Custom = 32,
+}
+
 #[derive(Clone, Copy)]
 struct Frame {
     array: bool,
     phase: u8,
     key: &'static str,
-    tool_search_call: bool,
-    nonempty_arguments_object: bool,
+    content_slot: Option<ContentSlot>,
+    observed_slots: u8,
 }
 
 struct Path<'a>(&'a [Frame]);
@@ -344,6 +356,9 @@ fn known_key(key: &str) -> &'static str {
         "tool_calls" => "tool_calls",
         "function" => "function",
         "function_call" => "function_call",
+        "custom" => "custom",
+        "operation" => "operation",
+        "diff" => "diff",
         "arguments" => "arguments",
         "type" => "type",
         "output" => "output",
@@ -429,8 +444,8 @@ struct JsonObserver {
     protocol: Protocol,
     sse: bool,
     request: bool,
-    // 仅原生 Responses SSE 等待首内容时需要识别结构化工具搜索参数。
-    observe_tool_search: bool,
+    // 仅等待原始 SSE 首内容时才匹配需要查看对象类型的槽。
+    observe_content_slots: bool,
     stack: Vec<Frame>,
     string: Option<JsonString>,
     primitive: Label,
@@ -447,7 +462,7 @@ impl JsonObserver {
             protocol,
             sse,
             request: false,
-            observe_tool_search: false,
+            observe_content_slots: false,
             stack: Vec::with_capacity(16),
             string: None,
             primitive: Label::default(),
@@ -500,6 +515,87 @@ impl JsonObserver {
             path.is(&["response", "output", "#", "type"])
         } else {
             path.is(&["output", "#", "type"])
+        }
+    }
+
+    fn note_content_slot(&mut self, string: &JsonString) {
+        let path = Path(&self.stack);
+        if path.last() == "type" {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.content_slot = Some(match string.label.text() {
+                    "thinking" => ContentSlot::Thinking,
+                    "reasoning" => ContentSlot::Summary,
+                    "tool_search_call" => ContentSlot::ToolSearch,
+                    "apply_patch_call" => ContentSlot::Patch,
+                    "create_file" | "update_file" => ContentSlot::PatchDiff,
+                    "custom" => ContentSlot::Custom,
+                    _ => ContentSlot::Other,
+                });
+            }
+            return;
+        }
+        if string.count.bytes == 0 {
+            return;
+        }
+        // Chat reasoning_part_slots 接受 thinking 字符串，或 thinking/summary 数组中每项的 text。
+        if self.protocol == Protocol::Chat {
+            if path.is(&[
+                "choices",
+                "#",
+                "delta",
+                "tool_calls",
+                "#",
+                "custom",
+                "input",
+            ]) {
+                self.stack[5].observed_slots |= ContentSlot::Custom as u8;
+            } else if path.is(&["choices", "#", "delta", "content", "#", "thinking"])
+                || path.is(&[
+                    "choices", "#", "delta", "content", "#", "thinking", "#", "text",
+                ])
+            {
+                self.stack[5].observed_slots |= ContentSlot::Thinking as u8;
+            } else if path.is(&[
+                "choices", "#", "delta", "content", "#", "summary", "#", "text",
+            ]) {
+                self.stack[5].observed_slots |= ContentSlot::Summary as u8;
+            }
+        } else if path.last() == "diff" {
+            if let Some(frame) = self.stack.last_mut() {
+                frame.observed_slots |= ContentSlot::PatchDiff as u8;
+            }
+        }
+    }
+
+    fn close_content_slot(&mut self, frame: Frame) {
+        if self.protocol == Protocol::Responses && !frame.array && frame.phase == 3 {
+            if let Some(parent) = self.stack.last_mut() {
+                match parent.key {
+                    "arguments" => parent.observed_slots |= ContentSlot::ToolSearch as u8,
+                    "operation"
+                        if frame.content_slot == Some(ContentSlot::PatchDiff)
+                            && frame.observed_slots & ContentSlot::PatchDiff as u8 != 0 =>
+                    {
+                        parent.observed_slots |= ContentSlot::Patch as u8;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Chat 自定义工具的续片可省略 type；只有确实带 custom.input 的调用能匹配。
+        let slot = frame.content_slot.unwrap_or(ContentSlot::Custom);
+        if frame.observed_slots & slot as u8 != 0 {
+            let path = Path(&self.stack);
+            self.event.content |= match slot {
+                ContentSlot::Thinking | ContentSlot::Summary | ContentSlot::Custom => {
+                    self.protocol == Protocol::Chat
+                }
+                ContentSlot::ToolSearch | ContentSlot::Patch => {
+                    self.protocol == Protocol::Responses
+                        && (path.is(&["item"]) || path.is(&["response", "output", "#"]))
+                }
+                _ => false,
+            };
         }
     }
 
@@ -876,9 +972,12 @@ impl JsonObserver {
         if self.invalid {
             return;
         }
-        if let Some(mut string) = self.string.take() {
+        if let Some(string) = &mut self.string {
             match string.byte(byte) {
                 Ok(true) => {
+                    // 字符串可跨整个网络块，闭合时才取出固定大小的解析状态。
+                    let string = string.clone();
+                    self.string = None;
                     if let Some(compact) = &mut self.compact {
                         compact.count.add(string.compact_count);
                         compact.count.character('"');
@@ -886,6 +985,9 @@ impl JsonObserver {
                     if string.key {
                         if let Some(frame) = self.stack.last_mut() {
                             frame.key = known_key(string.label.text());
+                            if self.observe_content_slots && frame.key == "type" {
+                                frame.content_slot = Some(ContentSlot::Other);
+                            }
                             frame.phase = 1;
                         } else {
                             self.invalid = true;
@@ -966,23 +1068,14 @@ impl JsonObserver {
                             // 新工具载体可能含有文字；未解释的槽不能成为完整的零。
                             self.event.incomplete = true;
                         }
-                        if string.metadata
-                            && self.observe_tool_search
-                            && path.last() == "type"
-                            && string.label.text() == "tool_search_call"
-                        {
-                            if let Some(item) = self.stack.last_mut() {
-                                item.tool_search_call = true;
-                            }
+                        if self.observe_content_slots {
+                            self.note_content_slot(&string);
                         }
                         self.value_done();
                     }
                 }
-                Ok(false) => self.string = Some(string),
-                Err(()) => {
-                    self.string = Some(string);
-                    self.invalid = true;
-                }
+                Ok(false) => {}
+                Err(()) => self.invalid = true,
             }
             return;
         }
@@ -1041,8 +1134,8 @@ impl JsonObserver {
                     array: byte == b'[',
                     phase: 0,
                     key: "",
-                    tool_search_call: false,
-                    nonempty_arguments_object: false,
+                    content_slot: None,
+                    observed_slots: 0,
                 });
             }
             b'}' | b']' => {
@@ -1060,20 +1153,8 @@ impl JsonObserver {
                     self.invalid = true;
                     return;
                 }
-                if self.observe_tool_search {
-                    if !frame.array && frame.phase == 3 {
-                        if let Some(item) =
-                            self.stack.last_mut().filter(|item| item.key == "arguments")
-                        {
-                            item.nonempty_arguments_object = true;
-                        }
-                    }
-                    // 在同一 item 闭合时合并两个字段，使首内容判定与键序无关。
-                    if frame.tool_search_call && frame.nonempty_arguments_object {
-                        let path = Path(&self.stack);
-                        self.event.content |=
-                            path.is(&["item"]) || path.is(&["response", "output", "#"]);
-                    }
+                if self.observe_content_slots {
+                    self.close_content_slot(frame);
                 }
                 if let Some(compact) = &mut self.compact {
                     compact.count.character(char::from(byte));
@@ -1210,7 +1291,7 @@ impl JsonObserver {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LineKind {
-    Prefix,
+    Prefix(&'static [u8]),
     DataStart,
     Data,
     Ignore,
@@ -1284,7 +1365,6 @@ pub(super) struct ResponseObserver {
     sse: bool,
     json: JsonObserver,
     line_kind: LineKind,
-    line_prefix: Label,
     line_nonempty: bool,
     event_data: bool,
     payload_started: bool,
@@ -1315,8 +1395,7 @@ impl ResponseObserver {
             protocol,
             sse,
             json: JsonObserver::new(protocol, sse),
-            line_kind: LineKind::Prefix,
-            line_prefix: Label::default(),
+            line_kind: LineKind::Prefix(b"\xef\xbb\xbfdata:"),
             line_nonempty: false,
             event_data: false,
             payload_started: false,
@@ -1362,6 +1441,9 @@ impl ResponseObserver {
                 .iter()
                 .position(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'));
             let prefix_len = first.unwrap_or(bytes.len());
+            if prefix_len != 0 || first.is_some_and(|offset| bytes[offset] != 0xef) {
+                self.line_kind = LineKind::Prefix(b"data:");
+            }
             self.leading_horizontal_whitespace |= bytes[..prefix_len]
                 .iter()
                 .any(|byte| matches!(byte, b' ' | b'\t'));
@@ -1371,7 +1453,8 @@ impl ResponseObserver {
             // typed 路径按实际正文选择 JSON/SSE；上游 MIME 可能只是 text/plain。
             self.sse = !matches!(bytes[first], b'{' | b'[');
             self.json.sse = self.sse;
-            self.json.observe_tool_search = self.sse && self.protocol == Protocol::Responses;
+            self.json.observe_content_slots =
+                self.sse && matches!(self.protocol, Protocol::Chat | Protocol::Responses);
             self.partial |= self.sse && self.leading_horizontal_whitespace;
             self.wire_detected = true;
             &bytes[first..]
@@ -1393,30 +1476,24 @@ impl ResponseObserver {
             if matches!(*byte, b'\r' | b'\n') {
                 if !self.line_nonempty {
                     self.end_event();
+                } else if self.line_kind == LineKind::Prefix(b":") {
+                    // 无冒号的 data 字段也贡献一行空数据。
+                    self.start_data_line();
                 }
-                self.line_kind = LineKind::Prefix;
-                self.line_prefix = Label::default();
+                self.line_kind = LineKind::Prefix(b"data:");
                 self.line_nonempty = false;
                 continue;
             }
             self.line_nonempty = true;
             match self.line_kind {
-                LineKind::Prefix => {
-                    if *byte == b':' {
-                        if self.line_prefix.text() == "data" {
-                            if self.event_data {
-                                self.payload(b'\n');
-                            }
-                            self.event_data = true;
-                            self.line_kind = LineKind::DataStart;
-                        } else {
-                            self.line_kind = LineKind::Ignore;
-                        }
+                LineKind::Prefix(prefix) => {
+                    if *byte != prefix[0] {
+                        self.line_kind = LineKind::Ignore;
+                    } else if prefix.len() == 1 {
+                        self.start_data_line();
+                        self.line_kind = LineKind::DataStart;
                     } else {
-                        self.line_prefix.character(char::from(*byte));
-                        if self.line_prefix.len > 8 {
-                            self.line_kind = LineKind::Ignore;
-                        }
+                        self.line_kind = LineKind::Prefix(&prefix[1..]);
                     }
                 }
                 LineKind::DataStart => {
@@ -1429,6 +1506,13 @@ impl ResponseObserver {
                 LineKind::Ignore => {}
             }
         }
+    }
+
+    fn start_data_line(&mut self) {
+        if self.event_data {
+            self.payload(b'\n');
+        }
+        self.event_data = true;
     }
 
     fn payload(&mut self, byte: u8) {
@@ -1474,7 +1558,7 @@ impl ResponseObserver {
         self.invalid |= !valid;
         if self.first_sse_content.is_none() && self.sse && !self.external_events && valid {
             let content = match self.protocol {
-                Protocol::Chat | Protocol::Completions => event.primary.bytes != 0,
+                Protocol::Chat | Protocol::Completions => event.primary.bytes != 0 || event.content,
                 Protocol::Messages => {
                     matches!(
                         event.kind.text(),
@@ -1483,6 +1567,7 @@ impl ResponseObserver {
                 }
                 Protocol::Responses => match event.kind.text() {
                     "response.output_text.delta"
+                    | "response.audio.transcript.delta"
                     | "response.refusal.delta"
                     | "response.reasoning_text.delta"
                     | "response.reasoning_summary_text.delta"
@@ -1513,7 +1598,7 @@ impl ResponseObserver {
             };
             if content {
                 self.first_sse_content = Some(Instant::now());
-                self.json.observe_tool_search = false;
+                self.json.observe_content_slots = false;
             }
         }
         if self.protocol == Protocol::Realtime {
@@ -1836,6 +1921,135 @@ mod tests {
             observer.feed(&[*byte]);
         }
         observer.finish(true)
+    }
+
+    fn observe_content_event(
+        protocol: Protocol,
+        event: &Value,
+        expected: bool,
+        bytes: Option<u64>,
+    ) {
+        let mut observer = ResponseObserver::new(protocol, false);
+        observer.feed(format!("data: {event}\n\n").as_bytes());
+        assert_eq!(
+            observer.first_sse_content_at().is_some(),
+            expected,
+            "{event}"
+        );
+        assert_eq!(
+            observer.finish(true).map(|count| count.utf8_bytes),
+            bytes,
+            "{event}"
+        );
+    }
+
+    #[test]
+    fn raw_chat_content_matches_typed_reasoning_and_custom_tool_input() {
+        use serde_json::json;
+        for (delta, expected) in [
+            (
+                json!({"content":[{"type":"thinking","thinking":"step"}]}),
+                true,
+            ),
+            (
+                json!({"content":[{"type":"thinking","thinking":[{"type":"text","text":"step"}]}]}),
+                true,
+            ),
+            (
+                json!({"content":[{"type":"reasoning","summary":[{"type":"summary_text","text":"step"}]}]}),
+                true,
+            ),
+            (
+                json!({"content":[{"type":"redacted_thinking","thinking":"opaque"}]}),
+                false,
+            ),
+            (
+                json!({"content":[{"type":"thinking","summary":[{"text":"wrong slot"}]}]}),
+                false,
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"type":"custom","custom":{"input":"first"}}]}),
+                true,
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"custom":{"input":"continuation"}}]}),
+                true,
+            ),
+            (
+                json!({"tool_calls":[{"index":0,"type":"function","custom":{"input":"wrong slot"}}]}),
+                false,
+            ),
+        ] {
+            observe_content_event(
+                Protocol::Chat,
+                &json!({"choices":[{"delta":delta}]}),
+                expected,
+                Some(0),
+            );
+        }
+    }
+
+    #[test]
+    fn raw_responses_content_matches_audio_transcripts_and_patch_diffs() {
+        use serde_json::json;
+        let patch = |kind, op, diff| json!({"type":kind,"operation":{"type":op,"diff":diff}});
+        let item = |item: Value| json!({"type":"response.output_item.done","item":item});
+        for (event, expected) in [
+            (
+                json!({"type":"response.audio.transcript.delta","delta":"spoken"}),
+                true,
+            ),
+            (
+                json!({"type":"response.audio.delta","delta":"base64"}),
+                false,
+            ),
+            (item(patch("apply_patch_call", "update_file", "diff")), true),
+            (
+                item(patch("unrecognized_tool", "update_file", "diff")),
+                false,
+            ),
+            (
+                item(patch("apply_patch_call", "delete_file", "diff")),
+                false,
+            ),
+            (item(patch("apply_patch_call", "update_file", "")), false),
+        ] {
+            observe_content_event(Protocol::Responses, &event, expected, None);
+        }
+        let snapshot = json!({"type":"response.completed","response":{"output":[patch("apply_patch_call","create_file","diff")]}});
+        observe_content_event(Protocol::Responses, &snapshot, true, Some(0));
+    }
+
+    #[test]
+    fn empty_data_field_completes_a_protocol_frame_without_content() {
+        for line_end in ["\n", "\r", "\r\n"] {
+            let mut observer = ResponseObserver::new(Protocol::Chat, false);
+            observer.feed(format!("datax{line_end}{line_end}data{line_end}").as_bytes());
+            assert!(observer.first_sse_frame_at().is_none());
+            observer.feed(line_end.as_bytes());
+            let first = observer
+                .first_sse_frame_at()
+                .expect("complete empty data event");
+            assert!(observer.first_sse_content_at().is_none());
+            observer.feed(
+                b"data: {\"choices\":\ndata\ndata: [{\"delta\":{\"content\":\"later\"}}]}\n\n",
+            );
+            assert_eq!(observer.first_sse_frame_at(), Some(first));
+            assert!(observer.first_sse_content_at().is_some());
+        }
+    }
+
+    #[test]
+    fn leading_utf8_bom_before_data_survives_any_split() {
+        let wire = b"\xef\xbb\xbfdata: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\r\n\r\n";
+        for width in 1..=wire.len() {
+            let mut observer = ResponseObserver::new(Protocol::Chat, false);
+            for part in wire.chunks(width) {
+                observer.feed(part);
+            }
+            assert!(observer.first_sse_content_at().is_some(), "{width}");
+            assert_eq!(observer.finish(true).unwrap().utf8_bytes, 5);
+        }
     }
 
     #[test]

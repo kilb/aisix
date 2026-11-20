@@ -2495,6 +2495,7 @@ fn record_recovered_first_frame(
 /// 一个 outer body poll 内暂存的最终发布；不复制请求的资源快照。
 /// 取消去重和终态副作用已经发生，锁外发布时只补交付边界测得的新字段。
 pub(crate) struct PendingUsage {
+    metrics: Arc<aisix_obs::Metrics>,
     upstream_timing: Option<aisix_gateway::response_tap::HttpTimingObserver>,
     sink: aisix_obs::UsageSink,
     fan_out: aisix_obs::OtlpHttpFanOut,
@@ -2513,14 +2514,12 @@ pub(crate) struct PendingUsage {
 impl PendingUsage {
     pub(crate) fn deliver(mut self) {
         // inner poll 的 stream span 已退出；发布日志必须重新挂回原请求。
-        self.event.first_token_latency_ms = self
-            .token_terminal
-            .then(crate::attribution::first_token_latency_ms)
-            .flatten();
-        stamp_http_timing(
+        stamp_delivery_timing(
             &mut self.event,
             self.upstream_timing.as_ref(),
             self.token_terminal,
+            self.surface,
+            &self.metrics,
         );
         self.publish();
     }
@@ -2572,13 +2571,9 @@ fn deliver_usage(
     upstream_timing: Option<aisix_gateway::response_tap::HttpTimingObserver>,
 ) {
     let token_terminal = event.is_final_attempt && crate::first_token::token_surface(surface);
-    event.first_token_latency_ms = if token_terminal {
-        crate::attribution::first_token_latency_ms()
-    } else {
-        None
-    };
     if token_terminal && crate::attribution::body_poll_in_progress() {
         let pending = PendingUsage {
+            metrics: state.metrics.clone(),
             upstream_timing,
             sink: state.usage_sink.clone(),
             fan_out: state.otlp_fan_out.clone(),
@@ -2604,7 +2599,13 @@ fn deliver_usage(
         crate::attribution::defer_body_usage(pending);
         return;
     }
-    stamp_http_timing(&mut event, upstream_timing.as_ref(), token_terminal);
+    stamp_delivery_timing(
+        &mut event,
+        upstream_timing.as_ref(),
+        token_terminal,
+        surface,
+        &state.metrics,
+    );
     let event = delivery.publish(&state.usage_sink, surface.handler, event, labels);
     if !matches!(delivery, UsageDelivery::ControlPlaneOnly) && !exporters.is_empty() {
         state.otlp_fan_out.fan_out(
@@ -2618,11 +2619,16 @@ fn deliver_usage(
     }
 }
 
-fn stamp_http_timing(
+fn stamp_delivery_timing(
     event: &mut UsageEvent,
     timing: Option<&aisix_gateway::response_tap::HttpTimingObserver>,
     token_terminal: bool,
+    surface: Surface,
+    metrics: &aisix_obs::Metrics,
 ) {
+    event.first_token_latency_ms = token_terminal
+        .then(crate::attribution::first_token_latency_ms)
+        .flatten();
     if let Some(timing) = timing {
         // 仅最终交换拥有交付内容；保存实际 Instant 后减各自 attempt 起点。
         if token_terminal {
@@ -2632,6 +2638,23 @@ fn stamp_http_timing(
         }
         event.upstream_timing = timing.snapshot();
     }
+    if !token_terminal {
+        return;
+    }
+    let endpoint = match surface {
+        crate::operation::CHAT => "/v1/chat/completions",
+        crate::operation::COMPLETIONS => "/v1/completions",
+        crate::operation::MESSAGES => "/v1/messages",
+        crate::operation::RESPONSES => "/v1/responses",
+        _ => return,
+    };
+    metrics.record_first_content(
+        endpoint,
+        event
+            .upstream_timing
+            .and_then(|sample| sample.upstream_first_content_ms),
+        event.first_token_latency_ms,
+    );
 }
 
 /// `gateway_overhead_ms` on the event that carries `downstream_latency_ms`,

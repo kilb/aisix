@@ -11,6 +11,8 @@ import { callGateway } from "../harness/cp-upstream.js";
 const OWNER = { email: "owner@ledger-e2e.test", password: "ledger-e2e-owner-5d2" };
 /** How long a charge may take to reach the ledger. */
 const WITHIN_MS = 15_000;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const BEIJING_UTC_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 describe("a tenant reads its ledger and its daily totals", () => {
   let world: BillingWorld | undefined;
@@ -72,22 +74,24 @@ describe("a tenant reads its ledger and its daily totals", () => {
   });
 
   test("Today's summary adds them up", async () => {
-    // The day the debits were posted on, read from the ledger itself, so a
-    // run across 00:00 UTC still asks for the right day.
+    // 以第一笔扣费入账的北京时间日期为准，即使测试跨过午夜也能查到正确的一天。
     const posted = await entries(2);
-    const day = new Date(posted[0].posted_at);
-    day.setUTCHours(0, 0, 0, 0);
-    const from = day.toISOString();
-    const to = new Date(day.getTime() + 86_400_000).toISOString();
+    const beijingDay = new Date(Date.parse(posted[0].posted_at) + BEIJING_UTC_OFFSET_MS);
+    beijingDay.setUTCHours(0, 0, 0, 0);
+    const dayStart = beijingDay.getTime() - BEIJING_UTC_OFFSET_MS;
+    const dayEnd = dayStart + DAY_MS;
+    const from = new Date(dayStart).toISOString();
+    const to = new Date(dayEnd).toISOString();
     const res = await owner.get(`/api/billing/summary?group=day&from=${from}&to=${to}`);
     expect(res.status, res.text).toBe(200);
-    // Both debits are in the one period when they share a day; when the run
-    // crossed midnight the first day holds only the first, and the totals
-    // still have to match the entries of that day.
-    const sameDay = posted.filter((e) => Date.parse(e.posted_at) < day.getTime() + 86_400_000);
+    // 若两笔扣费跨过北京时间午夜，第一天的汇总只应包含第一笔。
+    const sameDay = posted.filter((e) => {
+      const postedAt = Date.parse(e.posted_at);
+      return postedAt >= dayStart && postedAt < dayEnd;
+    });
     expect(res.body.items).toHaveLength(1);
     const row = res.body.items[0];
-    expect(Date.parse(row.period_start)).toBe(day.getTime());
+    expect(Date.parse(row.period_start)).toBe(dayStart);
     expect(row.usage_micro_cny).toBe(-sameDay.length * CALL_MICRO_CNY);
     expect(row.closing_balance_micro_cny).toBe(-sameDay.length * CALL_MICRO_CNY);
   });

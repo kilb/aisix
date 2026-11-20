@@ -5,6 +5,7 @@ use axum::extract::{Query, State};
 use axum::Json;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::auth::{OperatorAuth, OperatorRole};
 use crate::db::DbError;
@@ -37,6 +38,22 @@ pub struct ProfitTotals {
 pub struct ProfitResponse {
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
+    totals: ProfitTotals,
+    accounts: Option<Vec<AccountProfit>>,
+}
+
+#[derive(Serialize)]
+struct AccountProfit {
+    provider_key_id: Uuid,
+    provider_key_display_name: Option<String>,
+    totals: ProfitTotals,
+}
+
+#[derive(sqlx::FromRow)]
+struct SummaryRow {
+    provider_key_id: Option<Uuid>,
+    provider_key_display_name: Option<String>,
+    #[sqlx(flatten)]
     totals: ProfitTotals,
 }
 
@@ -87,11 +104,13 @@ pub async fn get(
         .execute(&mut *tx)
         .await
         .map_err(DbError::from)?;
-    let ready: bool =
-        sqlx::query_scalar("SELECT complete FROM billing_profit_backfill WHERE version = 1")
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(DbError::from)?;
+    let (ready, accounts_ready): (bool, bool) = sqlx::query_as(
+        "SELECT complete, (SELECT complete FROM billing_profit_backfill WHERE version = 2) \
+         FROM billing_profit_backfill WHERE version = 1",
+    )
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(DbError::from)?;
     if !ready {
         return Err(catching_up());
     }
@@ -104,20 +123,37 @@ pub async fn get(
     if pending.len() > MAX_PENDING {
         return Err(catching_up());
     }
-    let totals = sqlx::query_as(SUMMARY_SQL)
+    let mut rows = sqlx::query_as::<_, SummaryRow>(SUMMARY_SQL)
         .bind(q.from)
         .bind(q.to)
         .bind(whole_from)
         .bind(whole_to)
         .bind(&pending)
+        .bind(accounts_ready)
         .persistent(false)
-        .fetch_one(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map_err(DbError::from)?;
+        .map_err(DbError::from)?
+        .into_iter();
     tx.commit().await.map_err(DbError::from)?;
+    // 查询以全站总计开头，即使窗口内没有记录也会返回这行。
+    let total = rows
+        .next()
+        .ok_or_else(|| DbError::from(sqlx::Error::RowNotFound))?;
+    let accounts = accounts_ready.then(|| {
+        rows.filter_map(|row| {
+            row.provider_key_id.map(|id| AccountProfit {
+                provider_key_id: id,
+                provider_key_display_name: row.provider_key_display_name,
+                totals: row.totals,
+            })
+        })
+        .collect()
+    });
     Ok(Json(ProfitResponse {
         from: q.from,
         to: q.to,
-        totals,
+        totals: total.totals,
+        accounts,
     }))
 }

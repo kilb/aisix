@@ -325,7 +325,7 @@ for (const width of [1440, 390]) {
     const eventId = call!.event_id, filter = `calls?event_id=${encodeURIComponent(eventId)}`;
     const filteredRead = page.waitForResponse(response => isCallList(response, eventId)); await navigate(page, filter); expect((await filteredRead).status()).toBe(200);
     const link = page.getByRole("link", { name: `查看调用日志 ${eventId}`, exact: true }), row = page.getByRole("row").filter({ has: link });
-    await expect(row).toHaveCount(1); await checkDuration(field(row, "首字"), call!.first_token_latency_ms); await checkThroughput(field(row, "输出 TPS"), call!);
+    await expect(row).toHaveCount(1); await checkDuration(field(row, "请求首内容"), call!.first_token_latency_ms); await checkThroughput(field(row, "输出 TPS"), call!);
     await expect(field(row, "输出 TPS").locator("xpath=..")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
     await expect(row.getByText(estimate(call!), { exact: true })).toBeVisible();
     const fee = await row.locator("td").filter({ has: page.getByText("售价", { exact: true }) }).innerText();
@@ -340,7 +340,7 @@ for (const width of [1440, 390]) {
     const detailQuery = new URLSearchParams(new URL(page.url()).hash.split("?")[1]); expect(detailQuery.get("event_id")).toBe(eventId); expect(detailQuery.get("detail")).toBe(eventId);
     await expect(page.getByRole("table", { name: "计费明细", exact: true })).toBeHidden();
     const performance = page.getByRole("region", { name: "时间与性能", exact: true });
-    await checkDuration(field(performance, "首 Token 延迟"), typeof stored.event.first_token_latency_ms === "number" ? stored.event.first_token_latency_ms : call!.first_token_latency_ms);
+    await checkDuration(field(performance, "请求首内容"), typeof stored.event.first_token_latency_ms === "number" ? stored.event.first_token_latency_ms : call!.first_token_latency_ms);
     await checkThroughput(field(performance, "输出 TPS"), call!);
     await expect(field(performance, "输出 TPS").locator("xpath=preceding-sibling::dt[1]")).toHaveAttribute("title", OUTPUT_TPS_TITLE);
     const message = stored.event.error_message ?? call!.error_message; expect(typeof message).toBe("string"); expect((message as string).length).toBeGreaterThan(0);

@@ -13,7 +13,7 @@ import { ChargeCheck } from "../tabs/billing/Charges";
 import { RequestTimingDetails } from "./RequestTimingDetails";
 import { UpstreamTimingDetails } from "./UpstreamTimingDetails";
 import { UsageIoAuditDetails } from "./UsageIoAuditDetails";
-import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, UsagePerformance, formatThroughput } from "./UsagePerformance";
+import { ESTIMATED_THROUGHPUT_NOTE, OUTPUT_THROUGHPUT_NOTE, UsagePerformance, attemptDurationLabel, formatAttemptDuration, formatThroughput } from "./UsagePerformance";
 import { Card, CardHeader, PageHeader } from "./page";
 import "./CallLogDetails.css";
 
@@ -196,8 +196,8 @@ export function CallLogDetails({ eventId, backHref }: { eventId: string; backHre
           <Fields items={[
             ["完成时间", timeValue(stored?.occurred_at ?? charge?.occurred_at)],
             ["接收时间", timeValue(stored?.received_at)],
-            ["首 Token 延迟", formatDuration(numberValue(event?.first_token_latency_ms ?? charge?.first_token_latency_ms))],
-            ["上游尝试耗时", formatDuration(numberValue(event?.upstream_latency_ms ?? charge?.attempt_duration_ms))],
+            ["请求首内容", formatDuration(numberValue(event?.first_token_latency_ms ?? charge?.first_token_latency_ms)), "请求到达到网关首次交付生成内容，包含读取请求体和先前尝试的时间"],
+            [attemptDurationLabel(event?.error_class ?? charge?.error_class, event?.upstream_timing ?? charge?.upstream_timing), formatAttemptDuration(numberValue(event?.upstream_latency_ms ?? charge?.attempt_duration_ms))],
             ["下游响应阶段耗时", formatDuration(numberValue(event?.downstream_latency_ms)), DOWNSTREAM_TIMING_NOTE],
             ["上游首帧延迟", formatDuration(numberValue(event?.upstream_ttft_ms))],
             ["输出 TPS", formatThroughput(charge), OUTPUT_THROUGHPUT_NOTE],

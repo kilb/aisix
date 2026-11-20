@@ -23,7 +23,9 @@
 //! recorded here — it never had a response. It is counted by
 //! `aisix_proxy_client_cancelled_requests_total` alone.
 //!
-//! Time to first token is `aisix_request_ttft_seconds`; the SLO view of the same
+//! First frame uses the legacy `aisix_request_ttft_seconds` name. The first
+//! generated content is `aisix_request_first_content_seconds` and is recorded
+//! with terminal usage. The SLO view of the same
 //! whole-request duration is `aisix_request_e2e_latency_seconds`, whose
 //! `downstream` side is recorded by the same emit as the request families
 //! (every route but `/v1/realtime`), so a route that counts its requests
@@ -771,7 +773,7 @@ impl PendingRequestMetrics {
     }
 }
 
-/// Record a streamed response's time to first token — both sides, on
+/// Record a streamed response's first-frame latency on both legacy metrics,
 /// `aisix_request_ttft_seconds` and `aisix_llm_time_to_first_token_seconds`
 /// — under the same bounded labels the end-to-end latency histogram uses.
 pub(crate) fn record_stream_ttft(

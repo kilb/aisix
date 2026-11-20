@@ -27,7 +27,8 @@ use futures::StreamExt;
 use serde_json::Value;
 
 use crate::bridge::{
-    auth_headers, capability_id, is_arn, strip_region_prefix, BedrockSecret, RequestAuth,
+    auth_headers, capability_id, is_arn, strip_region_prefix, within_attempt, BedrockSecret,
+    RequestAuth,
 };
 
 const CHAT_COMPLETIONS_PATH: &str = "/openai/v1/chat/completions";
@@ -380,13 +381,13 @@ pub(crate) struct Endpoint {
     pub credentials_http: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 }
 
-async fn send(
+async fn prepare_request(
     endpoint: &Endpoint,
     req: Cow<'_, ChatFormat>,
     ctx: &BridgeContext,
     model_id: &str,
     stream: bool,
-) -> Result<(reqwest::Response, Instant, Option<Duration>), BridgeError> {
+) -> Result<(reqwest::RequestBuilder, Option<Duration>), BridgeError> {
     let (req, deadline) = inline_remote_images(req, ctx).await?;
     let body = {
         let messages = messages_from(&req, DeveloperRoleMode::Preserve);
@@ -447,25 +448,33 @@ async fn send(
         .request_auth_with_http(ctx.deadline, endpoint.credentials_http.clone())
         .await?;
     let headers = authenticated_headers(&auth, endpoint.creds.region(), &url_text, headers, &body)?;
-    let started = Instant::now();
-    let client = endpoint.client.clone();
-    let resp = with_deadline(deadline, started, async move {
-        aisix_gateway::upstream_io::send(
-            url.post_on(&client).headers(headers).body(body),
-            aisix_gateway::upstream_io::Protocol::Chat,
-        )
+    Ok((
+        url.post_on(&endpoint.client).headers(headers).body(body),
+        deadline,
+    ))
+}
+
+async fn send_request(request: reqwest::RequestBuilder) -> Result<reqwest::Response, BridgeError> {
+    aisix_gateway::upstream_io::send(request, aisix_gateway::upstream_io::Protocol::Chat)
         .await
         .map_err(aisix_gateway::send_error)
-    })
-    .await?;
+}
+
+async fn successful_response(
+    resp: reqwest::Response,
+    started: Instant,
+    error_deadline: Option<Duration>,
+) -> Result<reqwest::Response, BridgeError> {
     aisix_gateway::note_upstream_response(resp.headers());
     if !resp.status().is_success() {
         return Err(
-            aisix_gateway::upstream_error_within(deadline, resp, |resp| http_error(resp, started))
-                .await,
+            aisix_gateway::upstream_error_within(error_deadline, resp, |resp| {
+                http_error(resp, started)
+            })
+            .await,
         );
     }
-    Ok((resp, started, deadline))
+    Ok(resp)
 }
 
 pub(crate) async fn chat(
@@ -473,15 +482,34 @@ pub(crate) async fn chat(
     req: Cow<'_, ChatFormat>,
     ctx: &BridgeContext,
     model_id: &str,
+    attempt_started: Instant,
 ) -> Result<ChatResponse, BridgeError> {
-    let (resp, started, deadline) = send(&endpoint, req, ctx, model_id, false).await?;
-    let request_id = request_id_header(resp.headers());
-    // The body read gets what is left of the one budget, not a fresh one.
-    let left = deadline.map(|d| d.saturating_sub(started.elapsed()));
-    let parsed: OpenAiResponse = with_deadline(left, started, async {
-        aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
-    })
+    let (request, _) = within_attempt(
+        ctx.deadline,
+        attempt_started,
+        prepare_request(&endpoint, req, ctx, model_id, false),
+    )
     .await?;
+    let started = Instant::now();
+    // 预处理和 HTTP 交换共享原始预算，成功响应头到达后由交换自身判定超时。
+    let remaining = ctx
+        .deadline
+        .map(|budget| budget.saturating_sub(attempt_started.elapsed()));
+    let (parsed, request_id): (OpenAiResponse, _) =
+        aisix_gateway::upstream_http::with_buffered_response_deadline(
+            remaining,
+            attempt_started,
+            send_request(request),
+            |resp| async {
+                let resp = successful_response(resp, started, None).await?;
+                let request_id = request_id_header(resp.headers());
+                let parsed =
+                    aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
+                        .await?;
+                Ok((parsed, request_id))
+            },
+        )
+        .await?;
     let mut chat = response_into_chat_response(parsed);
     if chat.id.is_empty() {
         chat.id = request_id;
@@ -500,7 +528,10 @@ pub(crate) async fn chat_stream(
     ctx: &BridgeContext,
     model_id: &str,
 ) -> Result<ChatChunkStream, BridgeError> {
-    let (resp, _, _) = send(&endpoint, req, ctx, model_id, true).await?;
+    let (request, deadline) = prepare_request(&endpoint, req, ctx, model_id, true).await?;
+    let started = Instant::now();
+    let resp = with_deadline(deadline, started, send_request(request)).await?;
+    let resp = successful_response(resp, started, deadline).await?;
     let request_id = request_id_header(resp.headers());
     let byte_stream = resp.bytes_stream();
     let stream = async_stream::try_stream! {

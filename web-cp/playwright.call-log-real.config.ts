@@ -6,7 +6,7 @@ for (const name of ["REFINED_QA_SESSION", "REFINED_QA_OUTPUT"]) {
   if (!process.env[name]) throw new Error(`${name} is required for real call-log E2E`);
 }
 export default defineConfig({
-  testDir: "./e2e-real", testMatch: "call-log.spec.ts", workers: 1, retries: 0,
+  testDir: "./e2e-real", testMatch: process.env.CALL_LOG_QA_CANCEL_CASE ? "call-cancel-timing.spec.ts" : "call-log.spec.ts", workers: 1, retries: 0,
   timeout: 40_000, expect: { timeout: 6_000 },
   outputDir: resolve(process.env.REFINED_QA_OUTPUT!, "call-log-artifacts"),
   reporter: [["list"], ["json", { outputFile: resolve(process.env.REFINED_QA_OUTPUT!, "call-log-playwright.json") }]],

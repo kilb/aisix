@@ -9,6 +9,11 @@
 //! added/done 正文与后续 delta 共同组成可见输出：
 //! https://github.com/openai/openai-python/blob/141a89aa7fbb7f13a979bda930831a5fe38bc3a4/src/openai/lib/streaming/responses/_responses.py#L397-L430
 //! 客户端工具搜索可携带非空对象参数，见 https://developers.openai.com/api/docs/guides/tools-tool-search
+//! MCP 工具的开始帧可携带输入：
+//! https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/beta/beta_mcp_tool_use_block.py
+//! 音频转写与补丁正文：
+//! https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_audio_transcript_delta_event.py
+//! https://github.com/openai/openai-python/blob/main/src/openai/types/responses/response_apply_patch_tool_call.py
 
 use std::time::Instant;
 
@@ -145,6 +150,13 @@ fn response_item_has_content(item: &Value) -> bool {
             .is_some_and(|args| !args.is_empty()),
         Some("custom_tool_call") => nonempty(&item["input"]),
         Some("code_interpreter_call") => nonempty(&item["code"]),
+        Some("apply_patch_call") => {
+            let operation = &item["operation"];
+            matches!(
+                operation["type"].as_str(),
+                Some("create_file" | "update_file")
+            ) && nonempty(&operation["diff"])
+        }
         _ => false,
     }
 }
@@ -170,11 +182,14 @@ fn has_content(wire: Wire, frame: &[u8]) -> bool {
                 any_nonempty(
                     delta,
                     &["content", "reasoning_content", "reasoning", "refusal"],
-                ) || nonempty(&delta["function_call"]["arguments"])
+                ) || nonempty(&delta["audio"]["transcript"])
+                    || nonempty(&delta["function_call"]["arguments"])
                     || delta["tool_calls"].as_array().is_some_and(|calls| {
-                        calls
-                            .iter()
-                            .any(|call| nonempty(&call["function"]["arguments"]))
+                        calls.iter().any(|call| {
+                            nonempty(&call["function"]["arguments"])
+                                || (nonempty(&call["custom"]["input"])
+                                    && call.get("type").is_none_or(|kind| kind == "custom"))
+                        })
                     })
             })
         }),
@@ -188,16 +203,23 @@ fn has_content(wire: Wire, frame: &[u8]) -> bool {
                 Some("input_json_delta") => nonempty(&value["delta"]["partial_json"]),
                 _ => false,
             },
-            Some("content_block_start") => match value["content_block"]["type"].as_str() {
-                Some("text") => nonempty(&value["content_block"]["text"]),
-                Some("thinking") => nonempty(&value["content_block"]["thinking"]),
-                _ => false,
-            },
+            Some("content_block_start") => {
+                let block = &value["content_block"];
+                match block["type"].as_str() {
+                    Some("text") => nonempty(&block["text"]),
+                    Some("thinking") => nonempty(&block["thinking"]),
+                    Some("tool_use" | "server_tool_use" | "mcp_tool_use") => block["input"]
+                        .as_object()
+                        .is_some_and(|input| !input.is_empty()),
+                    _ => false,
+                }
+            }
             _ => false,
         },
         Wire::Responses => match value["type"].as_str() {
             Some(
                 "response.output_text.delta"
+                | "response.audio.transcript.delta"
                 | "response.refusal.delta"
                 | "response.reasoning_text.delta"
                 | "response.reasoning_summary_text.delta"
@@ -417,6 +439,91 @@ mod tests {
                 None,
                 "状态、空占位、加密内容和错误不能计时: {value}"
             );
+        }
+    }
+
+    #[test]
+    fn transcripts_and_native_tool_inputs_count_at_delivery() {
+        for (wire, value) in [
+            (
+                Wire::Chat,
+                json!({"choices":[{"delta":{"audio":{"transcript":"first"}}}]}),
+            ),
+            (
+                Wire::Chat,
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"custom":{"input":"first"}}]}}]}),
+            ),
+            (
+                Wire::Messages,
+                json!({"type":"content_block_start","content_block":{"type":"tool_use","input":{"a":1}}}),
+            ),
+            (
+                Wire::Messages,
+                json!({"type":"content_block_start","content_block":{"type":"server_tool_use","input":{"query":"first"}}}),
+            ),
+            (
+                Wire::Messages,
+                json!({"type":"content_block_start","content_block":{"type":"mcp_tool_use","name":"lookup","server_name":"mcp","input":{"q":"first"}}}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.audio.transcript.delta","delta":"first"}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.output_item.done","item":{"type":"apply_patch_call","operation":{"type":"update_file","diff":"+first"}}}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.completed","response":{"output":[{"type":"apply_patch_call","operation":{"type":"create_file","diff":"+first"}}]}}),
+            ),
+        ] {
+            let mut observer = Observer::new(wire, Instant::now());
+            let bytes = event(value.clone());
+            for byte in &bytes[..bytes.len() - 2] {
+                observer.feed(std::slice::from_ref(byte));
+            }
+            assert!(observer.first_content_at().is_none(), "{value}");
+            observer.feed(&bytes[bytes.len() - 2..]);
+            assert!(observer.first_content_at().is_some(), "{value}");
+        }
+    }
+
+    #[test]
+    fn tool_identities_and_audio_metadata_stay_unmeasured() {
+        for (wire, value) in [
+            (
+                Wire::Chat,
+                json!({"choices":[{"delta":{"audio":{"data":"AA==","expires_at":5}}}]}),
+            ),
+            (
+                Wire::Chat,
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"custom":{"name":"run","input":""}}]}}]}),
+            ),
+            (
+                Wire::Messages,
+                json!({"type":"content_block_start","content_block":{"type":"tool_use","input":{}}}),
+            ),
+            (
+                Wire::Messages,
+                json!({"type":"content_block_start","content_block":{"type":"web_search_tool_result","input":{"url":"result"}}}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.audio.transcript.done"}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.output_item.added","item":{"type":"apply_patch_call","operation":{"type":"update_file","diff":""}}}),
+            ),
+            (
+                Wire::Responses,
+                json!({"type":"response.output_item.added","item":{"type":"other","operation":{"diff":"+metadata"}}}),
+            ),
+        ] {
+            let mut observer = Observer::new(wire, Instant::now());
+            observer.feed(&event(value.clone()));
+            assert!(observer.first_content_at().is_none(), "{value}");
         }
     }
 

@@ -66,6 +66,7 @@ pub(crate) fn observe_native_event(io: &UpstreamIoObserver, bytes: &[u8]) {
 pub(crate) struct UpstreamIoInterceptor {
     protocol: Protocol,
     io: Arc<OnceLock<UpstreamIoObserver>>,
+    response_status: Arc<OnceLock<u16>>,
     input: Option<TextMeasurement>,
 }
 
@@ -74,8 +75,16 @@ impl UpstreamIoInterceptor {
         Self {
             protocol,
             io: Arc::new(OnceLock::new()),
+            response_status: Arc::new(OnceLock::new()),
             input: None,
         }
+    }
+
+    pub(crate) fn success_status(&self) -> Option<u16> {
+        self.response_status
+            .get()
+            .copied()
+            .filter(|status| (200..300).contains(status))
     }
 
     pub(crate) fn with_model_input(mut self, input: &serde_json::Value) -> Self {
@@ -174,6 +183,7 @@ impl Intercept for UpstreamIoInterceptor {
             return Ok(());
         };
         let response = context.response_mut();
+        let _ = self.response_status.set(response.status().as_u16());
         io.begin_response(response.headers().get("content-type"));
         let body = std::mem::replace(response.body_mut(), SdkBody::taken());
         // 响应不保留 bytes 快捷视图，确保 SDK 的完整读取也经过真实 frame 观察。

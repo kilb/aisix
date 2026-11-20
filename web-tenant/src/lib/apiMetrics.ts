@@ -42,7 +42,7 @@ export interface ApiMetricsResponse {
   from: string;
   to: string;
   bucket: MetricsBucket;
-  totals: ApiMetricValues;
+  totals: ApiMetricValues & { peak_rpm: number | null };
   series: ApiMetricPeriod[];
   models: ApiMetricModel[];
 }
@@ -88,7 +88,8 @@ function timestamp(value: unknown): value is string {
 /** 只验证结构边界，缺失/不安全计数不补零；金额字符串永不经 number。 */
 export function decodeApiMetrics(input: unknown): ApiMetricsResponse {
   const row = record(input);
-  if (!row || !timestamp(row.from) || !timestamp(row.to) || !["minute", "hour", "day"].includes(String(row.bucket)) || !record(row.totals) || !Array.isArray(row.series) || !Array.isArray(row.models)) {
+  const totals = record(row?.totals);
+  if (!row || !timestamp(row.from) || !timestamp(row.to) || !["minute", "hour", "day"].includes(String(row.bucket)) || !totals || !Array.isArray(row.series) || !Array.isArray(row.models)) {
     throw new ApiMetricsDecodeError("统计响应格式不完整，请重试或升级控制面。");
   }
   const series = row.series.map(input => {
@@ -102,7 +103,7 @@ export function decodeApiMetrics(input: unknown): ApiMetricsResponse {
     if (!item || !model || !(model.id === null || typeof model.id === "string") || typeof model.name !== "string") throw new ApiMetricsDecodeError("统计响应的模型数据无效，请重试。");
     return { ...values(item), model: { id: model.id, name: model.name } };
   });
-  return { from: row.from, to: row.to, bucket: row.bucket as MetricsBucket, totals: values(record(row.totals) ?? {}), series, models };
+  return { from: row.from, to: row.to, bucket: row.bucket as MetricsBucket, totals: { ...values(totals), peak_rpm: count(totals.peak_rpm) }, series, models };
 }
 
 /** 任何未知值均阻止全量排名；不能把未知当零再称其余模型为最高。 */
@@ -158,12 +159,13 @@ export function maximumMetricIndex(values: readonly (number | bigint | null)[]):
   return bestIndex;
 }
 
-/** 最终请求的统计周期平均速率，不当作瞬时吞吐；失败率沿用已知结果分母。 */
-export function requestRateSummary(requests: number | null, successRate: number | null, from: string, to: string): { failureRate: number | null; averageRps: number | null } {
-  const durationSeconds = (Date.parse(to) - Date.parse(from)) / 1000;
+/** 平均 RPM 以整个统计周期为分母；失败率沿用已知结果分母。 */
+export function requestRateSummary(requests: number | null, successRate: number | null, from: string, to: string): { failureRate: number | null; averageRpm: number | null } {
+  const durationMinutes = (Date.parse(to) - Date.parse(from)) / 60_000;
+  const requestCount = count(requests);
   return {
     failureRate: successRate !== null && Number.isFinite(successRate) && successRate >= 0 && successRate <= 1 ? 1 - successRate : null,
-    averageRps: requests !== null && Number.isSafeInteger(requests) && requests >= 0 && Number.isFinite(durationSeconds) && durationSeconds > 0 ? requests / durationSeconds : null,
+    averageRpm: requestCount !== null && Number.isFinite(durationMinutes) && durationMinutes > 0 ? requestCount / durationMinutes : null,
   };
 }
 

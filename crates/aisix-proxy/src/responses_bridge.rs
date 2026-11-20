@@ -1229,7 +1229,7 @@ fn unwrap_custom_tool_input(arguments: &str) -> String {
 pub struct ResponsesReplyContext {
     custom_tools: std::collections::BTreeSet<String>,
     client_tool_search: Option<String>,
-    declared_special_prefixes: std::collections::BTreeSet<String>,
+    declared_names: Vec<Box<str>>,
     /// Chat function name → `(namespace, sub-tool name)`.
     namespace_tools: std::collections::BTreeMap<String, (String, String)>,
     echo: Map<String, Value>,
@@ -1293,20 +1293,14 @@ impl ResponsesReplyContext {
             .iter()
             .any(client_tool_search)
             .then(|| tool_search_chat_name(&tools));
-        // 仅保存既是特殊工具名严格前缀、又是显式完整工具名的例外。
-        let mut declared_special_prefixes = std::collections::BTreeSet::new();
-        for special in custom_tools.iter().chain(&client_tool_search) {
-            for (end, _) in special.char_indices().skip(1) {
-                let prefix = &special[..end];
-                if top_level.contains(prefix) {
-                    declared_special_prefixes.insert(prefix.to_owned());
-                }
-            }
-        }
+        let mut names = top_level;
+        names.extend(namespace_tools.keys().map(String::as_str));
+        names.extend(client_tool_search.as_deref());
+        let declared_names = names.into_iter().map(Box::<str>::from).collect();
         Self {
             custom_tools,
             client_tool_search,
-            declared_special_prefixes,
+            declared_names,
             namespace_tools,
             echo: response_echo_fields(body),
         }
@@ -1319,24 +1313,24 @@ impl ResponsesReplyContext {
             .insert("previous_response_id".into(), Value::String(id.to_string()));
     }
 
-    fn special_name_starts_with(&self, name: &str) -> bool {
-        use std::ops::Bound::{Included, Unbounded};
-        self.client_tool_search
-            .as_deref()
-            .is_some_and(|tool| tool.starts_with(name))
-            || self
-                .custom_tools
-                .range::<str, _>((Included(name), Unbounded))
-                .next()
-                .is_some_and(|tool| tool.starts_with(name))
+    fn declared_names_from(&self, name: &str) -> &[Box<str>] {
+        let start = self
+            .declared_names
+            .partition_point(|tool| tool.as_ref() < name);
+        &self.declared_names[start..]
     }
 
-    fn partial_special_name(&self, name: &str) -> bool {
-        self.special_name_starts_with(name)
-            && self.client_tool_search.as_deref() != Some(name)
-            && !self.custom_tools.contains(name)
-            && !self.declared_special_prefixes.contains(name)
-            && !self.namespace_tools.contains_key(name)
+    fn waits_for_name_suffix(&self, name: &str, has_arguments: bool) -> bool {
+        let (first, rest) = match self.declared_names_from(name).split_first() {
+            Some(pair) => pair,
+            None => return false,
+        };
+        if first.as_ref() == name {
+            // 已出现参数时按精确匹配公布，否则仍可等候较长名称的后缀。
+            !has_arguments && rest.first().is_some_and(|next| next.starts_with(name))
+        } else {
+            first.starts_with(name)
+        }
     }
 
     fn tool_call<'a>(&'a self, chat_name: &'a str) -> ReplyToolCall<'a> {
@@ -2074,13 +2068,15 @@ struct ToolCallState {
     /// The call names one of the request's `custom` tools, so it streams as
     /// a `custom_tool_call` item rather than a `function_call` one.
     custom: bool,
+    // 首个非 JSON 空白字节能排除对象后，原样输入即可逐片发送。
+    custom_input_raw: Option<bool>,
     search: bool,
     /// `(namespace, sub-tool name)` when the call names a flattened
     /// namespace sub-tool. Fixed when the item is announced, like `custom`.
     namespace: Option<(String, String)>,
-    output_index: u32,
+    // 公布时才分配，保证并行项在客户端数组中连续。
+    output_index: Option<u32>,
     arguments: String,
-    item_added: bool,
 }
 
 impl ToolCallState {
@@ -2095,6 +2091,16 @@ impl ToolCallState {
             "fc"
         };
         format!("{prefix}_{}", self.item_uuid)
+    }
+
+    fn added_item(&self) -> Value {
+        if self.search {
+            tool_search_call_item(&self.item_id(), &self.call_id, "{}", "in_progress")
+        } else if self.custom {
+            self.custom_call_item("", "in_progress")
+        } else {
+            self.function_call_item("", "in_progress")
+        }
     }
 
     /// The completed output item for this call.
@@ -2427,7 +2433,7 @@ impl ResponsesSseEncoder {
             .values()
             .map(|tc| {
                 (
-                    tc.output_index,
+                    tc.output_index.unwrap_or(u32::MAX),
                     json!({
                         "id": tc.call_id,
                         "type": "function",
@@ -2518,7 +2524,7 @@ impl ResponsesSseEncoder {
             items.push((r.output_index, refusal_item_json(&r.item_id, &r.text)));
         }
         for tc in self.tool_calls.values() {
-            items.push((tc.output_index, tc.done_item()));
+            items.push((tc.output_index.unwrap_or(u32::MAX), tc.done_item()));
         }
         items.sort_by_key(|(idx, _)| *idx);
         items.into_iter().map(|(_, v)| v).collect()
@@ -2816,8 +2822,6 @@ impl ResponsesSseEncoder {
                     .unwrap_or("");
 
                 if !self.tool_calls.contains_key(&oai_index) {
-                    let output_index = self.next_output_index;
-                    self.next_output_index += 1;
                     self.tool_calls.insert(
                         oai_index,
                         ToolCallState {
@@ -2825,88 +2829,78 @@ impl ResponsesSseEncoder {
                             call_id: String::new(),
                             name: String::new(),
                             custom: false,
+                            custom_input_raw: None,
                             search: false,
                             namespace: None,
-                            output_index,
+                            output_index: None,
                             arguments: String::new(),
-                            item_added: false,
                         },
                     );
                 }
                 let state = self.tool_calls.get_mut(&oai_index).expect("just inserted");
-                // 已收参数、工具名仍有歧义时，上游既可能重发全名，也可能只发后缀。
-                let joined;
-                let name = if !name.is_empty()
-                    && !state.item_added
-                    && !state.arguments.is_empty()
-                    && !state.name.is_empty()
-                    && self.reply.partial_special_name(&state.name)
-                    && !(name.starts_with(&state.name) && self.reply.special_name_starts_with(name))
+                let mut opening = false;
+                if state.output_index.is_none()
+                    && (!id.is_empty() || !name.is_empty() || !arguments.is_empty())
                 {
-                    joined = format!("{}{name}", state.name);
-                    if self.reply.special_name_starts_with(&joined) {
-                        &joined
-                    } else {
-                        name
+                    if !id.is_empty() {
+                        state.call_id = id.to_owned();
                     }
-                } else {
-                    name
-                };
-                let (custom, search, namespace) = match self.reply.tool_call(name) {
-                    ReplyToolCall::Custom { name, namespace } => (
-                        true,
-                        false,
-                        namespace.map(|ns| (ns.to_string(), name.to_string())),
-                    ),
-                    ReplyToolCall::ToolSearch => (false, true, None),
-                    ReplyToolCall::Function {
-                        name: sub_name,
-                        namespace: Some(namespace),
-                    } => (
-                        false,
-                        false,
-                        Some((namespace.to_string(), sub_name.to_string())),
-                    ),
-                    ReplyToolCall::Function { .. } => (false, false, None),
-                };
-                if !id.is_empty() {
-                    state.call_id = id.to_string();
-                }
-                if !name.is_empty() {
-                    state.name = name.to_string();
-                    // Only until the item has been announced: `.added`
-                    // carries both the item id and the item type, and both
-                    // are derived from this flag. An upstream that splits
-                    // `function.name` across chunks overwrites the name on
-                    // each one, and letting a later fragment flip the flag
-                    // would leave `.done` disagreeing with the `.added`
-                    // the client already read.
-                    if !state.item_added {
-                        state.custom = custom;
-                        state.search = search;
-                        state.namespace = namespace;
+                    if !name.is_empty() {
+                        // 不完整名称可能以全名重发，也可能只补后缀。
+                        let mut name = name;
+                        let joined;
+                        if !state.name.is_empty()
+                            && self.reply.waits_for_name_suffix(&state.name, false)
+                        {
+                            let repeated = name.starts_with(&state.name)
+                                && self
+                                    .reply
+                                    .declared_names_from(name)
+                                    .first()
+                                    .is_some_and(|tool| tool.starts_with(name));
+                            if !repeated {
+                                joined = format!("{}{name}", state.name);
+                                if self
+                                    .reply
+                                    .declared_names_from(&joined)
+                                    .first()
+                                    .is_some_and(|tool| tool.starts_with(&joined))
+                                {
+                                    name = &joined;
+                                }
+                            }
+                        }
+                        state.name = name.to_owned();
+                        (state.custom, state.search, state.namespace) =
+                            match self.reply.tool_call(name) {
+                                ReplyToolCall::Custom { name, namespace } => (
+                                    true,
+                                    false,
+                                    namespace.map(|ns| (ns.to_owned(), name.to_owned())),
+                                ),
+                                ReplyToolCall::ToolSearch => (false, true, None),
+                                ReplyToolCall::Function { name, namespace } => (
+                                    false,
+                                    false,
+                                    namespace.map(|ns| (ns.to_owned(), name.to_owned())),
+                                ),
+                            };
                     }
+                    opening = !state.call_id.is_empty()
+                        && !state.name.is_empty()
+                        && !self.reply.waits_for_name_suffix(
+                            &state.name,
+                            !arguments.is_empty() || !state.arguments.is_empty(),
+                        );
                 }
-
-                // Emit output_item.added once the call id + name are known.
-                let opening = !state.item_added
-                    && (!name.is_empty() || !id.is_empty())
-                    && !state.call_id.is_empty()
-                    && !state.name.is_empty()
-                    && (state.arguments.is_empty()
-                        || !self.reply.partial_special_name(&state.name));
                 // 普通函数的参数可能先于 id 或名称到达。首次公布时补发所有已收参数。
                 let has_buffered_prefix = opening && !state.arguments.is_empty();
                 if opening {
-                    state.item_added = true;
-                    let output_index = state.output_index;
-                    let item = if state.search {
-                        tool_search_call_item(&state.item_id(), &state.call_id, "{}", "in_progress")
-                    } else if state.custom {
-                        state.custom_call_item("", "in_progress")
-                    } else {
-                        state.function_call_item("", "in_progress")
-                    };
+                    // 公布后固定名称、call_id、类型和 output_index，后续分片只补参数。
+                    let output_index = self.next_output_index;
+                    self.next_output_index += 1;
+                    state.output_index = Some(output_index);
+                    let item = state.added_item();
                     events.push(self.event(
                         "response.output_item.added",
                         json!({"output_index": output_index, "item": item}),
@@ -2916,26 +2910,39 @@ impl ResponsesSseEncoder {
                 if has_buffered_prefix || !arguments.is_empty() {
                     let state = self.tool_calls.get_mut(&oai_index).expect("present");
                     state.arguments.push_str(arguments);
-                    let delta = if has_buffered_prefix {
+                    let Some(output_index) = state.output_index else {
+                        continue;
+                    };
+                    if state.search {
+                        continue;
+                    }
+                    let mut delta = if has_buffered_prefix {
                         state.arguments.as_str()
                     } else {
                         arguments
                     };
-                    // A custom tool's fragments are the function-call
-                    // wrapper's JSON, not the freeform input the caller
-                    // asked for; they are buffered and emitted as one
-                    // unwrapped `custom_tool_call_input.delta` at the close.
-                    // Streaming the wrapper through would hand the client
-                    // pieces of `{"content":"…"}` under an event type whose
-                    // payload is supposed to be the input itself.
-                    if state.item_added && !state.custom && !state.search {
-                        let data = json!({
-                            "item_id": state.item_id(),
-                            "output_index": state.output_index,
-                            "delta": delta,
-                        });
-                        events.push(self.event("response.function_call_arguments.delta", data));
-                    }
+                    let event_type = if state.custom {
+                        // 只有对象可能是包装。原样输入在判明时补发前导空白，此后直接发送分片。
+                        if state.custom_input_raw.is_none() {
+                            state.custom_input_raw = delta
+                                .bytes()
+                                .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+                                .map(|byte| byte != b'{');
+                            delta = &state.arguments;
+                        }
+                        if state.custom_input_raw != Some(true) {
+                            continue;
+                        }
+                        "response.custom_tool_call_input.delta"
+                    } else {
+                        "response.function_call_arguments.delta"
+                    };
+                    let data = json!({
+                        "item_id": state.item_id(),
+                        "output_index": output_index,
+                        "delta": delta,
+                    });
+                    events.push(self.event(event_type, data));
                 }
             }
         }
@@ -3101,34 +3108,49 @@ impl ResponsesSseEncoder {
         let pending: Vec<u64> = self
             .tool_calls
             .iter()
-            .filter(|(_, s)| s.item_added)
+            .filter(|(_, s)| !s.call_id.is_empty() && !s.name.is_empty())
             .map(|(k, _)| *k)
             .collect();
         for k in pending {
-            let (item_id, arguments, output_index, custom, search, done_item) = {
-                let s = self.tool_calls.get(&k).expect("present");
-                (
-                    s.item_id(),
-                    s.arguments.clone(),
-                    s.output_index,
-                    s.custom,
-                    s.search,
-                    s.done_item(),
-                )
-            };
-            if custom {
-                // The buffered fragments become exactly one delta carrying
-                // the unwrapped input, then the done event — a custom tool
-                // never emits `response.function_call_arguments.*`.
-                let input = unwrap_custom_tool_input(&arguments);
+            let s = self.tool_calls.get_mut(&k).expect("present");
+            let item_id = s.item_id();
+            let announce_at_close = s.output_index.is_none();
+            let output_index = *s.output_index.get_or_insert_with(|| {
+                let next = self.next_output_index;
+                self.next_output_index += 1;
+                next
+            });
+            let (custom, search) = (s.custom, s.search);
+            let raw_input_streamed = s.custom_input_raw == Some(true);
+            let done_item = s.done_item();
+            // 到结束仍有歧义时，上游最后给出的名称即为完整名称。
+            if announce_at_close {
+                let item = s.added_item();
                 events.push(self.event(
-                    "response.custom_tool_call_input.delta",
-                    json!({
-                        "item_id": item_id,
-                        "output_index": output_index,
-                        "delta": input,
-                    }),
+                    "response.output_item.added",
+                    json!({"output_index": output_index, "item": item}),
                 ));
+                if !custom
+                    && !search
+                    && done_item["arguments"]
+                        .as_str()
+                        .is_some_and(|a| !a.is_empty())
+                {
+                    events.push(self.event(
+                        "response.function_call_arguments.delta",
+                        json!({"item_id": item_id, "output_index": output_index,
+                               "delta": done_item["arguments"]}),
+                    ));
+                }
+            }
+            if custom {
+                let input = &done_item["input"];
+                if !raw_input_streamed {
+                    events.push(self.event(
+                        "response.custom_tool_call_input.delta",
+                        json!({"item_id": item_id, "output_index": output_index, "delta": input}),
+                    ));
+                }
                 events.push(self.event(
                     "response.custom_tool_call_input.done",
                     json!({
@@ -3143,7 +3165,7 @@ impl ResponsesSseEncoder {
                     json!({
                         "item_id": item_id,
                         "output_index": output_index,
-                        "arguments": arguments,
+                        "arguments": done_item["arguments"],
                     }),
                 ));
             }
@@ -6424,70 +6446,267 @@ mod tests {
         assert_eq!(seqs, (0..all.len() as u64).collect::<Vec<_>>());
     }
 
-    /// A custom tool never streams the function-call argument events —
-    /// they carry the single-string wrapper, which is gateway plumbing the
-    /// caller never asked to see.
-    /// An upstream that splits `function.name` across chunks overwrites
-    /// the name on each one. The item id and the item type are both
-    /// derived from whether the name is a custom tool, so a later fragment
-    /// completing the name must not change what an already-emitted
-    /// `output_item.added` said — `.done` would name an item the client
-    /// never saw opened.
     #[test]
-    fn a_tool_name_completed_after_the_item_opened_keeps_its_announced_identity() {
-        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
-        // First fragment carries a PREFIX of the custom tool's name, so the
-        // item opens as a plain function call.
-        let mut all = enc.next_events(&ChatChunk {
-            native_envelope: None,
-            choice_index: 0,
-            logprobs: None,
-            id: "c".into(),
-            model: "m".into(),
-            delta: ChatDelta {
-                tool_calls: Some(vec![json!({
-                    "index": 0, "id": "call_1", "type": "function",
-                    "function": {"name": "apply_"},
-                })]),
-                ..Default::default()
-            },
-            finish_reason: None,
-            usage: None,
-            service_tier: None,
-            accounting_usage: None,
-        });
-        all.extend(enc.next_events(&ChatChunk {
-            native_envelope: None,
-            choice_index: 0,
-            logprobs: None,
-            id: "c".into(),
-            model: "m".into(),
-            delta: ChatDelta {
-                tool_calls: Some(vec![
-                    json!({"index": 0, "function": {"name": "apply_patch", "arguments": "{}"}}),
-                ]),
-                ..Default::default()
-            },
-            finish_reason: None,
-            usage: None,
-            service_tier: None,
-            accounting_usage: None,
-        }));
-        all.extend(enc.force_finish());
+    fn split_custom_tool_name_opens_only_with_the_declared_identity() {
+        for completion in ["patch", "apply_patch"] {
+            let mut enc =
+                ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
+            let prefix = enc.next_events(&tool_chunk(json!({
+                "index": 0, "id": "call_1", "function": {"name": "apply_"}
+            })));
+            assert_eq!(
+                types_of(&prefix),
+                ["response.created", "response.in_progress"]
+            );
+            let opened = enc.next_events(&tool_chunk(json!({
+                "index": 0, "function": {"name": completion, "arguments": r#"{"content":"example"}"#}
+            })));
+            assert_eq!(types_of(&opened), ["response.output_item.added"]);
+            let added = &opened[0].data["item"];
+            assert_eq!(added["type"], "custom_tool_call");
+            assert_eq!(added["name"], "apply_patch");
+            assert_eq!(added["call_id"], "call_1");
+            let done = enc.force_finish();
+            assert_eq!(
+                types_of(&done),
+                [
+                    "response.custom_tool_call_input.delta",
+                    "response.custom_tool_call_input.done",
+                    "response.output_item.done",
+                    "response.completed"
+                ]
+            );
+            assert_eq!(done[0].data["delta"], "example");
+            let item = &done[2].data["item"];
+            assert_eq!(item["id"], added["id"]);
+            assert_eq!(item["type"], added["type"]);
+            assert_eq!(item["name"], added["name"]);
+            assert_eq!(item["input"], "example");
+            assert_eq!(done[3].data["response"]["output"][0], *item);
+        }
+    }
 
-        let added = all
+    #[test]
+    fn overlapping_declared_names_resolve_on_suffix_arguments_or_finish() {
+        let tools = json!({"tools":[{"type":"custom", "name":"apply_patch"},
+                                    {"type":"function", "name":"apply_patch_plus"}]});
+        for (next, kind, name) in [
+            (
+                Some(json!({"name":"_plus", "arguments":"{}"})),
+                "function_call",
+                "apply_patch_plus",
+            ),
+            (
+                Some(json!({"arguments":"input"})),
+                "custom_tool_call",
+                "apply_patch",
+            ),
+            (None, "custom_tool_call", "apply_patch"),
+        ] {
+            let mut enc = ResponsesSseEncoder::new(
+                "resp_1",
+                "m",
+                0,
+                ResponsesReplyContext::from_request(&tools),
+            );
+            let first = enc.next_events(&tool_chunk(
+                json!({"id":"call_1", "function":{"name":"apply_patch"}}),
+            ));
+            assert_eq!(
+                types_of(&first),
+                ["response.created", "response.in_progress"]
+            );
+            let mut events = if let Some(fragment) = next {
+                let opened = enc.next_events(&tool_chunk(json!({"function":fragment})));
+                assert_eq!(opened[0].event_type, "response.output_item.added");
+                assert!(opened[1].event_type.ends_with(".delta"));
+                opened
+            } else {
+                Vec::new()
+            };
+            events.extend(enc.force_finish());
+            let added = &events[0].data["item"];
+            assert_eq!(added["type"], kind);
+            assert_eq!(added["name"], name);
+            let completed = &events.last().unwrap().data["response"]["output"][0];
+            assert_eq!(completed["type"], added["type"]);
+            assert_eq!(completed["name"], added["name"]);
+        }
+    }
+
+    #[test]
+    fn a_published_tool_keeps_its_call_id_and_name_across_later_fragments() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
+        let first = enc.next_events(&tool_chunk(json!({
+            "index":0,"id":"call_1","function":{"name":"apply_patch", "arguments":"raw "}
+        })));
+        let added = &first
             .iter()
             .find(|e| e.event_type == "response.output_item.added")
-            .expect("item announced");
-        let done = all
-            .iter()
-            .find(|e| e.event_type == "response.output_item.done")
-            .expect("item closed");
-        assert_eq!(added.data["item"]["id"], done.data["item"]["id"]);
-        assert_eq!(added.data["item"]["type"], done.data["item"]["type"]);
-        let final_item = &all.last().unwrap().data["response"]["output"][0];
-        assert_eq!(final_item["id"], added.data["item"]["id"]);
-        assert_eq!(final_item["type"], added.data["item"]["type"]);
+            .unwrap()
+            .data["item"];
+        enc.next_events(&tool_chunk(json!({
+            "index":0,"id":"call_2","function":{"name":"patch", "arguments":"input"}
+        })));
+        let done = enc.force_finish();
+        let completed = &done.last().unwrap().data["response"]["output"][0];
+        for field in ["id", "type", "name", "call_id"] {
+            assert_eq!(completed[field], added[field], "{field}");
+        }
+        assert_eq!(completed["input"], "raw input");
+    }
+
+    #[test]
+    fn tool_output_indices_follow_publication_order_with_interleaved_items() {
+        let tools = json!({"tools":[{"type":"custom","name":"apply_patch"},{"type":"function","name":"lookup"}]});
+        let mut enc = ResponsesSseEncoder::new(
+            "resp_1",
+            "m",
+            0,
+            ResponsesReplyContext::from_request(&tools),
+        );
+        let mut events = enc.next_events(&tool_chunk(json!({
+            "index":0,"id":"late","function":{"name":"apply_", "arguments":r#"{"content":"x"}"#}
+        })));
+        events.extend(enc.next_events(&tool_chunk(json!({
+            "index":1,"id":"fast","function":{"name":"look","arguments":"{"}
+        }))));
+        events.extend(enc.next_events(&tool_chunk(
+            json!({"index":1,"function":{"name":"up","arguments":"}"}}),
+        )));
+        events.extend(enc.next_events(&tool_chunk(json!({
+            "index":2,"function":{"name":"apply_patch","arguments":r#"{"content":"kept"}"#}
+        }))));
+        events.extend(enc.next_events(&content_chunk("text")));
+        events.extend(enc.next_events(&tool_chunk(json!({"index":0,"function":{"name":"patch"}}))));
+        events.extend(enc.next_events(&tool_chunk(json!({
+            "index":3,"id":"at_close","function":{"name":"apply_","arguments":"{}"}
+        }))));
+        events.extend(enc.force_finish());
+        let mut published = Vec::new();
+        for event in &events {
+            if event.event_type == "response.output_item.added" {
+                assert_eq!(event.data["output_index"], published.len());
+                published.push(event.data["item"]["id"].clone());
+            } else if let Some(idx) = event.data["output_index"].as_u64() {
+                let id = event
+                    .data
+                    .get("item_id")
+                    .unwrap_or(&event.data["item"]["id"]);
+                assert_eq!(
+                    published.get(idx as usize),
+                    Some(id),
+                    "{}",
+                    event.event_type
+                );
+            }
+        }
+        let items = events.last().unwrap().data["response"]["output"]
+            .as_array()
+            .unwrap();
+        assert_eq!(published.len(), 4);
+        for (idx, id) in published.iter().enumerate() {
+            assert_eq!(&items[idx]["id"], id);
+        }
+        assert_eq!(items[0]["call_id"], "fast");
+        assert_eq!(items[0]["name"], "lookup");
+        assert_eq!(items[1]["type"], "message");
+        assert_eq!(items[2]["call_id"], "late");
+        assert_eq!(items[3]["call_id"], "at_close");
+        assert_eq!(items[4]["name"], "apply_patch");
+        assert_eq!(items[4]["call_id"], "");
+        assert_eq!(items[4]["input"], "kept");
+    }
+
+    #[test]
+    fn unresolved_tool_name_prefix_at_finish_closes_as_an_ordinary_call() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
+        let initial = enc.next_events(&tool_chunk(json!({
+            "id":"call_1", "function":{"name":"apply_", "arguments":"{}"}
+        })));
+        assert_eq!(
+            types_of(&initial),
+            ["response.created", "response.in_progress"]
+        );
+        let done = enc.force_finish();
+        assert_eq!(
+            types_of(&done),
+            [
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        assert_eq!(done[0].data["item"]["name"], "apply_");
+        assert_eq!(done[1].data["delta"], "{}");
+        assert_eq!(done[3].data["item"]["type"], "function_call");
+        assert_eq!(done[3].data["item"]["id"], done[0].data["item"]["id"]);
+    }
+
+    #[test]
+    fn unwrapped_custom_input_streams_once_its_first_nonwhitespace_byte_proves_it_is_raw() {
+        let mut enc = ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
+        enc.next_events(&tool_chunk(json!({"function":{"arguments":"  "}})));
+        let opened = enc.next_events(&tool_chunk(json!({
+            "id":"call_1", "function":{"name":"apply_patch", "arguments":"\n"}
+        })));
+        assert_eq!(types_of(&opened), ["response.output_item.added"]);
+        let first = enc.next_events(&tool_chunk(json!({"function":{"arguments":"*** Begin"}})));
+        assert_eq!(types_of(&first), ["response.custom_tool_call_input.delta"]);
+        assert_eq!(first[0].data["delta"], "  \n*** Begin");
+        let next = enc.next_events(&tool_chunk(json!({"function":{"arguments":" patch"}})));
+        assert_eq!(types_of(&next), ["response.custom_tool_call_input.delta"]);
+        assert_eq!(next[0].data["delta"], " patch");
+        let done = enc.force_finish();
+        assert_eq!(
+            types_of(&done),
+            [
+                "response.custom_tool_call_input.done",
+                "response.output_item.done",
+                "response.completed"
+            ]
+        );
+        assert_eq!(done[0].data["input"], "  \n*** Begin patch");
+        assert_eq!(done[1].data["item"]["input"], done[0].data["input"]);
+        assert_eq!(done[2].data["response"]["output"][0], done[1].data["item"]);
+    }
+
+    #[test]
+    fn custom_input_that_may_still_be_a_wrapper_keeps_its_exact_raw_fallback() {
+        for (prefix, suffix) in [
+            (r#" {"content":"x""#, r#","other":1}"#),
+            (r#" {"content":"x"}"#, " trailing"),
+        ] {
+            let mut enc =
+                ResponsesSseEncoder::new("resp_1", "m", 0, custom_tools(&["apply_patch"]));
+            let opened = enc.next_events(&tool_chunk(json!({
+                "id":"call_1", "function":{"name":"apply_patch", "arguments":prefix}
+            })));
+            assert_eq!(
+                types_of(&opened),
+                [
+                    "response.created",
+                    "response.in_progress",
+                    "response.output_item.added"
+                ]
+            );
+            let later = enc.next_events(&tool_chunk(json!({"function":{"arguments":suffix}})));
+            let done = enc.force_finish();
+            let input = format!("{prefix}{suffix}");
+            let deltas: String = later
+                .iter()
+                .chain(&done)
+                .filter(|event| event.event_type == "response.custom_tool_call_input.delta")
+                .map(|event| event.data["delta"].as_str().unwrap())
+                .collect();
+            assert_eq!(deltas, input);
+            assert_eq!(
+                done.last().unwrap().data["response"]["output"][0]["input"],
+                input
+            );
+        }
     }
 
     #[test]

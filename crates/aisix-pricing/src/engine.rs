@@ -422,11 +422,20 @@ pub fn price_event(
     }
 
     let q = quantities(u).map_err(PricingError::InconsistentUsage)?;
-    // 流可能在上游结算前发出临时的输入或缓存计数。502 中断的计数和
-    // 502 的网关估算都保留给日志和统计，但不能触发余额、额度或成本入账。
-    if u.status_code == 502
-        && (u.usage_estimated || u.error_class.as_deref() == Some("stream_aborted"))
-    {
+    // 流中断前的 502 计数和网关估算可能未获上游确认。
+    let unconfirmed_bad_gateway = u.status_code == 502
+        && (u.usage_estimated || u.error_class.as_deref() == Some("stream_aborted"));
+    // 流内 429 可能只触发网关对输入的估算。没有上游总量或其他计量时，
+    // 保留估算供日志和统计，余额、额度和成本均不入账。
+    let estimated_rate_limited_input = u.status_code == 429
+        && u.error_class.as_deref() == Some("upstream_in_band")
+        && u.usage_estimated
+        && u.total_tokens == 0
+        && q == (Quantities {
+            input: u64::from(u.prompt_tokens),
+            ..Quantities::default()
+        });
+    if unconfirmed_bad_gateway || estimated_rate_limited_input {
         return Ok(unbilled(
             u,
             payer,

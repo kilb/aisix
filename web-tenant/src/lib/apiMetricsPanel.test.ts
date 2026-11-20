@@ -78,10 +78,10 @@ test("最终结果构成直接包含未知计数，不能沿用已知结果成�
 test("加载保留完整请求指标标签、期间说明和计数口径，不伪造零值", () => {
   const markup = renderToStaticMarkup(createElement(ApiMetricsPanel, props));
   const text = markup.replace(/<[^>]+>/g, "");
-  for (const label of ["最终请求", "成功率", "失败率（已知结果）", "统计周期平均请求速率", "结果已知的请求", "成功请求", "失败请求", "结果未知的请求", "计费尝试", "最终状态未知的尝试"]) assert.ok(text.includes(label), `加载时仍有${label}位置`);
+  for (const label of ["最终请求", "成功率", "失败率（已知结果）", "统计周期平均RPM", "统计周期峰值RPM", "结果已知的请求", "成功请求", "失败请求", "结果未知的请求", "计费尝试", "最终状态未知的尝试"]) assert.ok(text.includes(label), `加载时仍有${label}位置`);
   assert.match(text, /按小时汇总/);
   assert.equal((text.match(/UTC\+8/g) ?? []).length, 1);
-  assert.match(text, /请求速率是整个查询周期的平均值，不是瞬时 RPS/);
+  assert.match(text, /峰值 RPM 为单个自然分钟内的最高请求数/);
   assert.match(text, /请求数按最终记录统计/);
   assert.doesNotMatch(text, /0%|0 次\/秒|¥0\.00/);
   assert.match(markup, /role="region" aria-label="完整 API 指标"/);

@@ -6,7 +6,7 @@
     "charge": 15350,
     "cost": null,
     "discount": null,
-    "engine_version": 4,
+    "engine_version": 5,
     "estimated": false,
     "event_id": "evt-openai-cache-write-mixed-ttl-stream-1",
     "group_id": "group-golden",

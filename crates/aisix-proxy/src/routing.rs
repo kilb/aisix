@@ -79,8 +79,7 @@ const FALLBACK_ALL_UNHEALTHY_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// `fallback_on_statuses` (#1012) is the routing model's
 /// explicit opt-in list for providers that use 4xx codes for transient
 /// conditions (overload, queue full, quota): a status in the list is
-/// retryable regardless of the default classification. Empty by default,
-/// which preserves the historical behavior exactly.
+/// retryable regardless of the default classification. Empty by default.
 pub fn is_retryable(err: &BridgeError, retry_on_429: bool, fallback_on_statuses: &[u16]) -> bool {
     match err {
         // 本地归属服务故障不能触发已接受调用的重复派发。

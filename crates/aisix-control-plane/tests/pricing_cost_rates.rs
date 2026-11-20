@@ -948,6 +948,15 @@ async fn explicit_cost_backfill_uses_original_lines_and_only_changes_missing_acc
     );
     assert_eq!(totals["totals"]["rows_with_cost"], "3", "{totals}");
     assert_eq!(totals["totals"]["rows_without_cost"], "2", "{totals}");
+    let accounts = totals["accounts"].as_array().expect("按上游账号汇算");
+    assert_eq!(accounts.len(), 2, "没有归属账号的用量只计入全站总计");
+    assert_eq!(accounts[0]["provider_key_id"], account.to_string());
+    assert_eq!(accounts[0]["totals"]["charged_micro_cny"], "420000000");
+    assert_eq!(accounts[0]["totals"]["known_cost_micro_cny"], "20000000");
+    assert_eq!(accounts[0]["totals"]["rows_with_cost"], "3");
+    assert_eq!(accounts[1]["provider_key_id"], other_account.to_string());
+    assert_eq!(accounts[1]["totals"]["charged_micro_cny"], "140000000");
+    assert_eq!(accounts[1]["totals"]["rows_without_cost"], "1");
 
     let retried = cost_backfill(&w, account, &w.admin, json!({})).await;
     assert_eq!(retried.status, 200, "{retried:?}");

@@ -64,7 +64,11 @@ test("下游响应阶段独立展示真实失败记录，不冒充客户端总�
   await expect(label).toHaveAttribute("title", /各接口.*处理起点/);
   await expect(label).toHaveAttribute("title", /首次下游协议输出.*元数据/);
   await expect(label).toHaveAttribute("title", /不代表客户端完整请求耗时/);
-  await expect(field(timing, "首 Token 延迟")).toHaveText(duration(event.first_token_latency_ms));
+  await expect(field(timing, "请求首内容")).toHaveText(duration(event.first_token_latency_ms));
+  const stage = event.upstream_timing as Record<string, unknown> | null | undefined;
+  const awaitingHeaders = event.error_class === "client_disconnected" && stage?.http_send_started_ms != null && Object.keys(stage).length === 1;
+  const attempt = field(timing, awaitingHeaders ? "尝试开始至断开" : "本次上游耗时");
+  await expect(attempt).toHaveText(duration(typeof event.upstream_latency_ms === "number" && event.upstream_latency_ms > 0 ? event.upstream_latency_ms : null));
   const policy = timing.locator("details").filter({ has: page.locator("summary").getByText("计时口径", { exact: true }) });
   const toggle = policy.locator("summary");
   const note = policy.locator("p");

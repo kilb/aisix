@@ -182,6 +182,118 @@ test("成员用量分析下钻只显示该成员的调用", async ({ page }) => 
   expect(items.every(row => row.user_id === first.user_id)).toBe(true);
 });
 
+test("用量分析在天粒度显示全周期平均 RPM 和单分钟峰值 RPM", async ({ page }, info) => {
+  const base = await login(page, "admin");
+  const answer = await page.evaluate(async () => {
+    const response = await fetch("/admin/usage/events?limit=200");
+    return { status: response.status, history: await response.json() };
+  });
+  expect(answer.status).toBe(200);
+  const history = answer.history as {
+    items: { occurred_at: string; event: { is_final_attempt?: unknown } }[];
+    next_before: number | null;
+  };
+  expect(history.next_before).toBeNull();
+  const timestamps = history.items.filter(row => row.event.is_final_attempt === true)
+    .map(row => Date.parse(row.occurred_at));
+  expect(timestamps.length).toBeGreaterThan(1);
+  const fromMs = Math.floor(Math.min(...timestamps) / 86_400_000) * 86_400_000;
+  const toMs = fromMs + 4 * 86_400_000;
+  const minuteCounts = new Map<number, number>();
+  const requestCount = timestamps.filter(at => {
+    if (at < fromMs || at >= toMs) return false;
+    const minute = Math.floor(at / 60_000);
+    minuteCounts.set(minute, (minuteCounts.get(minute) ?? 0) + 1);
+    return true;
+  }).length;
+  const peakRpm = Math.max(...minuteCounts.values());
+  expect(peakRpm).toBeGreaterThan(1);
+  expect(peakRpm).toBeLessThan(requestCount);
+  const range = { from: new Date(fromMs).toISOString(), to: new Date(toMs).toISOString() };
+  const metrics = page.waitForResponse(response => matching(response, "/admin/usage/metrics", range));
+  await page.goto(`${base}/#analytics?${new URLSearchParams(range)}`);
+  const response = await metrics;
+  expect(response.status()).toBe(200);
+  expect(await response.json()).toMatchObject({ bucket: "day", totals: { requests: requestCount, peak_rpm: peakRpm } });
+  const scope = page.getByRole("region", { name: "完整 API 指标", exact: true });
+  const detail = scope.getByRole("heading", { name: "请求计数与结果", exact: true }).locator("xpath=ancestor::section[1]");
+  const value = (label: string) => detail.getByText(label, { exact: true }).locator("..").getByRole("definition");
+  const avgRpm = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 }).format(requestCount / (4 * 24 * 60));
+  await expect(value("统计周期平均RPM")).toHaveText(`${avgRpm} 次/分钟`);
+  await expect(value("统计周期峰值RPM")).toHaveText(`${peakRpm} 次/分钟`);
+  await detail.screenshot({ path: info.outputPath("request-rpm.png") });
+});
+
+test("用量分析指定时间段保留精确边界和调用记录下钻", async ({ page }) => {
+  const base = await login(page, "admin");
+  const charges = page.waitForResponse(response => matching(response, "/admin/pricing/charges", {}));
+  await page.goto(`${base}/#calls`);
+  type Call = { event_id: string; occurred_at: string; is_final_attempt: boolean };
+  const chargeAnswer = await charges;
+  expect(chargeAnswer.status()).toBe(200);
+  const history = (await chargeAnswer.json() as { items: Call[] }).items;
+  const call = history.find(row => row.is_final_attempt);
+  if (!call) throw new Error("需要真实的最终调用记录来验证指定时间段");
+  const timestamp = Date.parse(call.occurred_at);
+  const from = new Date(Math.floor(timestamp / 1000) * 1000 - 1000).toISOString();
+  const to = new Date(Math.ceil(timestamp / 1000) * 1000 + 1000).toISOString();
+  const inBeijing = (instant: string) => new Date(Date.parse(instant) + 8 * 3600_000).toISOString().slice(0, 19);
+  const path = "/admin/usage/metrics";
+  const initial = page.waitForResponse(response => matching(response, path, {}));
+  await page.goto(`${base}/#analytics`);
+  expect((await initial).status()).toBe(200);
+
+  const filters = page.getByRole("region", { name: "用量分析筛选", exact: true });
+  const recent = filters.getByRole("button", { name: "最近 24 小时", exact: true });
+  const custom = filters.getByRole("button", { name: "指定时间段", exact: true });
+  const start = filters.getByLabel("开始时间", { exact: true });
+  const end = filters.getByLabel("结束时间", { exact: true });
+  await expect(recent).toHaveAttribute("aria-pressed", "true");
+  await expect(start).toBeDisabled();
+  await expect(end).toBeDisabled();
+  await custom.click();
+  await expect(custom).toHaveAttribute("aria-pressed", "true");
+  await expect(start).toBeEnabled();
+  await expect(end).toBeEnabled();
+
+  const scoped = page.waitForResponse(response => matching(response, path, { from, to }));
+  await start.fill(inBeijing(from));
+  await end.fill(inBeijing(to));
+  const answer = await scoped;
+  expect(answer.status()).toBe(200);
+  expect((await answer.json()).totals.requests).toBeGreaterThan(0);
+  const analysis = page.getByRole("region", { name: "完整 API 指标", exact: true });
+  await expect(analysis.getByText(`${inBeijing(from).replace("T", " ")} — ${inBeijing(to).replace("T", " ")}（UTC+8，结束时间不含）`, { exact: true })).toBeVisible();
+  await analysis.getByRole("tab", { name: "费用", exact: true }).click();
+  await expect(analysis.getByRole("tab", { name: "费用", exact: true })).toHaveAttribute("aria-selected", "true");
+  const link = filters.getByRole("link", { name: "查看调用记录", exact: true });
+  const reopened = page.waitForResponse(response => matching(response, path, { from, to }));
+  await page.reload();
+  expect((await reopened).status()).toBe(200);
+  await expect(custom).toHaveAttribute("aria-pressed", "true");
+  await expect(analysis.getByRole("tab", { name: "费用", exact: true })).toHaveAttribute("aria-selected", "true");
+  const calls = page.waitForResponse(response => matching(response, "/admin/pricing/charges", { from, to }));
+  await link.click();
+  const callAnswer = await calls;
+  expect(callAnswer.status()).toBe(200);
+  const { items } = await callAnswer.json() as { items: Call[] };
+  expect(items.map(row => row.event_id)).toContain(call.event_id);
+  expect(items.every(row => Date.parse(row.occurred_at) >= Date.parse(from) && Date.parse(row.occurred_at) < Date.parse(to))).toBe(true);
+  await page.goBack();
+  await expect(custom).toHaveAttribute("aria-pressed", "true");
+
+  const reset = page.waitForResponse(response => {
+    const query = new URL(response.url()).searchParams;
+    return matching(response, path, {}) && Date.parse(query.get("to") ?? "") - Date.parse(query.get("from") ?? "") === 86_400_000;
+  });
+  await recent.click();
+  expect((await reset).status()).toBe(200);
+  await expect(recent).toHaveAttribute("aria-pressed", "true");
+  await expect(analysis.getByRole("tab", { name: "费用", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(start).toBeDisabled();
+  await expect(end).toBeDisabled();
+});
+
 test("admin visible time and identity controls combine before pagination and retain precise deep links", async ({ page }) => {
   const base = await login(page, "admin");
   const first = page.waitForResponse(response => matching(response, "/admin/pricing/charges", {}));

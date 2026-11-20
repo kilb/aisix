@@ -44,13 +44,14 @@ const VIEWS: { value: ApiMetricView; label: string; icon: LucideIcon }[] = [
 ];
 const TOKEN_LABELS: Record<TokenKind, string> = { input_tokens: "已记录输入 token", completion_tokens: "已记录输出 token" };
 const TOKEN_NOTE = "趋势只包含有可用用量记录的尝试，也包含已计费重试；缺失用量不当作零。可用记录可能含网关估算，不等于上游精确报告。输入合计为原始输入 + 额外缓存读取 + 额外缓存创建，输入内缓存子集不重复相加。";
-const LATENCY_LABELS: Record<LatencyKind, string> = { first_token_latency_ms: "首 token 延迟", response_latency_ms: "响应延迟", attempt_duration_ms: "上游尝试完整耗时" };
+const LATENCY_LABELS: Record<LatencyKind, string> = { first_token_latency_ms: "首 token 延迟", response_latency_ms: "响应延迟", attempt_duration_ms: "上游尝试耗时" };
 const LATENCY_NOTES: Record<LatencyKind, string> = {
-  first_token_latency_ms: "首个生成内容交付的实测延迟。无首 token 样本包含非流式与历史记录，不以首帧或完整耗时补齐。",
-  response_latency_ms: "请求至响应可用的实测延迟：流式请求统计首个可用数据，非流式请求统计完整响应。",
-  attempt_duration_ms: "每次上游尝试的完整耗时，包含可见的已计费重试；不能拼成客户端完整请求耗时。",
+  first_token_latency_ms: "从请求到达到首次交付生成内容。分位数只统计实测值；首内容前断开、非流式及未采集的请求计入无实测值。",
+  response_latency_ms: "端点上报的下游响应阶段耗时。Chat、Messages、Responses 的流式首帧可以只含元数据；其他端点可统计整段流或完整响应。",
+  attempt_duration_ms: "从每次尝试起点计时，含可见的已计费重试。在途请求断开时可记录至断开的耗时。",
 };
 const BUCKET_LABELS: Record<MetricsBucket, string> = { minute: "分钟", hour: "小时", day: "天" };
+const AVERAGE_RPM_FORMAT = new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 });
 
 function money(value: bigint | null): string { return value === null ? "未知" : fmtMicroCny(value); }
 function sumCounts(left: number | null | undefined, right: number | null | undefined): bigint | null {
@@ -211,7 +212,9 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
           {view === "requests" && <Facts items={[
             { label: "成功率", value: formatRatio(totals?.success_rate) },
             { label: "失败率（已知结果）", value: formatRatio(requestRates?.failureRate) },
-            { label: "统计周期平均请求速率", value: requestRates?.averageRps == null ? "未知" : `${new Intl.NumberFormat("en-US", { maximumSignificantDigits: 3 }).format(requestRates.averageRps)} 次/秒` }, { label: "结果已知的请求", value: formatCount(totals?.known_outcome_requests) }, { label: "成功请求", value: formatCount(totals?.succeeded_requests) },
+            { label: "统计周期平均RPM", value: requestRates?.averageRpm == null ? "未知" : `${AVERAGE_RPM_FORMAT.format(requestRates.averageRpm)} 次/分钟` },
+            { label: "统计周期峰值RPM", value: totals?.peak_rpm == null ? "未知" : `${formatCount(totals.peak_rpm)} 次/分钟` },
+            { label: "结果已知的请求", value: formatCount(totals?.known_outcome_requests) }, { label: "成功请求", value: formatCount(totals?.succeeded_requests) },
             { label: "失败请求", value: formatCount(totals?.failed_requests) }, { label: "结果未知的请求", value: formatCount(totals?.unknown_outcome_requests) },
             { label: "计费尝试", value: formatCount(totals?.billing_attempts) }, { label: "最终状态未知的尝试", value: formatCount(totals?.unknown_final_attempts) },
           ]} />}
@@ -234,13 +237,13 @@ export function ApiMetricsPanel({ scope, enabled, from, to, bucket, modelId, mem
           ]} />}
           {view === "cost" && <Facts items={[{ label: "最终请求", value: formatCount(totals?.requests) }, { label: "计费尝试", value: formatCount(totals?.billing_attempts) }, { label: "待计价尝试", value: formatCount(totals?.unpriced_attempts) }, { label: "费用调整", value: money(totals?.adjusted_micro_cny ?? null) }]} />}
           <CardFooter className="pt-2"><div className="metric-trend-slot">{data ? <TrendChart points={points} currentIndex={currentPeriod(data)} accessibleLabel={trendLabel} emptyLabel="所选范围没有可用期间数据" /> : <div><div className="relative h-56">{error ? <div className="absolute inset-0 flex items-center"><CardMessage onRetry={rangeError ? undefined : () => setRevision(value => value + 1)}>{error}</CardMessage></div> : <><div aria-hidden="true" className="h-full w-full rounded-tile bg-tint" /><span role="status" className="sr-only">正在加载完整 API 指标</span></>}</div><div aria-hidden="true" className="mt-2 flex justify-between text-micro text-fg-3"><span>—</span><span>—</span><span>—</span></div></div>}</div><p className="mt-4 text-caption text-fg-3">按{BUCKET_LABELS[displayBucket]}汇总，图形使用相对刻度，精确值可用键盘逐期查看。</p></CardFooter>
-          <p className="text-caption text-fg-3">{view === "latency" ? LATENCY_NOTES[latencyKind] + " P99 由所选范围原始实测样本计算，小样本需结合样本数判断。" : view === "tokens" ? TOKEN_NOTE : view === "cache" ? cacheKind === "tokens" ? "（输入内缓存子集 + 额外缓存读取）÷（原始输入 + 额外缓存读取 + 额外缓存创建）。这是已记录 token 的比例，不代表上游报告覆盖率。" : "响应缓存命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。" : view === "requests" ? "成功率 = 成功请求 ÷（成功 + 失败请求），失败率使用同一已知结果分母。结果未知的请求单列；最终状态未知的尝试不作为最终请求。请求速率是整个查询周期的平均值，不是瞬时 RPS。" : "已计价费用汇总最终记录及可见的已计费重试，保留当笔历史费率与费用调整。待计价尝试不等于免费，完成计价后费用可能变化。"}</p>
+          <p className="text-caption text-fg-3">{view === "latency" ? LATENCY_NOTES[latencyKind] + " P99 由所选范围原始实测样本计算，小样本需结合样本数判断。" : view === "tokens" ? TOKEN_NOTE : view === "cache" ? cacheKind === "tokens" ? "（输入内缓存子集 + 额外缓存读取）÷（原始输入 + 额外缓存读取 + 额外缓存创建）。这是已记录 token 的比例，不代表上游报告覆盖率。" : "响应缓存命中 ÷（命中 + 未命中）；绕过、未启用与未知不进入分母。" : view === "requests" ? "成功率 = 成功请求 ÷（成功 + 失败请求），失败率使用同一已知结果分母。结果未知的请求单列；最终状态未知的尝试不作为最终请求。平均 RPM 为最终请求数除以查询时长（分钟）。峰值 RPM 为单个自然分钟内的最高请求数。" : "已计价费用汇总最终记录及可见的已计费重试，保留当笔历史费率与费用调整。待计价尝试不等于免费，完成计价后费用可能变化。"}</p>
           <p className="text-caption text-fg-3">请求数按最终记录统计，费用与 token 还包含已计费重试。计费尝试包含免费与未定价的最终记录，不等于请求数。</p>
         </>}
       </Card>
       <Card className={cn(span.d5Wide, "metric-analysis-aside")}>
         <CardHeader number={numberStart + 1} title={sideTitle} description="与左侧使用相同时间、身份和筛选范围" />
-        {error ? <CardMessage>{rangeError ? "请调整上方的时间范围后查看明细。" : "分析明细暂不可用，请通过指标卡中的重试按钮重新加载。"}</CardMessage> : view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-4"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求的首个生成内容；无样本包含非流式与历史记录。" /><div className="border-t border-hairline pt-4"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求的响应延迟：流式请求统计首个可用数据，非流式请求统计完整响应。" /></div><div className="border-t border-hairline pt-4"><LatencyFacts title="上游尝试完整耗时" value={totals?.attempt_duration_ms} note="所有可见计费尝试各自的完整耗时，不能相加为客户端请求时长。" /></div></div>}
+        {error ? <CardMessage>{rangeError ? "请调整上方的时间范围后查看明细。" : "分析明细暂不可用，请通过指标卡中的重试按钮重新加载。"}</CardMessage> : view === "requests" || view === "cost" ? <ModelRanks data={data} field={view === "requests" ? "requests" : "charged_micro_cny"} /> : view === "tokens" ? <TokenFacts values={totals} /> : view === "cache" ? <CacheFacts values={totals} /> : <div className="grid gap-4"><LatencyFacts title="首 token 延迟" value={totals?.first_token_latency_ms} note="最终请求从到达到首次交付生成内容的耗时。首内容前断开的请求计入无实测值。" /><div className="border-t border-hairline pt-4"><LatencyFacts title="响应延迟" value={totals?.response_latency_ms} note="最终请求的下游响应阶段耗时。流式生成接口可止于元数据首帧，其他接口可涵盖完整响应。" /></div><div className="border-t border-hairline pt-4"><LatencyFacts title="上游尝试耗时" value={totals?.attempt_duration_ms} note="各次可见尝试独立计时。等待上游期间断开的请求可计至断开，历史未测量值计入缺失。" /></div></div>}
       </Card>
       </BentoGrid>
     </section>

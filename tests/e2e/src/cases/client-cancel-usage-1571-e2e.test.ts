@@ -30,6 +30,7 @@ import {
 const CALLER_PLAINTEXT = "sk-cancel-1571-PLAINTEXT";
 const CALLER_KEY_HASH = createHash("sha256").update(CALLER_PLAINTEXT).digest("hex");
 const PROVIDER_SECRET = "sk-mock-cancel-1571";
+const PRE_CANCEL_WAIT_MS = 150;
 
 const CREDENTIAL_REF = "mock";
 const SLS_PROJECT = "aisix-e2e-obs";
@@ -234,6 +235,8 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         slow.receivedRequests.length,
         "the gateway never dispatched to the slow upstream",
       ).toBeGreaterThan(0);
+      // 上游收到请求后再等待，确保这段已知时间属于实际的上游等待。
+      await new Promise((resolve) => setTimeout(resolve, PRE_CANCEL_WAIT_MS));
       controller.abort();
       await expect(inflight).rejects.toThrow();
 
@@ -248,6 +251,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(row.get("status_code")).toBe("499");
       expect(row.get("error_class")).toBe("client_disconnected");
       expect(row.get("error_message")).toContain("before the response head");
+      expect(Number(row.get("upstream_latency_ms"))).toBeGreaterThanOrEqual(PRE_CANCEL_WAIT_MS - 25);
       // The two identities the row has to keep apart: the caller addressed
       // the group, the gateway was waiting on the target. `model_id` is what
       // the control plane prices against, and a group has no pricing row.
@@ -310,6 +314,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
         slow.receivedRequests.length,
         "the relay never reached the upstream",
       ).toBeGreaterThan(before);
+      await new Promise((resolve) => setTimeout(resolve, PRE_CANCEL_WAIT_MS));
       controller.abort();
       await expect(inflight).rejects.toThrow();
 
@@ -324,6 +329,7 @@ describe("client cancel before the response head (AISIX-Cloud#1571)", () => {
       expect(row.get("status_code")).toBe("499");
       expect(row.get("error_class")).toBe("client_disconnected");
       expect(row.get("error_message")).toContain("before the response head");
+      expect(Number(row.get("upstream_latency_ms"))).toBeGreaterThanOrEqual(PRE_CANCEL_WAIT_MS - 25);
       expect(row.get("passthrough_route_name")).toBe(ROUTE);
       // This surface resolves no model, and the row says so rather than
       // borrowing one — `model_id` is what the control plane prices on.

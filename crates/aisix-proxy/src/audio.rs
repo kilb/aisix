@@ -1989,24 +1989,13 @@ async fn multipart_dispatch(
                                     })?;
                             return Ok((upstream_headers, held));
                         }
-                        let read = async {
-                            match stream_budget.filter(|_| stream_requested) {
-                                // No request-level timeout was set on the live path,
-                                // so bound this read rather than leaving it open.
-                                Some(d) => tokio::time::timeout(d, resp.bytes())
-                                    .await
-                                    .map_err(|_| aisix_gateway::BridgeError::Timeout {
-                                        elapsed_ms: d.as_millis() as u64,
-                                        cause: String::new(),
-                                    })?
-                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-                                None => resp
-                                    .bytes()
-                                    .await
-                                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-                            }
-                        };
-                        let body_bytes = read.await.map_err(|be| {
+                        let body_bytes = crate::dispatch::read_accepted_body_within(
+                            resp,
+                            stream_budget.filter(|_| stream_requested),
+                            reqwest::Response::bytes,
+                        )
+                        .await
+                        .map_err(|be| {
                             crate::cooldown::note_failure(tracker, model_id, cooldown_cfg, be)
                         })?;
                         Ok((upstream_headers, AudioUpstreamBody::Buffered(body_bytes)))

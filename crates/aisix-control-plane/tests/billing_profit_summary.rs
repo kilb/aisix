@@ -13,6 +13,7 @@ use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
 use futures::{future::join_all, FutureExt};
 use serde_json::{json, Value};
 use sqlx::{Connection, PgConnection};
+use support::migrate::{database_at, into_test_cp, migrate_rest};
 use support::world::{
     card, db_now, deliver, insert_baseline, insert_baseline_backdated, price, seed_key, seed_model,
     seed_provider_key, seed_tenant, usage, world, World,
@@ -59,6 +60,15 @@ async fn report(
 fn totals(r: &Resp, expected: Value) {
     assert_eq!(r.status, 200, "{r:?}");
     assert_eq!(r.body.get("totals"), Some(&expected), "{r:?}");
+}
+
+fn account_totals(r: &Resp, id: Uuid, expected: Value) {
+    let accounts = r.body["accounts"].as_array().expect("返回上游账号汇算列表");
+    let account = accounts
+        .iter()
+        .find(|account| account["provider_key_id"] == id.to_string())
+        .expect("返回历史调用所归属的上游账号");
+    assert_eq!(account["totals"], expected, "{account}");
 }
 
 fn empty() -> Value {
@@ -201,6 +211,16 @@ async fn all_time_and_long_explicit_windows_include_old_real_telemetry_at_half_o
             "unpriced_rows":"0", "rows":"3"
         }),
     );
+    assert_eq!(selected.body["accounts"].as_array().map(Vec::len), Some(1));
+    account_totals(
+        &selected,
+        account,
+        json!({
+            "charged_micro_cny":"2000", "adjusted_micro_cny":"0", "known_cost_micro_cny":"600",
+            "charged_with_cost_micro_cny":"2000", "rows_with_cost":"2", "rows_without_cost":"0",
+            "unpriced_rows":"0", "rows":"2"
+        }),
+    );
     assert_eq!(
         at(selected.body["from"].as_str().expect("返回开始时间")),
         from
@@ -316,6 +336,31 @@ async fn repricing_changes_revenue_once_but_keeps_original_known_and_unknown_cos
             "unpriced_rows":"0", "rows":"5"
         }),
     );
+    let accounts = after.body["accounts"].as_array().expect("返回完整账号列表");
+    assert_eq!(accounts.len(), 2, "没有上游账号的费用只进入总计");
+    assert_eq!(accounts[0]["provider_key_id"], account.to_string());
+    assert!(accounts[0]["provider_key_display_name"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("acct-pricing-")));
+    assert!(!after.body.to_string().contains("sk-pricing-upstream-7c1"));
+    account_totals(
+        &after,
+        account,
+        json!({
+            "charged_micro_cny":"2000", "adjusted_micro_cny":"1000", "known_cost_micro_cny":"300",
+            "charged_with_cost_micro_cny":"2000", "rows_with_cost":"1", "rows_without_cost":"0",
+            "unpriced_rows":"0", "rows":"2"
+        }),
+    );
+    account_totals(
+        &after,
+        unknown,
+        json!({
+            "charged_micro_cny":"2000", "adjusted_micro_cny":"1000", "known_cost_micro_cny":"0",
+            "charged_with_cost_micro_cny":"0", "rows_with_cost":"0", "rows_without_cost":"1",
+            "unpriced_rows":"0", "rows":"1"
+        }),
+    );
     let again =
         w.cp.send(
             "POST",
@@ -420,6 +465,7 @@ async fn money_stays_exact_above_javascript_and_bigint_aggregate_limits() {
 async fn pending_overlay_and_flushed_rollups_agree_for_partial_and_whole_days() {
     let Some(w) = world().await else { return };
     let model = seed_model(&w.cp, &w.admin).await;
+    let account = seed_provider_key(&w.cp, &w.admin).await;
     insert_baseline_backdated(
         w.cp.db(),
         model,
@@ -439,24 +485,9 @@ async fn pending_overlay_and_flushed_rollups_agree_for_partial_and_whole_days() 
         .await
         .expect("仅测试：占用投影互斥行");
     let events = vec![
-        usage(
-            &w,
-            "edge-start",
-            model,
-            json!({"occurred_at":"2021-01-01T12:00:00Z", "prompt_tokens":1000}),
-        ),
-        usage(
-            &w,
-            "whole-day",
-            model,
-            json!({"occurred_at":"2021-01-02T12:00:00Z", "prompt_tokens":1000}),
-        ),
-        usage(
-            &w,
-            "edge-end",
-            model,
-            json!({"occurred_at":"2021-01-03T11:59:59Z", "prompt_tokens":1000}),
-        ),
+        served(&w, "edge-start", model, account, at("2021-01-01T12:00:00Z")),
+        served(&w, "whole-day", model, account, at("2021-01-02T12:00:00Z")),
+        served(&w, "edge-end", model, account, at("2021-01-03T11:59:59Z")),
     ];
     let sent = deliver(&w.dp, Uuid::new_v4(), events.clone()).await;
     assert_eq!(sent.status, 200, "{sent:?}");
@@ -487,12 +518,112 @@ async fn pending_overlay_and_flushed_rollups_agree_for_partial_and_whole_days() 
                 "unpriced_rows":"0", "rows":rows
             }),
         );
+        account_totals(&r, account, r.body["totals"].clone());
         before.push(r.body);
     }
     fence.rollback().await.expect("释放测试投影互斥行");
     drain(w.cp.db()).await;
     for (window, expected) in windows.into_iter().zip(before) {
         assert_eq!(report(&w.cp, &w.admin, window).await.body, expected);
+    }
+}
+
+// 升级期间继续读取已存在的全站汇总，旧快照回放后恢复账号金额。
+#[tokio::test]
+async fn account_replay_after_upgrade_keeps_existing_totals_available() {
+    let Some(pool) = database_at(74).await else {
+        return;
+    };
+    let mut tx = pool.begin().await.expect("准备升级前的调用和日汇总");
+    let account = Uuid::new_v4();
+    let seq = fixture_charge(
+        &mut tx,
+        "before-account-upgrade",
+        at("2026-10-15T13:00:00Z"),
+        50,
+        Some(35),
+    )
+    .await;
+    sqlx::query("UPDATE usage_events SET event = jsonb_build_object('provider_key_id', $1::uuid) WHERE event_id = 'before-account-upgrade'")
+        .bind(account).execute(&mut *tx).await.expect("归属既有上游账号");
+    sqlx::query("UPDATE usage_metric_inputs SET projection_version = 2, text_provider_key_id = $1 WHERE event_id = 'before-account-upgrade'")
+        .bind(Uuid::new_v4().to_string()).execute(&mut *tx).await.expect("复现当前版本不能解释的窄投影");
+    let projected: i64 = sqlx::query_scalar(include_str!("../src/billing/profit_project.sql"))
+        .bind(["before-account-upgrade"])
+        .fetch_one(&mut *tx)
+        .await
+        .expect("按旧版 SQL 完成投影");
+    assert_eq!(projected, 1);
+    sqlx::query("UPDATE billing_profit_backfill SET after_seq = $1, high_seq = $1, complete = true WHERE version = 1")
+        .bind(seq).execute(&mut *tx).await.expect("准备已经追齐的旧版游标");
+    tx.commit().await.expect("提交升级前状态");
+    migrate_rest(&pool).await.expect("应用生产迁移");
+    let mut fence = pool.begin().await.expect("暂停独立的账号回放");
+    sqlx::query("SELECT version FROM billing_profit_backfill WHERE version = 2 FOR UPDATE")
+        .execute(&mut *fence)
+        .await
+        .expect("持有账号游标锁");
+    let cp = into_test_cp(pool).await;
+    let viewer = cp.admin_login_seeded(OperatorRole::Viewer).await;
+    let expected = json!({
+        "charged_micro_cny":"50", "adjusted_micro_cny":"0", "known_cost_micro_cny":"35",
+        "charged_with_cost_micro_cny":"50", "rows_with_cost":"1", "rows_without_cost":"0",
+        "unpriced_rows":"0", "rows":"1"
+    });
+    let pending = cp.send("GET", PATH, Some(viewer.cookie()), None).await;
+    totals(&pending, expected.clone());
+    assert_eq!(pending.body.get("accounts"), Some(&Value::Null));
+    let mut old_writer = cp
+        .db()
+        .pool()
+        .begin()
+        .await
+        .expect("准备仍在运行的旧版投影");
+    fixture_charge(
+        &mut old_writer,
+        "after-account-upgrade",
+        at("2026-10-15T13:01:00Z"),
+        10,
+        Some(4),
+    )
+    .await;
+    sqlx::query("UPDATE usage_events SET event = jsonb_build_object('provider_key_id', $1::uuid) WHERE event_id = 'after-account-upgrade'")
+        .bind(account).execute(&mut *old_writer).await.expect("准备升级后的同账号调用");
+    sqlx::query("SELECT version FROM billing_profit_backfill WHERE version = 1 FOR UPDATE")
+        .execute(&mut *old_writer)
+        .await
+        .expect("沿用旧投影写锁");
+    let projected: i64 = sqlx::query_scalar(include_str!("../src/billing/profit_project.sql"))
+        .bind(["after-account-upgrade"])
+        .fetch_one(&mut *old_writer)
+        .await
+        .expect("旧版 SQL 继续服务");
+    assert_eq!(projected, 1);
+    old_writer.commit().await.expect("提交旧版投影写入");
+    let expected = json!({
+        "charged_micro_cny":"60", "adjusted_micro_cny":"0", "known_cost_micro_cny":"39",
+        "charged_with_cost_micro_cny":"60", "rows_with_cost":"2", "rows_without_cost":"0",
+        "unpriced_rows":"0", "rows":"2"
+    });
+    let pending = cp.send("GET", PATH, Some(viewer.cookie()), None).await;
+    totals(&pending, expected.clone());
+    assert_eq!(pending.body.get("accounts"), Some(&Value::Null));
+    fence.rollback().await.expect("恢复账号回放");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let answer = report(&cp, &viewer, None).await;
+        totals(&answer, expected.clone());
+        if !answer.body["accounts"].is_null() {
+            account_totals(&answer, account, expected);
+            assert_eq!(
+                answer.body["accounts"][0].get("provider_key_display_name"),
+                Some(&Value::Null)
+            );
+            break;
+        }
+        assert!(Instant::now() < deadline, "账号历史没有在五秒内追齐");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1326,19 +1457,19 @@ async fn profit_projection_concurrent_intake_observation() {
     }
 }
 
-fn charge_plan_nodes<'a>(value: &'a Value, nodes: &mut Vec<&'a Value>) {
+fn relation_plan_nodes<'a>(value: &'a Value, relation: &str, nodes: &mut Vec<&'a Value>) {
     match value {
         Value::Object(object) => {
-            if object.get("Relation Name").and_then(Value::as_str) == Some("pricing_charges_cny") {
+            if object.get("Relation Name").and_then(Value::as_str) == Some(relation) {
                 nodes.push(value);
             }
             for child in object.values() {
-                charge_plan_nodes(child, nodes);
+                relation_plan_nodes(child, relation, nodes);
             }
         }
         Value::Array(values) => {
             for child in values {
-                charge_plan_nodes(child, nodes);
+                relation_plan_nodes(child, relation, nodes);
             }
         }
         _ => {}
@@ -1396,12 +1527,13 @@ async fn profit_summary_plans_never_scan_complete_day_charges_for_empty_partial_
             .bind(whole_from)
             .bind(whole_to)
             .bind(Vec::<String>::new())
+            .bind(true)
             .persistent(false)
             .fetch_one(db.pool())
             .await
             .expect("运行真实汇总 SQL 的实际执行计划");
         let mut nodes = Vec::new();
-        charge_plan_nodes(&plan, &mut nodes);
+        relation_plan_nodes(&plan, "pricing_charges_cny", &mut nodes);
         let mut executed = 0;
         for node in nodes {
             let loops = node
@@ -1447,6 +1579,56 @@ async fn profit_summary_plans_never_scan_complete_day_charges_for_empty_partial_
             json!({"observation":"billing_profit_summary_query_plan", "scenario":name, "plan":plan})
         );
     }
+}
+
+#[tokio::test]
+async fn account_profit_reads_narrow_attribution_for_pending_and_partial_days() {
+    let Some(bare) = BareDatabase::new().await else {
+        return;
+    };
+    let db = &bare.db;
+    let mut tx = db.pool().begin().await.expect("准备跨 UTC 日窗口");
+    let account = Uuid::new_v4();
+    for (id, time) in [
+        ("account-profit-edge", "2020-01-01T12:00:00Z"),
+        ("account-profit-pending", "2020-01-02T12:00:00Z"),
+    ] {
+        fixture_charge(&mut tx, id, at(time), 25, Some(5)).await;
+        sqlx::query("UPDATE usage_events SET event = jsonb_build_object('provider_key_id', $2::uuid) WHERE event_id = $1")
+            .bind(id).bind(account).execute(&mut *tx).await.expect("保留真实窄投影的账号标识");
+    }
+    tx.commit().await.expect("提交收费与窄投影");
+    let explain = format!(
+        "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {}",
+        include_str!("../src/billing/profit_summary.sql")
+    );
+    let plan: Value = sqlx::query_scalar(&explain)
+        .bind(at("2020-01-01T11:00:00Z"))
+        .bind(at("2020-01-04T08:00:00Z"))
+        .bind(at("2020-01-02T00:00:00Z"))
+        .bind(at("2020-01-04T00:00:00Z"))
+        .bind(["account-profit-edge", "account-profit-pending"])
+        .bind(true)
+        .persistent(false)
+        .fetch_one(db.pool())
+        .await
+        .expect("执行含真实账号的首边界和脏记录计划");
+    let mut nodes = Vec::new();
+    relation_plan_nodes(&plan, "usage_metric_inputs", &mut nodes);
+    assert!(
+        nodes.iter().any(|node| node["Actual Rows"]
+            .as_f64()
+            .is_some_and(|value| value > 0.0)),
+        "{plan}"
+    );
+    nodes.clear();
+    relation_plan_nodes(&plan, "usage_events", &mut nodes);
+    assert!(
+        nodes
+            .iter()
+            .all(|node| node["Actual Loops"].as_f64() == Some(0.0)),
+        "已有窄投影时不读取原始事件：{plan}"
+    );
 }
 
 // 空队列上准备的旧计划不能在历史快速增长后把一个短批变成整表扫描。

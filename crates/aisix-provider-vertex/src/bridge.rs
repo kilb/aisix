@@ -25,6 +25,7 @@
 //! `https://aiplatform.<us|eu>.rep.googleapis.com` for the `us` / `eu`
 //! multi-region locations).
 
+use aisix_gateway::upstream_http::with_buffered_response_deadline;
 use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{
     chat::ChatChoice,
@@ -44,7 +45,7 @@ use http::{
     header::{HeaderName, HeaderValue},
     HeaderMap,
 };
-use reqwest::{header, Client, StatusCode};
+use reqwest::{header, Client, RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -644,9 +645,9 @@ async fn with_deadline<T, F>(
 where
     F: std::future::Future<Output = Result<T, BridgeError>>,
 {
-    match deadline {
+    match remaining_deadline(deadline, started) {
         None => fut.await,
-        Some(d) => match tokio::time::timeout(d.saturating_sub(started.elapsed()), fut).await {
+        Some(remaining) => match tokio::time::timeout(remaining, fut).await {
             Ok(r) => r,
             Err(_) => Err(BridgeError::Timeout {
                 elapsed_ms: started.elapsed().as_millis() as u64,
@@ -654,6 +655,40 @@ where
             }),
         },
     }
+}
+
+fn remaining_deadline(deadline: Option<Duration>, started: Instant) -> Option<Duration> {
+    deadline.map(|budget| budget.saturating_sub(started.elapsed()))
+}
+
+async fn send_buffered<T, F>(
+    deadline: Option<Duration>,
+    started: Instant,
+    request: RequestBuilder,
+    protocol: Protocol,
+    consume: impl FnOnce(reqwest::Response) -> F,
+) -> Result<T, BridgeError>
+where
+    F: std::future::Future<Output = Result<T, BridgeError>>,
+{
+    with_buffered_response_deadline(
+        remaining_deadline(deadline, started),
+        started,
+        async move {
+            upstream_io::send(request, protocol)
+                .await
+                .map_err(aisix_gateway::send_error)
+        },
+        |response| async {
+            aisix_gateway::note_upstream_response(response.headers());
+            let status = response.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, response).await);
+            }
+            consume(response).await
+        },
+    )
+    .await
 }
 
 /// Map an upstream HTTP error to a [`BridgeError::UpstreamStatus`]
@@ -1000,63 +1035,58 @@ impl Bridge for VertexBridge {
         let client = self.client_for(ctx);
         let model_echo = req.model.clone();
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Embeddings,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let parsed: VertexPredictEmbeddingsResponse = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(body),
+            Protocol::Embeddings,
+            |resp| async move {
+                let parsed: VertexPredictEmbeddingsResponse = resp
+                    .json()
+                    .await
+                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
 
-            let mut data = Vec::with_capacity(parsed.predictions.len());
-            let mut prompt_tokens: u64 = 0;
-            let mut usage_reported = !parsed.predictions.is_empty();
-            for (i, p) in parsed.predictions.into_iter().enumerate() {
-                if let Some(token_count) = p
-                    .embeddings
-                    .statistics
-                    .as_ref()
-                    .and_then(|stats| stats.token_count)
-                {
-                    prompt_tokens += token_count;
-                } else {
-                    usage_reported = false;
+                let mut data = Vec::with_capacity(parsed.predictions.len());
+                let mut prompt_tokens: u64 = 0;
+                let mut usage_reported = !parsed.predictions.is_empty();
+                for (i, p) in parsed.predictions.into_iter().enumerate() {
+                    if let Some(token_count) = p
+                        .embeddings
+                        .statistics
+                        .as_ref()
+                        .and_then(|stats| stats.token_count)
+                    {
+                        prompt_tokens += token_count;
+                    } else {
+                        usage_reported = false;
+                    }
+                    data.push(EmbeddingObject {
+                        index: i as u32,
+                        object: "embedding".to_string(),
+                        embedding: EmbeddingVector::Float(p.embeddings.values),
+                    });
                 }
-                data.push(EmbeddingObject {
-                    index: i as u32,
-                    object: "embedding".to_string(),
-                    embedding: EmbeddingVector::Float(p.embeddings.values),
-                });
-            }
-            let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
-            let source = if usage_reported {
-                EmbeddingUsageSource::Reported
-            } else {
-                EmbeddingUsageSource::Unavailable
-            };
-            Ok(EmbeddingResponse {
-                object: "list".to_string(),
-                model: model_echo,
-                data,
-                usage: EmbeddingUsage {
-                    prompt_tokens: tokens,
-                    total_tokens: tokens,
-                    // The upstream reports no total; the one above is the
-                    // prompt count, filled for the client.
-                    upstream_total_tokens: 0,
-                    source,
-                },
-            })
-        })
+                let tokens = prompt_tokens.min(u32::MAX as u64) as u32;
+                let source = if usage_reported {
+                    EmbeddingUsageSource::Reported
+                } else {
+                    EmbeddingUsageSource::Unavailable
+                };
+                Ok(EmbeddingResponse {
+                    object: "list".to_string(),
+                    model: model_echo,
+                    data,
+                    usage: EmbeddingUsage {
+                        prompt_tokens: tokens,
+                        total_tokens: tokens,
+                        // The upstream reports no total; the one above is the
+                        // prompt count, filled for the client.
+                        upstream_total_tokens: 0,
+                        source,
+                    },
+                })
+            },
+        )
         .await
     }
 }
@@ -1160,28 +1190,22 @@ impl VertexBridge {
         with_shared_request_type(&mut headers, shared_request_type);
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Gemini,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-            // Every field of this shape has a default, so a 2xx that reports
-            // an error would otherwise read as an empty answer.
-            let parsed: GeminiGenerateContentResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
-                    .await?;
-            Ok(gemini_response_into_chat_response(parsed, upstream_id)
-                .with_fallback_service_tier(header_tier))
-        })
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(body),
+            Protocol::Gemini,
+            |resp| async move {
+                let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+                // Every field of this shape has a default, so a 2xx that reports
+                // an error would otherwise read as an empty answer.
+                let parsed: GeminiGenerateContentResponse =
+                    aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                        .await?;
+                Ok(gemini_response_into_chat_response(parsed, upstream_id)
+                    .with_fallback_service_tier(header_tier))
+            },
+        )
         .await
     }
 
@@ -1303,27 +1327,21 @@ impl VertexBridge {
         retain_vertex_betas(&mut headers)?;
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body_value),
-                Protocol::Messages,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let parsed: AnthropicResponse =
-                aisix_provider_anthropic::wire::decode_success_body(resp).await?;
-            let mut chat = response_into_chat_response(parsed);
-            if synthetic_json_tool {
-                unwrap_json_tool_call(&mut chat);
-            }
-            Ok(chat)
-        })
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(body_value),
+            Protocol::Messages,
+            |resp| async move {
+                let parsed: AnthropicResponse =
+                    aisix_provider_anthropic::wire::decode_success_body(resp).await?;
+                let mut chat = response_into_chat_response(parsed);
+                if synthetic_json_tool {
+                    unwrap_json_tool_call(&mut chat);
+                }
+                Ok(chat)
+            },
+        )
         .await
     }
 
@@ -1590,24 +1608,20 @@ impl VertexBridge {
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Chat,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-            let parsed: OpenAiResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
-                    .await?;
-            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
-        })
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(body),
+            Protocol::Chat,
+            |resp| async move {
+                let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+                let parsed: OpenAiResponse =
+                    aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                        .await?;
+                Ok(openai_response_into_chat_response(parsed)
+                    .with_fallback_service_tier(header_tier))
+            },
+        )
         .await
     }
 
@@ -1846,24 +1860,20 @@ impl VertexBridge {
         let headers = build_request_headers(&access_token, &ctx.request_id, &ctx.header_ctx())?;
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Chat,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-            let parsed: OpenAiResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
-                    .await?;
-            Ok(openai_response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
-        })
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(body),
+            Protocol::Chat,
+            |resp| async move {
+                let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
+                let parsed: OpenAiResponse =
+                    aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::Vertex)
+                        .await?;
+                Ok(openai_response_into_chat_response(parsed)
+                    .with_fallback_service_tier(header_tier))
+            },
+        )
         .await
     }
 

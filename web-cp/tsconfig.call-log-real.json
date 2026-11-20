@@ -1,4 +1,4 @@
 {
   "extends": "./tsconfig.json",
-  "include": ["src", "e2e-real/call-log.spec.ts", "playwright.call-log-real.config.ts"]
+  "include": ["src", "e2e-real/call-log.spec.ts", "e2e-real/call-cancel-timing.spec.ts", "playwright.call-log-real.config.ts"]
 }

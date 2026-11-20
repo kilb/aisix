@@ -242,8 +242,8 @@ for (const surface of ['admin', 'tenant']) {
         const text = (await cell.innerText()).trim();
         expect(text, 'time cell shows a date and clock on separate lines').toMatch(/\d{4}-\d{2}-\d{2}\s*\n\s*\d{2}:\d{2}:\d{2}/);
         const p = row.locator('td').nth(perfIndex);
-        await expect(p).toContainText('首字');
-        await expect(p).toContainText('总用时');
+        await expect(p).toContainText('请求首内容');
+        await expect(p).toContainText(/本次上游耗时|尝试开始至断开/);
         await expect(p).toContainText('输出 TPS');
       }
       await noOverflow(page);

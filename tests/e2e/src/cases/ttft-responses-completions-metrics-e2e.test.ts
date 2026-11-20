@@ -39,6 +39,7 @@ const CALLER_KEY_HASH = createHash("sha256")
 const TTFT_HISTOGRAM_COUNT = "aisix_request_ttft_seconds_count";
 const TTFT_HISTOGRAM_SUM = "aisix_request_ttft_seconds_sum";
 const TTFT_LEGACY_COUNT = "aisix_llm_time_to_first_token_seconds_count";
+const FIRST_CONTENT_COUNT = "aisix_request_first_content_seconds_count";
 const E2E_HISTOGRAM_COUNT = "aisix_request_e2e_latency_seconds_count";
 
 /** 上游发出首帧前的等待：正确的 TTFT 一定不小于它。 */
@@ -423,6 +424,10 @@ async function expectStreamTtft(
     (LEAD_MS + GAP_MS) / 1000,
   );
 
+  for (const side of ["upstream", "downstream"]) {
+    expect(metricDelta(before, after, FIRST_CONTENT_COUNT, { endpoint: path, side })).toBe(1);
+  }
+
   // 用量事件是同一次测量的另一个出口。
   const ttftMs = Number((await usageSpan(fx, requestId))["aisix.upstream_ttft_ms"]);
   expect(ttftMs, "usage event upstream_ttft_ms is at least the lead time").toBeGreaterThanOrEqual(
@@ -528,6 +533,7 @@ describe("TTFT metrics on /v1/responses and /v1/completions streams", () => {
         metricDelta(before, after, TTFT_LEGACY_COUNT, want),
         `${path}: legacy TTFT summary observations`,
       ).toBe(0);
+      expect(metricDelta(before, after, FIRST_CONTENT_COUNT, { endpoint: path })).toBe(0);
     }
   });
 });
