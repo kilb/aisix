@@ -7855,81 +7855,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocked_session_does_not_retry_or_fail_over_on_configured_403() {
-        for (message, expected_status, primary_attempts, fallback_attempts) in [
-            (
+    async fn upstream_403_uses_the_configured_retry_policy_regardless_of_message() {
+        for stream in [false, true] {
+            for message in [
                 "This session is blocked after a refusal or fallback. Start a new session to continue.",
-                StatusCode::FORBIDDEN,
-                1,
-                0,
-            ),
-            (
                 "This session is blocked after a Claude refusal or fallback. Start a new session to continue.",
-                StatusCode::FORBIDDEN,
-                1,
-                0,
-            ),
-            ("Provider temporarily unavailable", StatusCode::OK, 3, 1),
-        ] {
-            let primary = MockServer::builder().start().await;
-            let fallback = MockServer::builder().start().await;
-            Mock::given(method("POST"))
-                .and(path("/v1/messages"))
-                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-                    "type": "error",
-                    "error": {"type": "permission_error", "message": message}
-                })))
-                .mount(&primary)
-                .await;
-            Mock::given(method("POST"))
-                .and(path("/v1/messages"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(anthropic_response()))
-                .mount(&fallback)
-                .await;
-
-            let snap = new_snap_anthropic(&primary.uri());
-            snap.models.insert(anthropic_model("primary"));
-            let fallback_key = "55555555-5555-5555-5555-555555555555";
-            snap.provider_keys.insert(ResourceEntry::from_arc(
-                fallback_key,
-                anthropic_pk(&fallback.uri()).value,
-                1,
-            ));
-            let mut fallback_model = (*anthropic_model("fallback").value).clone();
-            fallback_model.provider_key_id = Some(fallback_key.into());
-            snap.models
-                .insert(ResourceEntry::new("m-fallback", fallback_model, 1));
-            let group: Model = serde_json::from_value(serde_json::json!({
-                "display_name": "group",
-                "routing": {
-                    "strategy": "failover",
-                    "targets": [{"model": "primary"}, {"model": "fallback"}],
-                    "retries": 2,
-                    "fallback_on_statuses": [403]
+                "Provider temporarily unavailable",
+            ] {
+                for retry_403 in [false, true] {
+                    assert_upstream_403_policy(message, stream, retry_403).await;
                 }
-            }))
-            .unwrap();
-            snap.models.insert(ResourceEntry::new("m-group", group, 1));
-            snap.apikeys.insert(apikey_entry(&["*"]));
+            }
+        }
+    }
 
-            let resp = build_app(snap)
-                .oneshot(make_req(serde_json::json!({
-                    "model": "group",
-                    "messages": [{"role": "user", "content": "Hello"}],
-                    "max_tokens": 16
-                })))
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), expected_status, "{message}");
-            assert_eq!(
-                primary.received_requests().await.unwrap().len(),
-                primary_attempts,
-                "{message}"
-            );
-            assert_eq!(
-                fallback.received_requests().await.unwrap().len(),
-                fallback_attempts,
-                "{message}"
+    async fn assert_upstream_403_policy(message: &str, stream: bool, retry_403: bool) {
+        let primary = MockServer::builder().start().await;
+        let fallback = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "type": "error",
+                "error": {"type": "permission_error", "message": message}
+            })))
+            .mount(&primary)
+            .await;
+        let success = if stream {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":",
+                    "{\"id\":\"msg_fallback\",\"type\":\"message\",\"role\":\"assistant\",",
+                    "\"content\":[],\"model\":\"claude-3-5-haiku-20241022\",",
+                    "\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                ))
+        } else {
+            ResponseTemplate::new(200).set_body_json(anthropic_response())
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(success)
+            .mount(&fallback)
+            .await;
+
+        let snap = new_snap_anthropic(&primary.uri());
+        snap.models.insert(anthropic_model("primary"));
+        let fallback_key = "55555555-5555-5555-5555-555555555555";
+        snap.provider_keys.insert(ResourceEntry::from_arc(
+            fallback_key,
+            anthropic_pk(&fallback.uri()).value,
+            1,
+        ));
+        let mut fallback_model = (*anthropic_model("fallback").value).clone();
+        fallback_model.provider_key_id = Some(fallback_key.into());
+        snap.models
+            .insert(ResourceEntry::new("m-fallback", fallback_model, 1));
+        let group: Model = serde_json::from_value(serde_json::json!({
+            "display_name": "group",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "primary"}, {"model": "fallback"}],
+                "retries": 2,
+                "fallback_on_statuses": if retry_403 { &[403][..] } else { &[][..] }
+            }
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["*"]));
+
+        let resp = build_app(snap)
+            .oneshot(make_req(serde_json::json!({
+                "model": "group",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 16,
+                "stream": stream
+            })))
+            .await
+            .unwrap();
+        let case = format!("{message}, stream={stream}, retry_403={retry_403}");
+        assert_eq!(
+            resp.status(),
+            if retry_403 {
+                StatusCode::OK
+            } else {
+                StatusCode::FORBIDDEN
+            },
+            "{case}"
+        );
+        assert_eq!(
+            primary.received_requests().await.unwrap().len(),
+            if retry_403 { 3 } else { 1 },
+            "{case}"
+        );
+        let fallback_requests = fallback.received_requests().await.unwrap();
+        assert_eq!(fallback_requests.len(), usize::from(retry_403), "{case}");
+        if let Some(request) = fallback_requests.first() {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "claude-3-5-haiku-20241022", "{case}");
+        }
+        if retry_403 && stream {
+            let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            assert!(
+                body.contains("msg_fallback") && body.contains("event: message_stop"),
+                "{case}"
             );
         }
     }
