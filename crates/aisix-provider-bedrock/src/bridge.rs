@@ -1435,8 +1435,9 @@ impl Bridge for BedrockBridge {
                     .interceptor(io.clone())
                     .send();
                 let resp = within_buffered_attempt(deadline, started, &io, async {
-                    send.await
-                        .map_err(|e| crate::errors::sdk_error(e, started, deadline))
+                    send.await.map_err(|error| {
+                        crate::errors::buffered_sdk_error(error, started, deadline)
+                    })
                 })
                 .await?;
                 let parsed: TitanEmbedResponse = serde_json::from_slice(resp.body().as_ref())
@@ -1505,7 +1506,7 @@ impl Bridge for BedrockBridge {
                 .send();
             let resp = within_buffered_attempt(deadline, started, &io, async {
                 send.await
-                    .map_err(|e| crate::errors::sdk_error(e, started, deadline))
+                    .map_err(|error| crate::errors::buffered_sdk_error(error, started, deadline))
             })
             .await?;
             let parsed: CohereEmbedResponse = serde_json::from_slice(resp.body().as_ref())
@@ -1804,7 +1805,7 @@ impl BedrockBridge {
             .interceptor(io)
             .send()
             .await
-            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+            .map_err(|error| crate::errors::buffered_sdk_error(error, started, deadline))?;
         let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&resp)
             .unwrap_or_default()
             .to_string();
@@ -1982,7 +1983,7 @@ impl BedrockBridge {
             .interceptor(io)
             .send()
             .await
-            .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+            .map_err(|error| crate::errors::buffered_sdk_error(error, started, deadline))?;
         let request_id = aws_sdk_bedrockruntime::operation::RequestId::request_id(&resp)
             .unwrap_or_default()
             .to_string();

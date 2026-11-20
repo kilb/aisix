@@ -118,6 +118,28 @@ pub(crate) fn in_band_error(
     }
 }
 
+pub(crate) fn buffered_sdk_error<E>(
+    err: SdkError<E, aws_smithy_runtime_api::http::Response>,
+    started: Instant,
+    deadline: Option<Duration>,
+) -> BridgeError
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+{
+    if let SdkError::ResponseError(response) = &err {
+        let status = response.raw().status();
+        if status.is_success() {
+            let reason = "Bedrock SDK could not read or decode the upstream response".to_string();
+            return BridgeError::UpstreamBodyUnread {
+                status: status.as_u16(),
+                decode_error: reason.clone(),
+                reason,
+            };
+        }
+    }
+    sdk_error(err, started, deadline)
+}
+
 /// An AWS SDK operation failure.
 pub(crate) fn sdk_error<E>(
     err: SdkError<E, aws_smithy_runtime_api::http::Response>,

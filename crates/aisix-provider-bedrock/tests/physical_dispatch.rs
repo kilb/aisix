@@ -272,6 +272,46 @@ async fn sdk_count_tokens_buffered_deadline_distinguishes_success_head() {
 }
 
 #[tokio::test]
+async fn sdk_download_stall_after_success_is_terminal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (finish, finished) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        assert!(read_request_head(&mut socket)
+            .await
+            .starts_with("POST /model/"));
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nx-amzn-requestid: local-sdk-stall\r\n\r\n{").await.unwrap();
+        tokio::select! {
+            biased;
+            second = listener.accept() => panic!("unexpected second SDK request: {second:?}"),
+            done = finished => done.unwrap(),
+        }
+    });
+    let tap = Arc::new(ResponseHeaderTap::default());
+    let ctx = context(&base, SECRET).with_deadline(Duration::from_secs(60));
+    let bridge = BedrockBridge::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(30),
+        aisix_gateway::response_tap::scope(tap.clone(), async {
+            bridge.anthropic_messages(input(), &ctx).await.map(|_| ())
+        }),
+    )
+    .await
+    .expect("SDK stall protection must fire before the gateway's deadline");
+    finish.send(()).unwrap();
+    server.await.unwrap();
+    assert_eq!(tap.capture().request_id, "local-sdk-stall");
+    assert!(
+        matches!(
+            result,
+            Err(BridgeError::UpstreamBodyUnread { status: 200, .. })
+        ),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn sdk_embed_buffered_deadline_distinguishes_success_head() {
     buffered_deadline("amazon.titan-embed-text-v2:0", "/invoke", false).await;
     buffered_deadline("cohere.embed-english-v3", "/invoke", false).await;
@@ -356,6 +396,7 @@ async fn buffered_deadline(model_name: &str, path: &'static str, native_messages
     for accepted in [false, true] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let (received, mut request_seen) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let head = read_request_head(&mut socket).await;
@@ -368,6 +409,7 @@ async fn buffered_deadline(model_name: &str, path: &'static str, native_messages
             assert!(head
                 .to_ascii_lowercase()
                 .contains("authorization: aws4-hmac-sha256"));
+            received.send(()).unwrap();
             if accepted {
                 // 先交付成功响应头和第一个字节，继续扣住剩余正文直到预算耗尽。
                 socket
@@ -400,6 +442,9 @@ async fn buffered_deadline(model_name: &str, path: &'static str, native_messages
             }
         })
         .await;
+        request_seen
+            .try_recv()
+            .expect("upstream must see the signed request");
         assert!(tap.http_dispatched());
         if accepted {
             assert_eq!(tap.capture().request_id, "local-accepted");

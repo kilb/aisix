@@ -97,7 +97,7 @@ impl BedrockBridge {
                 .interceptor(io)
                 .send()
                 .await
-                .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
+                .map_err(|error| crate::errors::buffered_sdk_error(error, started, deadline))?;
             let json: Value = serde_json::from_slice(resp.body().as_ref())
                 .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))?;
             return Ok(NativeMessages::Json(json));
@@ -194,7 +194,9 @@ impl BedrockBridge {
                 .interceptor(io.clone())
                 .send()
                 .await
-                .map_err(|error| crate::errors::sdk_error(error, operation_started, ctx.deadline))
+                .map_err(|error| {
+                    crate::errors::buffered_sdk_error(error, operation_started, ctx.deadline)
+                })
         })
         .await;
         match runtime {
