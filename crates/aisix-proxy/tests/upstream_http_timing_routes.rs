@@ -12,7 +12,7 @@ use aisix_gateway::Hub;
 use aisix_obs::{UsageEvent, UsageSink};
 use aisix_proxy::{build_router, ProxyState};
 use axum::body::{to_bytes, Body, Bytes};
-use axum::extract::ConnectInfo;
+use axum::extract::{ConnectInfo, FromRequest, Multipart};
 use axum::http::{Request, Response, StatusCode};
 use futures::StreamExt;
 use serde_json::{json, Value};
@@ -25,6 +25,7 @@ const GAP: Duration = Duration::from_millis(60);
 const ENTRY_WAIT: Duration = Duration::from_millis(300);
 const DEADLINE: Duration = Duration::from_secs(10);
 const PK: &str = "22222222-2222-4222-8222-222222222222";
+const MODEL_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 #[derive(Clone, Copy, Debug)]
 enum Family {
@@ -33,6 +34,7 @@ enum Family {
     Messages,
     ResponsesNative,
     ResponsesChatBridge,
+    Transcription,
 }
 
 impl Family {
@@ -42,6 +44,7 @@ impl Family {
             Self::Completions => "/v1/completions",
             Self::Messages => "/v1/messages",
             Self::ResponsesNative | Self::ResponsesChatBridge => "/v1/responses",
+            Self::Transcription => "/v1/audio/transcriptions",
         }
     }
 
@@ -62,6 +65,7 @@ impl Family {
 
     fn request(self, stream: bool) -> Value {
         match self {
+            Self::Transcription => json!({"model":"clock-model","stream":stream}),
             Self::Completions => {
                 json!({"model":"clock-model","prompt":"hello","max_tokens":16,"stream":stream})
             }
@@ -137,6 +141,11 @@ impl Family {
                     json!({"type":"response.completed","response":{"id":"resp_clock","object":"response","model":"upstream-clock","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}),
                 ),
             ),
+            Self::Transcription => (
+                sse(json!({"type":"transcript.text.delta","delta":"clock-"})),
+                sse(json!({"type":"transcript.text.delta","delta":"output"})),
+                sse(json!({"type":"transcript.text.done","text":"clock-output"})),
+            ),
         }
     }
 
@@ -154,6 +163,7 @@ impl Family {
             Self::ResponsesNative => {
                 json!({"id":"resp_clock","object":"response","model":"upstream-clock","status":"completed","output":[{"type":"message","id":"msg_clock","role":"assistant","status":"completed","content":[{"type":"output_text","text":"clock-output","annotations":[]}]}],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}})
             }
+            Self::Transcription => json!({"text":"clock-output"}),
         }
     }
 }
@@ -224,10 +234,35 @@ async fn upstream(replies: Vec<Reply>) -> TestResult<Upstream> {
         let seen = seen.clone();
         async move {
             let path = request.uri().path().to_owned();
-            let bytes = to_bytes(request.into_body(), 1048576)
-                .await
-                .map_err(|_| StatusCode::BAD_REQUEST)?;
-            let body = serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?;
+            let body = if path == Family::Transcription.route() {
+                let bad_request = |_| StatusCode::BAD_REQUEST;
+                let mut form = Multipart::from_request(request, &())
+                    .await
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                let mut body = json!({});
+                while let Some(field) = form.next_field().await.map_err(bad_request)? {
+                    match field.name() {
+                        Some("model") => {
+                            body["model"] = json!(field.text().await.map_err(bad_request)?)
+                        }
+                        Some("stream") => {
+                            body["stream"] =
+                                json!(field.text().await.map_err(bad_request)? == "true")
+                        }
+                        Some("file") => {
+                            body["file_bytes"] =
+                                json!(field.bytes().await.map_err(bad_request)?.len())
+                        }
+                        _ => {}
+                    }
+                }
+                body
+            } else {
+                let bytes = to_bytes(request.into_body(), 1048576)
+                    .await
+                    .map_err(|_| StatusCode::BAD_REQUEST)?;
+                serde_json::from_slice(&bytes).map_err(|_| StatusCode::BAD_REQUEST)?
+            };
             seen.send((path, body))
                 .await
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -272,6 +307,16 @@ fn app_with_hold(
     retries: u32,
     held: bool,
 ) -> TestResult<(axum::Router, mpsc::Receiver<UsageEvent>)> {
+    let (state, events) = state_with_hold(base, family, retries, held)?;
+    Ok((build_router(state), events))
+}
+
+fn state_with_hold(
+    base: &str,
+    family: Family,
+    retries: u32,
+    held: bool,
+) -> TestResult<(ProxyState, mpsc::Receiver<UsageEvent>)> {
     let snapshot = AisixSnapshot::new();
     if held {
         let guardrail = serde_json::from_value(json!({
@@ -300,14 +345,13 @@ fn app_with_hold(
         .provider_keys
         .insert(ResourceEntry::new(PK, key, 1));
     let model: Model = serde_json::from_value(json!({
-        "display_name":"clock-model","provider":provider,"model_name":"upstream-clock",
+        "display_name":"clock-model","provider":provider,
+        "model_name":if matches!(family, Family::Transcription) { "gpt-4o-transcribe" } else { "upstream-clock" },
         "provider_key_id":PK,"retries":retries
     }))?;
-    snapshot.models.insert(ResourceEntry::new(
-        "11111111-1111-4111-8111-111111111111",
-        model,
-        1,
-    ));
+    snapshot
+        .models
+        .insert(ResourceEntry::new(MODEL_ID, model, 1));
     let key: ApiKey = serde_json::from_value(json!({
         "key_hash":ApiKey::hash_bearer("clock-caller"),"allowed_models":["clock-model"]
     }))?;
@@ -339,7 +383,7 @@ fn app_with_hold(
     let state = ProxyState::new(SnapshotHandle::new(snapshot), hub, &config)
         .without_cache()
         .with_usage_sink(UsageSink::new(tx));
-    Ok((build_router(state), events))
+    Ok((state, events))
 }
 
 async fn call(
@@ -651,6 +695,264 @@ async fn buffered_token_routes_publish_raw_http_stages_without_stream_samples() 
         .map(buffered_case),
     )
     .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_messages_stream_request_with_stalled_json_is_not_retried() -> TestResult {
+    stream_request_with_stalled_json(Family::Messages).await
+}
+
+#[tokio::test]
+async fn native_responses_stream_request_with_stalled_json_is_not_retried() -> TestResult {
+    stream_request_with_stalled_json(Family::ResponsesNative).await
+}
+
+#[tokio::test]
+async fn transcription_stream_request_with_stalled_json_is_not_retried() -> TestResult {
+    stream_request_with_stalled_json(Family::Transcription).await
+}
+
+async fn stream_request_with_stalled_json(family: Family) -> TestResult {
+    let mut stalled = Reply::buffered(family);
+    stalled.header_delay = Duration::ZERO;
+    stalled.parts[0].0 = Duration::ZERO;
+    stalled.parts[1].0 = Duration::from_millis(650);
+    let mut upstream = upstream(vec![stalled, Reply::buffered(family)]).await?;
+    let (state, mut events) = state_with_hold(&upstream.base, family, 1, false)?;
+    let snapshot = state.snapshot.load();
+    let mut model = (*snapshot
+        .models
+        .get_by_id(MODEL_ID)
+        .ok_or("missing model")?
+        .value)
+        .clone();
+    model.timeout = Some(250);
+    model.cooldown = Some(serde_json::from_value(
+        json!({"enabled":true,"trigger_on_timeout":true}),
+    )?);
+    snapshot
+        .models
+        .insert(ResourceEntry::new(MODEL_ID, model, 2));
+    let router = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = GatewaySocket(tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    }));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(DEADLINE)
+        .build()?;
+    let request = client
+        .post(format!("http://{address}{}", family.route()))
+        .bearer_auth("clock-caller");
+    let request = if matches!(family, Family::Transcription) {
+        let wav = b"RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x02\x00\x00\x00\x00\x00";
+        request.multipart(
+            reqwest::multipart::Form::new()
+                .text("model", "clock-model")
+                .text("stream", "true")
+                .part(
+                    "file",
+                    reqwest::multipart::Part::bytes(wav.to_vec())
+                        .file_name("sample.wav")
+                        .mime_str("audio/wav")?,
+                ),
+        )
+    } else {
+        request
+            .header("anthropic-version", "2023-06-01")
+            .json(&family.request(true))
+    };
+    let response = request.send().await?;
+    let status = response.status();
+    let payload = response.text().await?;
+    let first = event(&mut events).await?;
+    let (path, body) = tokio::time::timeout(DEADLINE, upstream.requests.recv())
+        .await?
+        .ok_or("missing socket attempt")?;
+    assert_eq!(path, family.upstream_route());
+    assert_eq!(body["stream"], true);
+    if matches!(family, Family::Transcription) {
+        assert_eq!(body["model"], "gpt-4o-transcribe");
+        assert_eq!(body["file_bytes"], 46);
+    }
+    let timing = first
+        .upstream_timing
+        .ok_or("missing upstream HTTP timing")?;
+    measured(timing.response_headers_ms, "accepted response headers")?;
+    measured(timing.first_response_byte_ms, "initial buffered body bytes")?;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{family:?}: {payload}");
+    assert_eq!(first.status_code, 502);
+    assert_eq!(first.error_class, "upstream_decode");
+    assert!(
+        first.error_message.contains("HTTP 200") && first.error_message.contains("timed out"),
+        "{}",
+        first.error_message
+    );
+    assert!(first.is_final_attempt);
+    assert!(
+        upstream.requests.try_recv().is_err(),
+        "unexpected upstream replay"
+    );
+    assert!(events.try_recv().is_err(), "unexpected extra usage event");
+    assert_eq!(state.runtime_status.status(MODEL_ID).cooldown_until, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn translated_buffered_messages_retry_only_before_an_accepted_response() -> TestResult {
+    let delay = Duration::from_millis(650);
+    for (primary_status, early_headers, timeout, expected_status, expected_attempts) in [
+        (StatusCode::OK, true, Some(250), StatusCode::BAD_GATEWAY, 1),
+        (StatusCode::OK, false, Some(250), StatusCode::OK, 2),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            true,
+            Some(250),
+            StatusCode::OK,
+            2,
+        ),
+        (StatusCode::OK, true, None, StatusCode::OK, 1),
+    ] {
+        let body = Family::Chat.buffered_reply().to_string().into_bytes();
+        let primary_body = if primary_status.is_success() {
+            body.as_slice()
+        } else {
+            br#"{"error":{"message":"fixture unavailable"}}"#
+        };
+        let first = Reply {
+            status: primary_status,
+            content_type: "application/json",
+            header_delay: if early_headers { Duration::ZERO } else { delay },
+            parts: vec![
+                (Duration::ZERO, Bytes::copy_from_slice(&primary_body[..10])),
+                (
+                    if early_headers { delay } else { Duration::ZERO },
+                    Bytes::copy_from_slice(&primary_body[10..]),
+                ),
+            ],
+        };
+        let second = Reply {
+            status: StatusCode::OK,
+            content_type: "application/json",
+            header_delay: Duration::ZERO,
+            parts: vec![(Duration::ZERO, Bytes::from(body))],
+        };
+        let mut upstream = upstream(vec![first, second]).await?;
+        let (state, mut events) = state_with_hold(&upstream.base, Family::Chat, 0, false)?;
+        let snapshot = state.snapshot.load();
+        let primary_id = MODEL_ID;
+        let mut primary = (*snapshot
+            .models
+            .get_by_id(primary_id)
+            .ok_or("missing primary")?
+            .value)
+            .clone();
+        primary.display_name = "clock-primary".into();
+        primary.model_name = Some("fixture-primary".into());
+        let mut fallback = primary.clone();
+        fallback.display_name = "clock-fallback".into();
+        fallback.model_name = Some("fixture-fallback".into());
+        primary.cooldown = Some(serde_json::from_value(json!({
+            "enabled":true,"trigger_on_timeout":true
+        }))?);
+        snapshot
+            .models
+            .insert(ResourceEntry::new(primary_id, primary, 2));
+        snapshot.models.insert(ResourceEntry::new(
+            "44444444-4444-4444-8444-444444444444",
+            fallback,
+            2,
+        ));
+        let group: Model = serde_json::from_value(json!({
+            "display_name":"clock-model","timeout":timeout,
+            "routing":{"strategy":"failover","retries":0,"targets":[{"model":"clock-primary"},{"model":"clock-fallback"}]}
+        }))?;
+        snapshot.models.insert(ResourceEntry::new(
+            "55555555-5555-4555-8555-555555555555",
+            group,
+            2,
+        ));
+        let router = build_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let _server = GatewaySocket(tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        }));
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(DEADLINE)
+            .build()?
+            .post(format!("http://{address}/v1/messages"))
+            .bearer_auth("clock-caller")
+            .header("anthropic-version", "2023-06-01")
+            .json(&Family::Messages.request(false))
+            .send()
+            .await?;
+        let status = response.status();
+        let payload = response.text().await?;
+        assert_eq!(
+            status, expected_status,
+            "primary_status={primary_status}, early_headers={early_headers}, timeout={timeout:?}, body={payload}"
+        );
+        if status == StatusCode::OK {
+            assert!(payload.contains("clock-output"), "{payload}");
+        }
+        let first = event(&mut events).await?;
+        assert_eq!(first.attempt_index, 0);
+        assert_eq!(first.model_id, primary_id);
+        assert_eq!(first.is_final_attempt, expected_attempts == 1);
+        let timing = first.upstream_timing.ok_or("missing primary HTTP timing")?;
+        assert_eq!(timing.response_headers_ms.is_some(), early_headers);
+        if expected_status == StatusCode::BAD_GATEWAY {
+            assert_eq!(first.status_code, 502);
+            assert_eq!(first.error_class, "upstream_decode");
+            assert!(
+                first.error_message.contains("HTTP 200")
+                    && first.error_message.contains("timed out"),
+                "{}",
+                first.error_message
+            );
+        } else if expected_attempts == 2 {
+            assert_eq!(first.status_code, 504);
+            assert_eq!(first.error_class, "timeout");
+            let second = event(&mut events).await?;
+            assert_eq!(second.status_code, 200);
+            assert_eq!(second.attempt_index, 1);
+            assert_eq!(second.attempt_kind, "fallback");
+            assert!(second.is_final_attempt);
+        }
+        for model in ["fixture-primary", "fixture-fallback"]
+            .into_iter()
+            .take(expected_attempts)
+        {
+            let (path, body) = tokio::time::timeout(DEADLINE, upstream.requests.recv())
+                .await?
+                .ok_or("missing socket attempt")?;
+            assert_eq!(path, "/v1/chat/completions");
+            assert_eq!(body["model"], model);
+        }
+        assert!(
+            upstream.requests.try_recv().is_err(),
+            "unexpected upstream replay"
+        );
+        assert!(events.try_recv().is_err(), "unexpected extra usage event");
+        let runtime = state.runtime_status.status(primary_id);
+        assert_eq!(runtime.cooldown_until.is_some(), expected_attempts == 2);
+        if !early_headers {
+            assert_eq!(runtime.status_reason.as_deref(), Some("request_timeout"));
+        }
+    }
     Ok(())
 }
 

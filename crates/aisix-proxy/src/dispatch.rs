@@ -898,20 +898,28 @@ pub(crate) async fn json_body_within(
     resp: reqwest::Response,
     deadline: Option<std::time::Duration>,
 ) -> Result<serde_json::Value, BridgeError> {
-    let read = resp.json::<serde_json::Value>();
-    match deadline {
-        Some(d) => tokio::time::timeout(d, read)
-            .await
-            .map_err(|_| BridgeError::Timeout {
-                elapsed_ms: d.as_millis() as u64,
-                cause: "upstream answered a streaming request with a JSON body that stalled"
-                    .to_string(),
-            })?
-            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-        None => read
-            .await
-            .map_err(|e| aisix_gateway::upstream_body_read_error(&e)),
-    }
+    read_accepted_body_within(resp, deadline, reqwest::Response::json).await
+}
+
+pub(crate) async fn read_accepted_body_within<T, F>(
+    resp: reqwest::Response,
+    deadline: Option<std::time::Duration>,
+    read: impl FnOnce(reqwest::Response) -> F,
+) -> Result<T, BridgeError>
+where
+    F: std::future::Future<Output = reqwest::Result<T>>,
+{
+    aisix_gateway::upstream_http::with_buffered_response_deadline(
+        deadline,
+        Instant::now(),
+        std::future::ready(Ok(resp)),
+        |resp| async {
+            read(resp)
+                .await
+                .map_err(|err| aisix_gateway::upstream_body_read_error(&err))
+        },
+    )
+    .await
 }
 
 #[cfg(test)]

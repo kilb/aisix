@@ -2,7 +2,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aisix_gateway::{Bridge, BridgeContext, NativeMessages, ResponseHeaderTap};
+use aisix_gateway::{
+    Bridge, BridgeContext, BridgeError, ChatFormat, ChatMessage, NativeMessages, ResponseHeaderTap,
+};
 use aisix_provider_bedrock::BedrockBridge;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +28,36 @@ fn context(base: &str, secret: &str) -> BridgeContext {
 fn input() -> Value {
     json!({"model":"client-name","max_tokens":20,"stream":false,
         "messages":[{"role":"user","content":"local transport check"}]})
+}
+
+async fn read_request_head(socket: &mut tokio::net::TcpStream) -> String {
+    let mut head = Vec::new();
+    let mut byte = [0];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 32768);
+        socket.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+async fn respond_json(mut socket: tokio::net::TcpStream, status: &str, body: &str) {
+    let head = read_request_head(&mut socket).await;
+    let length: usize = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .unwrap();
+    let mut request = vec![0; length];
+    socket.read_exact(&mut request).await.unwrap();
+    let wire = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    socket.write_all(wire.as_bytes()).await.unwrap();
 }
 
 struct Provider {
@@ -211,5 +243,181 @@ async fn sdk_static_credential_preflight_error_never_claims_http_dispatch() {
                 .is_err(),
             "an already rejected preflight cannot contact even the local runtime endpoint"
         );
+    }
+}
+
+#[tokio::test]
+async fn openai_compatible_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline("us.xai.grok-4", "/openai/v1/chat/completions", false).await;
+}
+
+#[tokio::test]
+async fn sdk_messages_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline(MODEL, "/invoke", true).await;
+}
+
+#[tokio::test]
+async fn sdk_chat_invoke_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline(MODEL, "/invoke", false).await;
+}
+
+#[tokio::test]
+async fn sdk_chat_converse_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline("amazon.nova-lite-v1:0", "/converse", false).await;
+}
+
+#[tokio::test]
+async fn sdk_count_tokens_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline(MODEL, "/count-tokens", true).await;
+}
+
+#[tokio::test]
+async fn sdk_embed_buffered_deadline_distinguishes_success_head() {
+    buffered_deadline("amazon.titan-embed-text-v2:0", "/invoke", false).await;
+    buffered_deadline("cohere.embed-english-v3", "/invoke", false).await;
+}
+
+#[tokio::test]
+async fn sdk_titan_success_does_not_classify_the_next_operation() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let (invoked, mut invocations) = mpsc::channel(1);
+    let (release, held) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        respond_json(
+            socket,
+            "200 OK",
+            r#"{"embedding":[1.0],"inputTextTokenCount":3}"#,
+        )
+        .await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        invoked
+            .send(read_request_head(&mut second).await)
+            .await
+            .unwrap();
+        held.await.unwrap();
+    });
+    let mut ctx = context(&base, SECRET).with_deadline(Duration::from_millis(500));
+    Arc::make_mut(&mut ctx.model).model_name = Some("amazon.titan-embed-text-v2:0".into());
+    let req = serde_json::from_value(json!({"model":"local","input":["one","two"]})).unwrap();
+    let result = BedrockBridge::new().embed(&req, &ctx).await;
+    assert!(
+        matches!(result, Err(BridgeError::Timeout { .. })),
+        "{result:?}"
+    );
+    assert!(invocations.try_recv().unwrap().contains("/invoke HTTP/1.1"));
+    release.send(()).unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn mantle_count_tokens_classifies_a_success_head_after_runtime_rejection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    aisix_provider_bedrock::init_mantle_endpoint(Some(base.clone()));
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        respond_json(
+            socket,
+            "400 Bad Request",
+            r#"{"message":"The provided model does not support counting tokens."}"#,
+        )
+        .await;
+        let (mut mantle, _) = listener.accept().await.unwrap();
+        assert!(read_request_head(&mut mantle)
+            .await
+            .starts_with("POST /anthropic/v1/messages/count_tokens HTTP/1.1\r\n"));
+        mantle.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 20\r\nx-amzn-requestid: local-mantle-accepted\r\n\r\n{").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let tap = Arc::new(ResponseHeaderTap::default());
+    let mut ctx = context(&base, SECRET).with_deadline(Duration::from_millis(500));
+    Arc::make_mut(&mut ctx.model).model_name = Some("anthropic.claude-opus-5-5".into());
+    let bridge = BedrockBridge::new();
+    let result = aisix_gateway::response_tap::scope(
+        tap.clone(),
+        bridge.anthropic_count_tokens(input(), &ctx),
+    )
+    .await;
+    assert_eq!(tap.capture().request_id, "local-mantle-accepted");
+    assert!(
+        matches!(
+            result,
+            Err(BridgeError::UpstreamBodyUnread { status: 200, .. })
+        ),
+        "{result:?}"
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+async fn buffered_deadline(model_name: &str, path: &'static str, native_messages: bool) {
+    for accepted in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_request_head(&mut socket).await;
+            let request_line = head.lines().next().unwrap();
+            assert!(request_line.starts_with("POST "));
+            assert!(
+                request_line.ends_with(&format!("{path} HTTP/1.1")),
+                "{request_line}"
+            );
+            assert!(head
+                .to_ascii_lowercase()
+                .contains("authorization: aws4-hmac-sha256"));
+            if accepted {
+                // 先交付成功响应头和第一个字节，继续扣住剩余正文直到预算耗尽。
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nx-amzn-requestid: local-accepted\r\n\r\n{")
+                    .await
+                    .unwrap();
+            }
+            std::future::pending::<()>().await;
+        });
+        let tap = Arc::new(ResponseHeaderTap::default());
+        let mut ctx = context(&base, SECRET);
+        Arc::make_mut(&mut ctx.model).model_name = Some(model_name.into());
+        ctx.deadline = Some(Duration::from_millis(500));
+        let bridge = BedrockBridge::new();
+        let result = aisix_gateway::response_tap::scope(tap.clone(), async {
+            if path == "/count-tokens" {
+                bridge
+                    .anthropic_count_tokens(input(), &ctx)
+                    .await
+                    .map(|_| ())
+            } else if native_messages {
+                bridge.anthropic_messages(input(), &ctx).await.map(|_| ())
+            } else if model_name.contains("embed") {
+                let req = serde_json::from_value(json!({"model":"local","input":["one"]})).unwrap();
+                bridge.embed(&req, &ctx).await.map(|_| ())
+            } else {
+                let req =
+                    ChatFormat::new("local", vec![ChatMessage::user("local transport check")]);
+                bridge.chat(&req, &ctx).await.map(|_| ())
+            }
+        })
+        .await;
+        assert!(tap.http_dispatched());
+        if accepted {
+            assert_eq!(tap.capture().request_id, "local-accepted");
+            assert!(
+                matches!(
+                    result,
+                    Err(BridgeError::UpstreamBodyUnread { status: 200, .. })
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(tap.capture().request_id.is_empty());
+            assert!(
+                matches!(result, Err(BridgeError::Timeout { .. })),
+                "{result:?}"
+            );
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }

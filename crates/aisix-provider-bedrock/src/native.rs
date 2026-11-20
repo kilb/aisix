@@ -20,8 +20,8 @@ use aws_sdk_bedrockruntime::types::{CountTokensInput, InvokeModelTokensRequest, 
 use serde_json::Value;
 
 use crate::bridge::{
-    strip_region_prefix, upstream_model, validate_model_id_chars, within_attempt, BedrockBridge,
-    BedrockPublisher, BedrockSecret,
+    strip_region_prefix, upstream_model, validate_model_id_chars, within_attempt,
+    within_buffered_attempt, BedrockBridge, BedrockPublisher, BedrockSecret,
 };
 
 /// Whether `/v1/messages` for `upstream_id` takes Bedrock's own Anthropic
@@ -41,10 +41,21 @@ impl BedrockBridge {
         body: Value,
         ctx: &BridgeContext,
     ) -> Result<NativeMessages, BridgeError> {
-        within_attempt(
+        let started = Instant::now();
+        if body.get("stream").and_then(Value::as_bool) == Some(true) {
+            return within_attempt(
+                ctx.deadline,
+                started,
+                self.native_messages_attempt(body, ctx, None),
+            )
+            .await;
+        }
+        let io = UpstreamIoInterceptor::new(Protocol::Messages);
+        within_buffered_attempt(
             ctx.deadline,
-            Instant::now(),
-            self.native_messages_attempt(body, ctx),
+            started,
+            &io,
+            self.native_messages_attempt(body, ctx, Some(io.clone())),
         )
         .await
     }
@@ -53,10 +64,10 @@ impl BedrockBridge {
         &self,
         mut body: Value,
         ctx: &BridgeContext,
+        buffered_io: Option<UpstreamIoInterceptor>,
     ) -> Result<NativeMessages, BridgeError> {
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
-        let stream = body.get("stream").and_then(Value::as_bool) == Some(true);
         let fetched = fetch_urls(platform::media_urls(&body), ctx, Encoding::Base64).await?;
         let charged = fetched.charge(ctx);
         let ctx = &*charged;
@@ -75,7 +86,7 @@ impl BedrockBridge {
         let client = self.build_client_from_ctx(ctx).await?;
         let started = Instant::now();
         let deadline = ctx.deadline;
-        if !stream {
+        if let Some(io) = buffered_io {
             let resp = client
                 .invoke_model()
                 .model_id(upstream_id)
@@ -83,7 +94,7 @@ impl BedrockBridge {
                 .accept("application/json")
                 .body(Blob::new(bytes))
                 .customize()
-                .interceptor(UpstreamIoInterceptor::new(Protocol::Messages))
+                .interceptor(io)
                 .send()
                 .await
                 .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -150,19 +161,7 @@ impl BedrockBridge {
         body: Value,
         ctx: &BridgeContext,
     ) -> Result<Value, BridgeError> {
-        within_attempt(
-            ctx.deadline,
-            Instant::now(),
-            self.native_count_tokens_attempt(body, ctx),
-        )
-        .await
-    }
-
-    async fn native_count_tokens_attempt(
-        &self,
-        body: Value,
-        ctx: &BridgeContext,
-    ) -> Result<Value, BridgeError> {
+        let started = Instant::now();
         let upstream_id = upstream_model(ctx)?;
         validate_model_id_chars(upstream_id)?;
         // CountTokens names the base model: no inference-profile prefix, no
@@ -184,17 +183,20 @@ impl BedrockBridge {
                 .build()
                 .map_err(|e| BridgeError::Config(e.to_string()))?,
         );
-        let client = self.build_client_from_ctx(ctx).await?;
-        let started = Instant::now();
-        let runtime = client
-            .count_tokens()
-            .model_id(model_id)
-            .input(input)
-            .customize()
-            .interceptor(io)
-            .send()
-            .await
-            .map_err(|e| crate::errors::sdk_error(e, started, ctx.deadline));
+        let runtime = within_buffered_attempt(ctx.deadline, started, &io, async {
+            let client = self.build_client_from_ctx(ctx).await?;
+            let operation_started = Instant::now();
+            client
+                .count_tokens()
+                .model_id(model_id)
+                .input(input)
+                .customize()
+                .interceptor(io.clone())
+                .send()
+                .await
+                .map_err(|error| crate::errors::sdk_error(error, operation_started, ctx.deadline))
+        })
+        .await;
         match runtime {
             Ok(resp) => Ok(serde_json::json!({"input_tokens": resp.input_tokens()})),
             // bedrock-runtime's CountTokens does not count every Claude model
@@ -203,7 +205,7 @@ impl BedrockBridge {
             Err(BridgeError::UpstreamStatus {
                 status: 400 | 404, ..
             }) if model_id.to_ascii_lowercase().contains("claude") => {
-                mantle_count_tokens(&body, model_id, ctx).await
+                mantle_count_tokens(&body, model_id, ctx, started).await
             }
             Err(e) => Err(e),
         }
@@ -244,6 +246,7 @@ async fn mantle_count_tokens(
     body: &Value,
     model_id: &str,
     ctx: &BridgeContext,
+    started: Instant,
 ) -> Result<Value, BridgeError> {
     let creds = BedrockSecret::parse(&ctx.provider_key.api_key)?;
     let mut count = serde_json::Map::new();
@@ -299,7 +302,7 @@ async fn mantle_count_tokens(
             unsigned.push(("anthropic-beta".to_string(), betas));
         }
     }
-    let auth = creds.request_auth(ctx.deadline).await?;
+    let auth = within_attempt(ctx.deadline, started, creds.request_auth(ctx.deadline)).await?;
     let signed =
         crate::bridge::mantle_auth_headers(&auth, creds.region(), &url, &unsigned, &bytes)?;
 
@@ -316,13 +319,26 @@ async fn mantle_count_tokens(
     for (name, value) in unsigned.iter().chain(signed.iter()) {
         req = req.header(name, value);
     }
-    if let Some(d) = ctx.deadline {
-        req = req.timeout(d);
-    }
-    let started = Instant::now();
-    let resp = aisix_gateway::upstream_io::send(req, Protocol::Messages)
-        .await
-        .map_err(aisix_gateway::send_error)?;
+    let remaining = ctx
+        .deadline
+        .map(|budget| budget.saturating_sub(started.elapsed()));
+    aisix_gateway::upstream_http::with_buffered_response_deadline(
+        remaining,
+        started,
+        async {
+            aisix_gateway::upstream_io::send(req, Protocol::Messages)
+                .await
+                .map_err(aisix_gateway::send_error)
+        },
+        |resp| read_mantle_count_tokens(resp, started),
+    )
+    .await
+}
+
+async fn read_mantle_count_tokens(
+    resp: reqwest::Response,
+    started: Instant,
+) -> Result<Value, BridgeError> {
     aisix_gateway::note_upstream_response(resp.headers());
     let status = resp.status();
     if !status.is_success() {

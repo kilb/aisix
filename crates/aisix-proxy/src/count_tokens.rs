@@ -63,6 +63,7 @@
 
 use crate::request_json::Json;
 use crate::request_json::JsonRejection;
+use aisix_gateway::BridgeError;
 use aisix_obs::AccessLog;
 use axum::extract::State;
 use axum::http::{HeaderName, HeaderValue};
@@ -818,6 +819,14 @@ async fn dispatch(
                         retryable,
                         fallback_statuses,
                     );
+                    if matches!(
+                        &e,
+                        ProxyError::Bridge(
+                            BridgeError::UpstreamBodyUnread { .. } | BridgeError::UpstreamDecode(_)
+                        )
+                    ) {
+                        return Err(e);
+                    }
                     // See `RetryBudget::covers`: a default budget skips
                     // same-target retries for timeouts; fail-over is
                     // unaffected (the outer loop still moves on).
@@ -1429,7 +1438,9 @@ mod tests {
     use aisix_gateway::Hub;
     use axum::body::to_bytes;
     use axum::http::{Request, StatusCode};
+    use serde_json::Value;
     use std::sync::Arc;
+    use std::time::Duration;
     use tower::ServiceExt;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2075,6 +2086,137 @@ mod tests {
             3,
             "initial + 2 retries on the sole anthropic target",
         );
+    }
+
+    async fn count_with_vertex_primary(
+        upstream_status: StatusCode,
+        upstream_body: Option<&'static str>,
+        expected_fallback_calls: usize,
+    ) -> (StatusCode, Value) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let primary = axum::Router::new().route(
+            "/v1/projects/count-test/locations/us-central1/publishers/anthropic/models/count-tokens:rawPredict",
+            axum::routing::post({
+                let primary_calls = Arc::clone(&primary_calls);
+                move |_body: axum::Json<Value>| async move {
+                    primary_calls.fetch_add(1, Ordering::Relaxed);
+                    let body = match upstream_body {
+                        Some(body) => axum::body::Body::from(body),
+                        None => axum::body::Body::from_stream(futures::stream::pending::<
+                            Result<bytes::Bytes, std::io::Error>,
+                        >()),
+                    };
+                    (upstream_status, [("content-type", "application/json")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_base = format!("http://{}", listener.local_addr().unwrap());
+        let primary_server = tokio::spawn(async move { axum::serve(listener, primary).await });
+        let fallback = MockServer::builder().start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "input_tokens": 7
+            })))
+            .mount(&fallback)
+            .await;
+
+        let snap = new_snap(&fallback.uri());
+        let vertex_key = serde_json::from_value(serde_json::json!({
+            "display_name": "vertex-up",
+            "provider": "google",
+            "adapter": "vertex",
+            "api_base": primary_base,
+            "api_key": r#"{"access_token":"synthetic-token","project":"count-test","region":"us-central1"}"#,
+        }))
+        .unwrap();
+        snap.provider_keys
+            .insert(ResourceEntry::new("pk-vertex", vertex_key, 1));
+        let vertex = serde_json::from_value(serde_json::json!({
+            "display_name": "ct-vertex",
+            "provider": "google",
+            "model_name": "claude-sonnet-4-5",
+            "provider_key_id": "pk-vertex",
+            "timeout": 1000,
+            "retries": 1,
+        }))
+        .unwrap();
+        snap.models
+            .insert(ResourceEntry::new("m-vertex", vertex, 1));
+        snap.models.insert(anthropic_model("ct-fallback"));
+        let group = serde_json::from_value(serde_json::json!({
+            "display_name": "ct-group",
+            "routing": {
+                "strategy": "failover",
+                "targets": [{"model": "ct-vertex"}, {"model": "ct-fallback"}],
+            },
+        }))
+        .unwrap();
+        snap.models.insert(ResourceEntry::new("m-group", group, 1));
+        snap.apikeys.insert(apikey_entry(&["ct-group"]));
+        let hub = Arc::new(Hub::new());
+        hub.register_family(
+            aisix_core::Adapter::Vertex,
+            Arc::new(aisix_provider_vertex::VertexBridge::with_client(
+                aisix_gateway::client_builder().no_proxy().build().unwrap(),
+            )),
+        );
+        let app = crate::build_router(
+            crate::ProxyState::new(SnapshotHandle::new(snap), hub, &cfg()).without_cache(),
+        );
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            app.oneshot(make_req(serde_json::json!({
+                "model": "ct-group",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))),
+        )
+        .await;
+        primary_server.abort();
+        let response = result.unwrap().unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 65536).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(primary_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            fallback.received_requests().await.unwrap().len(),
+            expected_fallback_calls,
+            "unexpected number of fallback calls; response: {status} {body}",
+        );
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn vertex_count_group_does_not_redispatch_after_success_body_timeout() {
+        let (status, body) = count_with_vertex_primary(StatusCode::OK, None, 0).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("upstream request timed out")),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_count_group_does_not_redispatch_after_success_decode_error() {
+        let (status, body) = count_with_vertex_primary(StatusCode::OK, Some("{}"), 0).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    }
+
+    #[tokio::test]
+    async fn vertex_count_group_falls_back_after_an_ordinary_refusal() {
+        let (status, body) = count_with_vertex_primary(
+            StatusCode::BAD_REQUEST,
+            Some(r#"{"type":"error","error":{"type":"invalid_request_error","message":"This model does not support token counting"}}"#),
+            1,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body, serde_json::json!({"input_tokens": 7}));
     }
 
     #[tokio::test]

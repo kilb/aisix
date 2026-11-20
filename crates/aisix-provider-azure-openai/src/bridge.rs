@@ -15,6 +15,7 @@
 //! `aisix_provider_openai::overrides`.
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
+use aisix_gateway::upstream_http::with_buffered_response_deadline;
 use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{
     apply_request_headers, Bridge, BridgeContext, BridgeError, ChatChunk, ChatChunkStream,
@@ -241,7 +242,7 @@ impl AzureOpenAiBridge {
     }
 
     // 原生 completion 不经过 chat 投影；部署、凭据及覆盖与其余 Azure 请求一致。
-    async fn send_completion_raw(
+    async fn send_completion_response(
         &self,
         body: &Value,
         ctx: &BridgeContext,
@@ -266,20 +267,23 @@ impl AzureOpenAiBridge {
         let url = self.resolve_route_url(ctx, &upstream, "azure/completions", || {
             upstream.deployment_url("completions")
         });
-        let response = upstream_io::send(
+        upstream_io::send(
             url.post_on(&self.client_for(ctx))
                 .headers(headers)
                 .body(outbound),
             Protocol::Completions,
         )
         .await
-        .map_err(aisix_gateway::send_error)?;
-        aisix_gateway::note_upstream_response(response.headers());
-        let status = response.status();
-        if !status.is_success() {
-            return Err(map_http_error(status, response).await);
-        }
-        Ok(response)
+        .map_err(aisix_gateway::send_error)
+    }
+
+    async fn send_completion_raw(
+        &self,
+        body: &Value,
+        ctx: &BridgeContext,
+        stream: bool,
+    ) -> Result<reqwest::Response, BridgeError> {
+        require_success_response(self.send_completion_response(body, ctx, stream).await?).await
     }
 }
 
@@ -787,6 +791,24 @@ fn parse_azure_error_envelope(body: &[u8]) -> Option<aisix_gateway::UpstreamErro
     Some(view)
 }
 
+async fn require_success_response(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, BridgeError> {
+    aisix_gateway::note_upstream_response(response.headers());
+    let status = response.status();
+    if !status.is_success() {
+        return Err(map_http_error(status, response).await);
+    }
+    Ok(response)
+}
+
+async fn decode_buffered_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+) -> Result<T, BridgeError> {
+    let response = require_success_response(response).await?;
+    aisix_gateway::decode_success_body(response, aisix_gateway::UpstreamWire::AzureOpenAI).await
+}
+
 /// Wrap a future in the optional deadline, counted from `started`: a wait
 /// that follows another on the same attempt gets only what is left of it.
 /// `None` → no timeout.
@@ -941,11 +963,13 @@ impl Bridge for AzureOpenAiBridge {
     }
 
     async fn complete(&self, body: &Value, ctx: &BridgeContext) -> Result<Value, BridgeError> {
-        with_deadline(ctx.deadline, Instant::now(), async {
-            let response = self.send_completion_raw(body, ctx, false).await?;
-            aisix_gateway::decode_success_body(response, aisix_gateway::UpstreamWire::AzureOpenAI)
-                .await
-        })
+        let started = Instant::now();
+        with_buffered_response_deadline(
+            ctx.deadline.map(|d| d.saturating_sub(started.elapsed())),
+            started,
+            self.send_completion_response(body, ctx, false),
+            decode_buffered_response,
+        )
         .await
     }
 
@@ -1014,31 +1038,26 @@ impl Bridge for AzureOpenAiBridge {
         let url = self.resolve_url(ctx, &upstream);
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Chat,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            // Azure injects `prompt_filter_results` /
-            // `content_filter_results` blocks. OpenAiResponse uses
-            // `#[serde(default)]` on optional fields and does NOT set
-            // `deny_unknown_fields`, so the extension fields pass
-            // through transparently without breaking deserialization.
-            let parsed: OpenAiResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
-                    .await?;
-            Ok(response_into_chat_response(parsed))
-        })
-        .await
+        // Azure injects `prompt_filter_results` /
+        // `content_filter_results` blocks. OpenAiResponse uses
+        // `#[serde(default)]` on optional fields and does NOT set
+        // `deny_unknown_fields`, so the extension fields pass
+        // through transparently without breaking deserialization.
+        let parsed: OpenAiResponse = with_buffered_response_deadline(
+            ctx.deadline.map(|d| d.saturating_sub(started.elapsed())),
+            started,
+            async move {
+                upstream_io::send(
+                    url.post_on(&client).headers(headers).body(body),
+                    Protocol::Chat,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            decode_buffered_response,
+        )
+        .await?;
+        Ok(response_into_chat_response(parsed))
     }
 
     async fn chat_stream(
@@ -1175,26 +1194,21 @@ impl Bridge for AzureOpenAiBridge {
         });
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Embeddings,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            let parsed: OpenAiEmbedResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI)
-                    .await?;
-            Ok(embed_response_into(parsed))
-        })
-        .await
+        let parsed: OpenAiEmbedResponse = with_buffered_response_deadline(
+            ctx.deadline.map(|d| d.saturating_sub(started.elapsed())),
+            started,
+            async move {
+                upstream_io::send(
+                    url.post_on(&client).headers(headers).body(body),
+                    Protocol::Embeddings,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            decode_buffered_response,
+        )
+        .await?;
+        Ok(embed_response_into(parsed))
     }
 
     /// Azure's image-generation route for a DALL·E deployment. Same body and
@@ -1230,22 +1244,19 @@ impl Bridge for AzureOpenAiBridge {
         let url = self.resolve_route_url(ctx, &upstream, "azure/images", || upstream.images_url());
         let client = self.client_for(ctx);
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(outbound),
-                Protocol::Images,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::AzureOpenAI).await
-        })
+        with_buffered_response_deadline(
+            ctx.deadline.map(|d| d.saturating_sub(started.elapsed())),
+            started,
+            async move {
+                upstream_io::send(
+                    url.post_on(&client).headers(headers).body(outbound),
+                    Protocol::Images,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            decode_buffered_response,
+        )
         .await
     }
 }
@@ -3850,7 +3861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compat_azure_completion_deadline_covers_response_body_in_both_modes() {
+    async fn compat_azure_completion_deadline_before_headers_is_retryable_in_both_modes() {
         let server = MockServer::builder().start().await;
         Mock::given(method("POST"))
             .respond_with(
@@ -3878,6 +3889,77 @@ mod tests {
             .complete_stream(&serde_json::json!({"prompt":"hi","stream":true}), &ctx)
             .await;
         assert!(matches!(streamed, Err(BridgeError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn azure_buffered_adapters_treat_post_head_deadline_as_unread_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let checks = ["chat", "embeddings", "completions", "images"].map(|method| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let upstream = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{")
+                    .await
+                    .unwrap();
+                // 已发出响应头和正文前缀；后续正文只能等到请求预算耗尽。
+                std::future::pending::<()>().await;
+            });
+            let ctx = BridgeContext::new(
+                "req-azure-body-deadline",
+                sample_model(),
+                sample_pk(Some(&format!("http://{address}"))),
+            )
+            .with_deadline(Duration::from_millis(250));
+            let bridge = AzureOpenAiBridge::new();
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                match method {
+                    "chat" => bridge
+                        .chat(&ChatFormat::new("alias", vec![ChatMessage::user("hi")]), &ctx)
+                        .await
+                        .map(|_| ()),
+                    "embeddings" => bridge
+                        .embed(
+                            &EmbeddingRequest {
+                                model: "alias".into(),
+                                input: vec!["hi".into()],
+                                input_was_single: true,
+                                encoding_format: None,
+                                dimensions: None,
+                                input_type: None,
+                                embedding_types: None,
+                                token_input: None,
+                                extra: Default::default(),
+                            },
+                            &ctx,
+                        )
+                        .await
+                        .map(|_| ()),
+                    "completions" => bridge
+                        .complete(&serde_json::json!({"prompt":"hi"}), &ctx)
+                        .await
+                        .map(|_| ()),
+                    "images" => bridge
+                        .generate_image(&serde_json::json!({"prompt":"hi"}), &ctx)
+                        .await
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                }
+            })
+            .await;
+            upstream.abort();
+            let error = result.unwrap().unwrap_err();
+            assert!(
+                matches!(error, BridgeError::UpstreamBodyUnread { status: 200, .. }),
+                "{method}: {error:?}"
+            );
+            assert!(error.to_string().contains("timed out"), "{method}: {error}");
+        });
+        futures::future::join_all(checks).await;
     }
 
     #[tokio::test]

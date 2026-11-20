@@ -8,6 +8,7 @@
 use std::time::Instant;
 
 use aisix_gateway::media_fetch::{fetch_urls, Encoding};
+use aisix_gateway::upstream_http::with_buffered_response_deadline;
 use aisix_gateway::upstream_io::{self, Protocol};
 use aisix_gateway::{BridgeContext, BridgeError, NativeMessages};
 use aisix_provider_anthropic::platform::{self, Platform};
@@ -16,8 +17,8 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
 use super::{
-    build_request_headers, map_http_error, outbound_bytes, upstream_model, validate_url_token,
-    with_deadline, VertexBridge, VertexPublisher, VertexSecret,
+    build_request_headers, map_http_error, outbound_bytes, remaining_deadline, send_buffered,
+    upstream_model, validate_url_token, with_deadline, VertexBridge, VertexPublisher, VertexSecret,
 };
 
 pub(super) fn serves_anthropic_messages(upstream_id: &str) -> bool {
@@ -128,11 +129,16 @@ impl VertexBridge {
             );
         }
         if !stream || aisix_gateway::response_is_json(&resp) {
-            let json = with_deadline(ctx.deadline, started, async {
-                resp.json::<Value>()
-                    .await
-                    .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
-            })
+            let json = with_buffered_response_deadline(
+                remaining_deadline(ctx.deadline, started),
+                started,
+                std::future::ready(Ok(resp)),
+                |resp| async {
+                    resp.json::<Value>()
+                        .await
+                        .map_err(|e| BridgeError::UpstreamDecode(e.to_string()))
+                },
+            )
             .await?;
             return Ok(NativeMessages::Json(json));
         }
@@ -170,32 +176,27 @@ impl VertexBridge {
         }
         let bytes = outbound_bytes(&body)?;
         let client = self.client_for(ctx);
-        with_deadline(ctx.deadline, started, async {
-            let resp = upstream_io::send(
-                url.post_on(&client).headers(headers).body(bytes),
-                Protocol::Messages,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let json: Value = resp
-                .json()
-                .await
-                .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
-            let tokens = json
-                .get("input_tokens")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
-                    BridgeError::UpstreamDecode(
-                        "count-tokens answer carries no input_tokens".into(),
-                    )
-                })?;
-            Ok(serde_json::json!({"input_tokens": tokens}))
-        })
+        send_buffered(
+            ctx.deadline,
+            started,
+            url.post_on(&client).headers(headers).body(bytes),
+            Protocol::Messages,
+            |resp| async {
+                let json: Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| aisix_gateway::upstream_body_read_error(&e))?;
+                let tokens = json
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        BridgeError::UpstreamDecode(
+                            "count-tokens answer carries no input_tokens".into(),
+                        )
+                    })?;
+                Ok(serde_json::json!({"input_tokens": tokens}))
+            },
+        )
         .await
     }
 }

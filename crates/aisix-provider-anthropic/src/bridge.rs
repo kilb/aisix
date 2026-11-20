@@ -467,27 +467,32 @@ impl Bridge for AnthropicBridge {
         let headers =
             build_request_headers(key, self.api_version, &request_id, false, &ctx.header_ctx())?;
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Messages,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
+        aisix_gateway::upstream_http::with_buffered_response_deadline(
+            ctx.deadline,
+            started,
+            async move {
+                send(
+                    url.post_on(&client).headers(headers).body(body),
+                    Protocol::Messages,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            |resp| async move {
+                aisix_gateway::note_upstream_response(resp.headers());
+                let status = resp.status();
+                if !status.is_success() {
+                    return Err(map_http_error(status, resp).await);
+                }
 
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            let parsed: AnthropicResponse = crate::wire::decode_success_body(resp).await?;
-            let mut chat = response_into_chat_response(parsed);
-            if synthetic_json_tool {
-                unwrap_json_tool_call(&mut chat);
-            }
-            Ok(legacy.reply(chat))
-        })
+                let parsed: AnthropicResponse = crate::wire::decode_success_body(resp).await?;
+                let mut chat = response_into_chat_response(parsed);
+                if synthetic_json_tool {
+                    unwrap_json_tool_call(&mut chat);
+                }
+                Ok(legacy.reply(chat))
+            },
+        )
         .await
     }
 
@@ -1394,6 +1399,53 @@ data: {\"type\":\"message_stop\"}\n\n";
         let ctx = sample_ctx(&server.uri()).with_deadline(Duration::from_millis(50));
         let err = bridge.chat(&req(), &ctx).await.unwrap_err();
         assert!(matches!(err, BridgeError::Timeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn buffered_body_deadline_preserves_the_accepted_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctx = sample_ctx(&format!("http://{}", listener.local_addr().unwrap()))
+            .with_deadline(Duration::from_millis(500));
+        let tap = Arc::new(aisix_gateway::ResponseHeaderTap::new(
+            vec!["x-request-id".into()],
+            false,
+            "req-1".into(),
+        ));
+        let upstream = async {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                assert_ne!(stream.read_buf(&mut request).await.unwrap(), 0);
+            }
+            assert!(request.starts_with(b"POST /v1/messages HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nx-request-id: stalled-body\r\n\r\n{")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        };
+        let bridge = AnthropicBridge::new();
+        let request = req();
+        let result = tokio::select! {
+            result = aisix_gateway::response_tap::scope(tap.clone(), bridge.chat(&request, &ctx)) => result,
+            _ = upstream => unreachable!(),
+        };
+        assert_eq!(
+            tap.capture()
+                .headers
+                .get("x-request-id")
+                .map(String::as_str),
+            Some("stalled-body"),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::UpstreamBodyUnread { status: 200, .. })
+            ),
+            "{result:?}",
+        );
     }
 
     #[tokio::test]

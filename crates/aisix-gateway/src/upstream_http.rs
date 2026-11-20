@@ -15,8 +15,9 @@
 //!   failure, a TCP reset, a TLS handshake error, and a stale pooled
 //!   connection. The chain is what tells them apart.
 
+use std::future::Future;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bridge::BridgeError;
 use crate::upstream_tls::TlsSettings;
@@ -306,6 +307,47 @@ pub fn transport_error_message(err: &reqwest::Error) -> String {
 pub fn upstream_body_read_error(err: &reqwest::Error) -> BridgeError {
     log_body_read_causes(err);
     BridgeError::UpstreamDecode(err.to_string())
+}
+
+/// 将剩余的单次请求预算用于发送和读取缓冲响应。收到 2xx 后耗尽预算，
+/// 走已有的响应体读取错误，避免重发可能已经计费的请求。
+pub async fn with_buffered_response_deadline<T, F>(
+    remaining: Option<Duration>,
+    started: Instant,
+    send_response: impl Future<Output = Result<reqwest::Response, BridgeError>>,
+    consume_response: impl FnOnce(reqwest::Response) -> F,
+) -> Result<T, BridgeError>
+where
+    F: Future<Output = Result<T, BridgeError>>,
+{
+    let Some(remaining) = remaining else {
+        return consume_response(send_response.await?).await;
+    };
+    let mut response_status = None;
+    let result = tokio::time::timeout(remaining, async {
+        let response = send_response.await?;
+        response_status = Some(response.status());
+        consume_response(response).await
+    })
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            let error = BridgeError::Timeout {
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                cause: String::new(),
+            };
+            if let Some(status) = response_status.filter(http::StatusCode::is_success) {
+                let reason = error.to_string();
+                return Err(BridgeError::UpstreamBodyUnread {
+                    status: status.as_u16(),
+                    decode_error: reason.clone(),
+                    reason,
+                });
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Log why a response body could not be read. `Response::json` reports a parse
@@ -1055,11 +1097,12 @@ mod tests {
     /// top of a file, and cutting there silently excused everything
     /// below from every scan in this module.
     fn production_half(src: &str) -> &str {
-        const MARKER: &str = "\n#[cfg(test)]\nmod ";
-        match src.find(MARKER) {
-            Some(i) => &src[..i],
-            None => src,
-        }
+        const MARKERS: [&str; 2] = ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\npub(super) mod "];
+        MARKERS
+            .into_iter()
+            .filter_map(|marker| src.find(marker))
+            .min()
+            .map_or(src, |index| &src[..index])
     }
 
     /// The scans above are only worth their runtime if they actually see
@@ -1067,11 +1110,15 @@ mod tests {
     /// hide every call site under it.
     #[test]
     fn production_half_cuts_at_the_test_module_not_a_field_attribute() {
-        let src = "struct S {\n    #[cfg(test)]\n    probe: bool,\n}\nfn f() {}\n\
-                   #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
-        let production = production_half(src);
-        assert!(production.contains("fn f()"), "{production}");
-        assert!(!production.contains("fn t()"), "{production}");
+        for visibility in ["", "pub(super) "] {
+            let src = format!(
+                "struct S {{\n    #[cfg(test)]\n    probe: bool,\n}}\nfn f() {{}}\n\
+                 #[cfg(test)]\n{visibility}mod tests {{\n    fn t() {{}}\n}}\n"
+            );
+            let production = production_half(&src);
+            assert!(production.contains("fn f()"), "{production}");
+            assert!(!production.contains("fn t()"), "{production}");
+        }
     }
 
     /// On a thread-per-core worker every dispatch runs on that worker's

@@ -17,7 +17,8 @@
 //! - upstream non-2xx → `BridgeError::UpstreamStatus` (4xx passes through,
 //!   5xx collapses to 502 via `http_status()` on the proxy side).
 //! - malformed JSON from upstream → `BridgeError::UpstreamDecode`
-//! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`
+//! - elapsed deadline → `BridgeError::Timeout { elapsed_ms }`; after
+//!   buffered 2xx headers, `BridgeError::UpstreamBodyUnread`.
 
 use aisix_core::{RequestOverrides, ResponseOverrides, StreamDoneMarker};
 use aisix_gateway::structured_output::close_object_schemas;
@@ -48,7 +49,7 @@ use crate::reasoning::{is_reasoning_model, ReasoningFamily};
 use crate::wire::{
     build_request, embed_request_body, embed_response_into, messages_from,
     response_into_chat_response, stream_chunk_into_chat_chunks, DeveloperRoleMode,
-    OpenAiEmbedResponse, OpenAiResponse, OpenAiStreamChunk, ToolCallIndexer,
+    OpenAiStreamChunk, ToolCallIndexer,
 };
 
 /// Whether this dispatch moves a reasoning model's `max_tokens` to
@@ -122,9 +123,7 @@ impl OpenAiBridge {
         )
     }
 
-    /// Send a legacy `/completions` request and return the successful raw
-    /// response. JSON decoding and SSE forwarding deliberately live in the two
-    /// trait methods so request preparation cannot drift between modes.
+    /// Send a legacy `/completions` request and return its raw response.
     async fn send_completion_raw(
         &self,
         body: &serde_json::Value,
@@ -173,19 +172,12 @@ impl OpenAiBridge {
             || Ok(format!("{}/completions", self.resolve_base(ctx)?)),
         )?;
         let client = self.client_for(ctx);
-        let resp = send(
+        send(
             url.post_on(&client).headers(headers).body(outbound),
             Protocol::Completions,
         )
         .await
-        .map_err(aisix_gateway::send_error)?;
-
-        aisix_gateway::note_upstream_response(resp.headers());
-        let status = resp.status();
-        if !status.is_success() {
-            return Err(map_http_error(status, resp).await);
-        }
-        Ok(resp)
+        .map_err(aisix_gateway::send_error)
     }
 
     /// Resolve `ProviderKey.api_base` into the canonical base URL the
@@ -417,6 +409,36 @@ where
     }
 }
 
+async fn buffered_json<T, M>(
+    deadline: Option<Duration>,
+    started: Instant,
+    send_response: impl std::future::Future<Output = Result<reqwest::Response, BridgeError>>,
+    metadata: impl FnOnce(&HeaderMap) -> M,
+) -> Result<(T, M), BridgeError>
+where
+    T: serde::de::DeserializeOwned,
+{
+    aisix_gateway::upstream_http::with_buffered_response_deadline(
+        deadline,
+        started,
+        send_response,
+        |response| async {
+            aisix_gateway::note_upstream_response(response.headers());
+            let status = response.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, response).await);
+            }
+
+            let metadata = metadata(response.headers());
+            let decoded =
+                aisix_gateway::decode_success_body(response, aisix_gateway::UpstreamWire::OpenAI)
+                    .await?;
+            Ok((decoded, metadata))
+        },
+    )
+    .await
+}
+
 /// Convert the typed [`build_request`] output to a `serde_json::Value`
 /// and apply every [`RequestOverrides`] / [`ResponseOverrides`] field
 /// whose primitive lives in [`crate::overrides`]. Issue #302 §5 lays
@@ -621,27 +643,21 @@ impl Bridge for OpenAiBridge {
         let client = self.client_for(ctx);
         let started = Instant::now();
 
-        with_deadline(ctx.deadline, started, async move {
-            let resp = send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Chat,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-            let header_tier = aisix_gateway::chat::gemini_header_service_tier(resp.headers());
-
-            let parsed: OpenAiResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
-                    .await?;
-            Ok(response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
-        })
-        .await
+        let (parsed, header_tier) = buffered_json(
+            ctx.deadline,
+            started,
+            async move {
+                send(
+                    url.post_on(&client).headers(headers).body(body),
+                    Protocol::Chat,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            aisix_gateway::chat::gemini_header_service_tier,
+        )
+        .await?;
+        Ok(response_into_chat_response(parsed).with_fallback_service_tier(header_tier))
     }
 
     async fn embed(
@@ -675,26 +691,21 @@ impl Bridge for OpenAiBridge {
         )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
-        with_deadline(ctx.deadline, started, async move {
-            let resp = send(
-                url.post_on(&client).headers(headers).body(body),
-                Protocol::Embeddings,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            let parsed: OpenAiEmbedResponse =
-                aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI)
-                    .await?;
-            Ok(embed_response_into(parsed))
-        })
-        .await
+        let (parsed, ()) = buffered_json(
+            ctx.deadline,
+            started,
+            async move {
+                send(
+                    url.post_on(&client).headers(headers).body(body),
+                    Protocol::Embeddings,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            |_| (),
+        )
+        .await?;
+        Ok(embed_response_into(parsed))
     }
 
     async fn complete(
@@ -703,11 +714,14 @@ impl Bridge for OpenAiBridge {
         ctx: &BridgeContext,
     ) -> Result<serde_json::Value, BridgeError> {
         let started = Instant::now();
-        with_deadline(ctx.deadline, started, async {
-            let resp = self.send_completion_raw(body, ctx, false).await?;
-            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
-        })
-        .await
+        let (parsed, ()) = buffered_json(
+            ctx.deadline,
+            started,
+            self.send_completion_raw(body, ctx, false),
+            |_| (),
+        )
+        .await?;
+        Ok(parsed)
     }
 
     async fn complete_stream(
@@ -717,7 +731,13 @@ impl Bridge for OpenAiBridge {
     ) -> Result<CompletionByteStream, BridgeError> {
         let started = Instant::now();
         let response = with_deadline(ctx.deadline, started, async {
-            self.send_completion_raw(body, ctx, true).await
+            let response = self.send_completion_raw(body, ctx, true).await?;
+            aisix_gateway::note_upstream_response(response.headers());
+            let status = response.status();
+            if !status.is_success() {
+                return Err(map_http_error(status, response).await);
+            }
+            Ok(response)
         })
         .await?;
         let stream = response
@@ -766,23 +786,21 @@ impl Bridge for OpenAiBridge {
         )?;
         let client = self.client_for(ctx);
         let started = Instant::now();
-        with_deadline(ctx.deadline, started, async move {
-            let resp = send(
-                url.post_on(&client).headers(headers).body(outbound),
-                Protocol::Images,
-            )
-            .await
-            .map_err(aisix_gateway::send_error)?;
-
-            aisix_gateway::note_upstream_response(resp.headers());
-            let status = resp.status();
-            if !status.is_success() {
-                return Err(map_http_error(status, resp).await);
-            }
-
-            aisix_gateway::decode_success_body(resp, aisix_gateway::UpstreamWire::OpenAI).await
-        })
-        .await
+        let (parsed, ()) = buffered_json(
+            ctx.deadline,
+            started,
+            async move {
+                send(
+                    url.post_on(&client).headers(headers).body(outbound),
+                    Protocol::Images,
+                )
+                .await
+                .map_err(aisix_gateway::send_error)
+            },
+            |_| (),
+        )
+        .await?;
+        Ok(parsed)
     }
 
     async fn chat_stream(

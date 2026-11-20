@@ -803,6 +803,27 @@ pub(crate) async fn within_attempt<T>(
         .unwrap_or_else(|_| Err(timed_out()))
 }
 
+pub(crate) async fn within_buffered_attempt<T>(
+    deadline: Option<std::time::Duration>,
+    started: Instant,
+    io: &UpstreamIoInterceptor,
+    fut: impl std::future::Future<Output = Result<T, BridgeError>>,
+) -> Result<T, BridgeError> {
+    within_attempt(deadline, started, fut)
+        .await
+        .map_err(|error| {
+            if let (BridgeError::Timeout { .. }, Some(status)) = (&error, io.success_status()) {
+                let reason = error.to_string();
+                return BridgeError::UpstreamBodyUnread {
+                    status,
+                    decode_error: reason.clone(),
+                    reason,
+                };
+            }
+            error
+        })
+}
+
 /// Build a Bedrock SDK Client from the resolved authentication plus the
 /// optional endpoint override.
 fn build_client(
@@ -1306,7 +1327,7 @@ impl Bridge for BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
     ) -> Result<ChatResponse, BridgeError> {
-        within_attempt(ctx.deadline, Instant::now(), self.chat_attempt(req, ctx)).await
+        self.chat_attempt(req, ctx, Instant::now()).await
     }
 
     async fn chat_stream(
@@ -1403,6 +1424,7 @@ impl Bridge for BedrockBridge {
                 }
                 let body_bytes = serde_json::to_vec(&body)
                     .map_err(|e| BridgeError::Config(format!("serialize Titan embed body: {e}")))?;
+                let io = UpstreamIoInterceptor::new(Protocol::Embeddings);
                 let send = client
                     .invoke_model()
                     .model_id(upstream_id)
@@ -1410,9 +1432,9 @@ impl Bridge for BedrockBridge {
                     .accept("application/json")
                     .body(Blob::new(body_bytes))
                     .customize()
-                    .interceptor(UpstreamIoInterceptor::new(Protocol::Embeddings))
+                    .interceptor(io.clone())
                     .send();
-                let resp = within_attempt(deadline, started, async {
+                let resp = within_buffered_attempt(deadline, started, &io, async {
                     send.await
                         .map_err(|e| crate::errors::sdk_error(e, started, deadline))
                 })
@@ -1471,6 +1493,7 @@ impl Bridge for BedrockBridge {
                 })
                 .map_err(|e| BridgeError::Config(format!("serialize Cohere embed body: {e}")))?,
             );
+            let io = UpstreamIoInterceptor::new(Protocol::Embeddings);
             let send = client
                 .invoke_model()
                 .model_id(upstream_id)
@@ -1478,9 +1501,9 @@ impl Bridge for BedrockBridge {
                 .accept("application/json")
                 .body(Blob::new(body_bytes))
                 .customize()
-                .interceptor(UpstreamIoInterceptor::new(Protocol::Embeddings))
+                .interceptor(io.clone())
                 .send();
-            let resp = within_attempt(deadline, started, async {
+            let resp = within_buffered_attempt(deadline, started, &io, async {
                 send.await
                     .map_err(|e| crate::errors::sdk_error(e, started, deadline))
             })
@@ -1620,12 +1643,12 @@ fn shape_invoke_body(
 }
 
 impl BedrockBridge {
-    /// One non-streamed chat attempt: everything [`Bridge::chat_cow`] runs
-    /// inside the attempt's deadline.
+    /// 单次非流式调用，SDK 和原生 HTTP 各自沿用同一个尝试起点。
     async fn chat_attempt(
         &self,
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
+        started: Instant,
     ) -> Result<ChatResponse, BridgeError> {
         let req = aisix_gateway::tool_calls::chat_without_thought_signatures(req);
         let upstream_id = upstream_model(ctx)?;
@@ -1633,32 +1656,34 @@ impl BedrockBridge {
         let publisher = resolve_publisher(upstream_id)?;
         if crate::openai_compat::serves(&req, upstream_id) {
             let endpoint = self.chat_completions_endpoint(ctx)?;
-            return crate::openai_compat::chat(endpoint, req, ctx, upstream_id).await;
+            return crate::openai_compat::chat(endpoint, req, ctx, upstream_id, started).await;
         }
-        // InvokeModel and Converse take tools, not the legacy fields.
-        let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
-        // Claude answers a non-streamed request through InvokeModel, in
-        // Anthropic Messages shape; every other publisher, and every
-        // streamed request, through Converse.
-        // InvokeModel has no place for `requestMetadata`, a Bedrock
-        // `outputConfig`, `additionalModelResponseFieldPaths` or
-        // `promptVariables`, so a Claude request carrying one is served by
-        // Converse, as it is when streamed.
-        let needs_converse = [
-            "requestMetadata",
-            "outputConfig",
-            "additionalModelResponseFieldPaths",
-            "promptVariables",
-        ]
-        .iter()
-        .any(|k| req.extra.get(*k).is_some_and(|v| !v.is_null()));
-        match publisher {
-            Some(BedrockPublisher::Anthropic) if !needs_converse => {
-                self.chat_anthropic(req, ctx, upstream_id).await
+        // Claude 默认走 InvokeModel；只有 Converse 能承载这些原生字段。
+        let use_invoke = publisher == Some(BedrockPublisher::Anthropic)
+            && ![
+                "requestMetadata",
+                "outputConfig",
+                "additionalModelResponseFieldPaths",
+                "promptVariables",
+            ]
+            .iter()
+            .any(|key| req.extra.get(*key).is_some_and(|value| !value.is_null()));
+        let io = UpstreamIoInterceptor::new(if use_invoke {
+            Protocol::Messages
+        } else {
+            Protocol::Converse
+        });
+        within_buffered_attempt(ctx.deadline, started, &io, async {
+            // InvokeModel 和 Converse 只接受 tools，不接受旧版 functions 字段。
+            let (req, legacy) = aisix_gateway::tool_calls::legacy_functions_as_tools(req)?;
+            if use_invoke {
+                self.chat_anthropic(req, ctx, upstream_id, io.clone()).await
+            } else {
+                self.chat_converse(req, ctx, upstream_id, io.clone()).await
             }
-            _ => self.chat_converse(req, ctx, upstream_id).await,
-        }
-        .map(|resp| legacy.reply(resp))
+            .map(|resp| legacy.reply(resp))
+        })
+        .await
     }
 
     /// Dispatch Anthropic-on-Bedrock chat via the legacy /invoke
@@ -1676,6 +1701,7 @@ impl BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
+        io: UpstreamIoInterceptor,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx).await?;
 
@@ -1775,7 +1801,7 @@ impl BedrockBridge {
         }
         let resp = call
             .customize()
-            .interceptor(UpstreamIoInterceptor::new(Protocol::Messages))
+            .interceptor(io)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;
@@ -1877,6 +1903,7 @@ impl BedrockBridge {
         req: std::borrow::Cow<'_, ChatFormat>,
         ctx: &BridgeContext,
         upstream_id: &str,
+        io: UpstreamIoInterceptor,
     ) -> Result<ChatResponse, BridgeError> {
         let client = self.build_client_from_ctx(ctx).await?;
         let fetched =
@@ -1952,7 +1979,7 @@ impl BedrockBridge {
         let resp = call
             .customize()
             .interceptor(interceptor)
-            .interceptor(UpstreamIoInterceptor::new(Protocol::Converse))
+            .interceptor(io)
             .send()
             .await
             .map_err(|e| crate::errors::sdk_error(e, started, deadline))?;

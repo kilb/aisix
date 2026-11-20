@@ -1,13 +1,16 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use aisix_core::usage_io::{TextMeasurement, UsageIoAudit};
 use aisix_gateway::{
-    response_tap, Bridge, BridgeContext, ChatFormat, ChatMessage, EmbeddingRequest, NativeMessages,
-    ResponseHeaderTap,
+    response_tap, Bridge, BridgeContext, BridgeError, ChatFormat, ChatMessage, EmbeddingRequest,
+    NativeMessages, ResponseHeaderTap,
 };
 use aisix_provider_vertex::VertexBridge;
 use futures::TryStreamExt;
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -259,20 +262,9 @@ async fn upstream_io_vertex_predict_measures_native_embedding_input() {
     let bridge = VertexBridge::new();
     let tap = tap();
     response_tap::scope(tap.clone(), async {
-        let request = EmbeddingRequest {
-            model: "caller-alias".into(),
-            input: vec!["A汉😀".into()],
-            token_input: None,
-            input_was_single: true,
-            encoding_format: None,
-            dimensions: None,
-            input_type: None,
-            embedding_types: None,
-            extra: Default::default(),
-        };
         assert_eq!(
             bridge
-                .embed(&request, &ctx)
+                .embed(&embedding_request(), &ctx)
                 .await
                 .unwrap()
                 .usage
@@ -290,4 +282,109 @@ async fn upstream_io_vertex_predict_measures_native_embedding_input() {
             complete: true,
         })
     );
+}
+
+fn embedding_request() -> EmbeddingRequest {
+    EmbeddingRequest {
+        model: "caller-alias".into(),
+        input: vec!["A汉😀".into()],
+        token_input: None,
+        input_was_single: true,
+        encoding_format: None,
+        dimensions: None,
+        input_type: None,
+        embedding_types: None,
+        extra: Default::default(),
+    }
+}
+
+async fn assert_vertex_buffered_deadline(route: &str, model: &str, send_head: bool) {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind local upstream");
+    let base = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let upstream = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.expect("receive Vertex request");
+        assert_ne!(conn.read(&mut [0; 4096]).await.expect("request bytes"), 0);
+        if send_head {
+            conn.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-goog-request-id: vertex-upstream-id\r\ncontent-length: 1024\r\n\r\n{")
+                .await
+                .expect("send head and incomplete body");
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let ctx = context(&base, model, false).with_deadline(Duration::from_millis(500));
+    let bridge = VertexBridge::new();
+    let tap = tap();
+    let result = response_tap::scope(tap.clone(), async {
+        let messages = || json!({"messages":[{"role":"user","content":"hello"}]});
+        match route {
+            "messages" | "messages-json-fallback" => {
+                let mut body = messages();
+                body["max_tokens"] = json!(32);
+                body["stream"] = json!(route == "messages-json-fallback");
+                bridge.anthropic_messages(body, &ctx).await.map(|_| ())
+            }
+            "count_tokens" => bridge
+                .anthropic_count_tokens(messages(), &ctx)
+                .await
+                .map(|_| ()),
+            "embeddings" => bridge.embed(&embedding_request(), &ctx).await.map(|_| ()),
+            _ => {
+                let request = ChatFormat::new("caller-alias", vec![ChatMessage::user("hello")]);
+                bridge.chat(&request, &ctx).await.map(|_| ())
+            }
+        }
+    })
+    .await;
+    upstream.abort();
+
+    if send_head {
+        assert!(
+            matches!(
+                result,
+                Err(BridgeError::UpstreamBodyUnread { status: 200, .. })
+            ),
+            "{route} {model}: {result:?}"
+        );
+        let captured = tap.capture();
+        assert_eq!(captured.request_id, "vertex-upstream-id");
+        let audit = captured.io.expect("capture the actual response").snapshot();
+        assert_eq!(audit.exchange_count, Some(1));
+        assert!(!audit.response_complete);
+    } else {
+        assert!(
+            matches!(result, Err(BridgeError::Timeout { .. })),
+            "{route} {model}: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn vertex_buffered_deadlines_keep_the_accepted_upstream_status() {
+    futures::future::join_all(
+        [
+            ("chat", "gemini-2.5-pro"),
+            ("chat", "claude-sonnet-4-5"),
+            ("chat", "llama-3.3-70b-instruct-maas"),
+            ("chat", "mistral-large-2411"),
+            ("chat", "jamba-1.5-large"),
+            ("embeddings", "text-embedding-005"),
+            ("messages", "claude-sonnet-4-5"),
+            ("messages-json-fallback", "claude-sonnet-4-5"),
+            ("count_tokens", "claude-sonnet-4-5"),
+        ]
+        .into_iter()
+        .map(|(route, model)| assert_vertex_buffered_deadline(route, model, true)),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vertex_buffered_deadline_before_headers_is_a_timeout() {
+    assert_vertex_buffered_deadline("chat", "gemini-2.5-pro", false).await;
 }

@@ -392,10 +392,10 @@ pub enum BridgeError {
         /// [`with_body_read_error`](Self::with_body_read_error).
         diagnostic: Option<String>,
     },
-    /// A non-2xx whose body could not be read, on a route that reports that
-    /// to its caller as [`UpstreamDecode`](Self::UpstreamDecode): the same
-    /// status, type, class and retry decisions, the same text to the caller
-    /// (`decode_error`), and only `Display` saying what happened.
+    /// An unread HTTP response body reported as
+    /// [`UpstreamDecode`](Self::UpstreamDecode) to the caller. The caller
+    /// receives `decode_error`. `Display` includes the observed upstream
+    /// status and the diagnostic reason.
     #[error("upstream returned HTTP {status}: failed to read response body: {reason}")]
     UpstreamBodyUnread {
         status: u16,
